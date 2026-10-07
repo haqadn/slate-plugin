@@ -54,6 +54,7 @@ allowed-tools: Bash(node:*)
 !`node "${CLAUDE_PLUGIN_ROOT}/scripts/init.mjs" "${CLAUDE_SESSION_ID}"`
 ```
 
+- `allowed-tools: Bash(node:*)` is **untested**: every probe had it, so it's unknown whether the `!` command runs without it. Keep it.
 - The script's stdout (rules and folder path) becomes the skill text, with no model round trip.
 - The script reads `CLAUDE_PID` from its env (see Q2).
 - The UserPromptSubmit fallback is not needed.
@@ -81,7 +82,7 @@ allowed-tools: Bash(node:*)
 - **Fallback:** start at `process.ppid`, skip shells (`sh`, `bash`, `zsh`, `dash`, `fish`, with or without a path or leading `-`), and take the first other process.
 - Don't match on the name `claude`; the table shows why.
 - The PID stays the same across `/clear` and `/branch`.
-- A `--resume` in a new process gets a new PID (Q7), so SessionStart(`resume`, `compact`) must write the current PID back into `session.json`.
+- A `--resume` in a new process gets a new PID (Q7), so SessionStart(`resume`) must write the current PID back into `session.json`. This is a spec change; see Q7.
 
 ## 3. `SessionStart` input for a fork
 
@@ -160,18 +161,35 @@ Run B and run C added `--setting-sources ""`. Run A loaded the user's settings.
 
 **Chosen mechanism**
 
+Example for session folder `/Users/me/proj/.slate/<id>`:
+
 ```
-claude -p --model <curatorModel> --setting-sources "" --settings '{"disableAllHooks":true}' \
-  --strict-mcp-config --disable-slash-commands --no-session-persistence --tools Read,Edit,Write \
-  --permission-mode dontAsk \
-  --allowedTools "Edit(/<abs>/instructions.md)" "Edit(/<abs>/assumptions.md)" "Edit(/<abs>/facts.md)" \
-                 "Edit(/<abs>/now.md)" "Edit(/<abs>/superseded.md)"
+claude -p "$CURATOR_PROMPT" --model <curatorModel> --setting-sources "" \
+  --settings '{"disableAllHooks":true}' --strict-mcp-config --disable-slash-commands \
+  --no-session-persistence --permission-mode dontAsk --tools Read,Edit,Write \
+  --allowedTools "Edit(//Users/me/proj/.slate/<id>/instructions.md)" \
+                 "Edit(//Users/me/proj/.slate/<id>/assumptions.md)" \
+                 "Edit(//Users/me/proj/.slate/<id>/facts.md)" \
+                 "Edit(//Users/me/proj/.slate/<id>/now.md)" \
+                 "Edit(//Users/me/proj/.slate/<id>/superseded.md)"
 ```
 
-- **Rule syntax:** `Edit(` + `/` + absolute path + `)`, for example `Edit(//Users/me/proj/.slate/<id>/facts.md)`. One `Edit(...)` rule allows both Edit and Write.
+- **Prompt placement:** pass the prompt as the first positional argument, directly after `-p`, before any variadic flag (`--tools`, `--allowedTools` take `<tools...>`).
+  - Runs A, B and C all did this with a multi-line prompt, and it worked.
+  - A prompt placed last, or after `--`, was not tested.
+  - In Node, pass `['-p', prompt, '--model', model, …]` as the args array, with no shell.
+- **Rule syntax:** each rule is `"Edit(/" + absolutePath + ")"`, where `absolutePath` starts with `/`, so the rule starts with `//`.
+  - Example: `Edit(//Users/me/proj/.slate/<id>/instructions.md)`.
+  - One `Edit(...)` rule allows both Edit and Write.
+- **Build `absolutePath` from `fs.realpathSync(folder)`.** On macOS, `/var/...` is a symlink to `/private/var/...`.
+  - Run A showed a `/var/...` rule matching a `/private/var/...` edit, but only that one direction was tested.
+  - The realpath keeps the rules and the model's paths in agreement.
 - **`--setting-sources ""` is required.** Without it, allow rules from user or project settings let the curator write anywhere.
-  - It also drops `env` and `apiKeyHelper` from settings. OAuth login still worked here.
-- **Spawn with stdin ignored** (`stdio: 'ignore'` or `< /dev/null`) to avoid the 3s stall.
+- **Cost of `--setting-sources ""`:** it skips the user, project and local settings files, so any `env` and `apiKeyHelper` set there are dropped too.
+  - `--settings` and managed settings still apply.
+  - OAuth login still worked here.
+  - Not probed with an `apiKeyHelper` setup.
+- **Spawn with stdin ignored** (`stdio: 'ignore'` or `< /dev/null`) to avoid the 3s stall. Stdin is therefore not a way to pass the prompt.
 - Run the curator with cwd set to the project dir.
 
 ## 6. Plugin `userConfig` for `curatorModel`
@@ -215,9 +233,10 @@ The value was set with `--settings '{"pluginConfigs":{"slate@inline":{"options":
   - The next UserPromptSubmit and Stop used `d35ea1e3-…`.
   - `CLAUDE_PID` stayed 82990.
 
-**Chosen mechanism.** As in the spec:
-- `resume` keeps the ID, so the folder exists. Rewrite the PID in `session.json`.
-- `clear` gets a new ID. Find the folder by `CLAUDE_PID` and rename it.
+**Chosen mechanism**
+- **`clear`, as in the spec:** new ID. Find the folder by `CLAUDE_PID` and rename it.
+- **`resume`: spec change.** The ID is the same, so the folder exists. But a `--resume` in a new process has a new PID, so SessionStart(`resume`) must also rewrite `session.json`'s pid to the current `CLAUDE_PID`. Otherwise a later `/clear` finds no folder.
+- **`compact`:** a rewrite is not needed. Compaction runs inside the same process, so the PID cannot change. Compaction was not probed; a rewrite would be harmless.
 
 ## 8. `--plugin-dir` hooks in `-p` mode, and the agent name
 
@@ -233,7 +252,7 @@ The value was set with `--settings '{"pluginConfigs":{"slate@inline":{"options":
 
 ## Other findings for later tasks
 
-- **Background subagents.** In `-p` mode the Agent tool ran `slate:offload` in the background. The Stop hook fired three times in sequence:
+- **Background subagents.** In `-p` mode the Agent tool ran `slate:offload` in the background. Three hooks fired in sequence:
   1. Stop, with an interim `last_assistant_message` ("…running in the background…") and `background_tasks:[{status:"running"}]`.
   2. UserPromptSubmit, with `prompt` starting `<task-notification>`.
   3. A second Stop, with the real answer.
@@ -252,3 +271,9 @@ This `~/.claude/projects` folder was created by the probes and has been removed:
 - `~/.claude/projects/-private-var-folders-yn-n1h-qdds3g57ndq635ryl38w0000gn-T-slateprobe-xGT66O-proj`
 
 Also removed: `/private/tmp/claude-501/-private-var-folders-yn-n1h-qdds3g57ndq635ryl38w0000gn-T-slateprobe-xGT66O-proj` (scratchpad and task output) and `$P`.
+
+**Not removed.** These were created by the probes, but their names don't contain the temp path, so the cleanup ruling didn't cover them. They are harmless; delete them by hand if wanted:
+
+- Empty dirs, one per probe session: `~/.claude/session-env/a8e9c986-5031-436e-9595-4dc68a3bea01`, `…/5b712beb-b3d8-41b1-84ae-805e27079c2d`, `…/61939fdf-1c38-4022-8355-7b1360fc9fb1`, `…/d35ea1e3-7b26-4ed0-886a-0a8ade1c8104`.
+- The empty dir `~/.claude/plugins/data/slate-inline`. This is `CLAUDE_PLUGIN_DATA` for `--plugin-dir`, and development will reuse it.
+- The project entry for `…/slateprobe.xGT66O/proj` in `~/.claude.json`. It was left alone rather than edit that file.
