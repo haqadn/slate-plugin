@@ -58,3 +58,13 @@ test('parseMemoryFile handles empty and non-title first line', () => {
   assert.deepEqual(parseMemoryFile(''), { items: [], retired: [], plain: [] });
   assert.deepEqual(parseMemoryFile('only text').plain, ['only text']);
 });
+
+test('leading zeros normalize to the same ID', () => {
+  assert.equal(parseItemLine('- [I07 t1] x').id, 'I7');
+  assert.equal(parseRetiredLine('- [A007 t1 retired t2] x (reason: y)').id, 'A7');
+});
+
+test('CRLF parses like LF', () => {
+  const lf = '# T\n- [I1 t1] a\n- [I2 t1 retired t2] b (reason: c)\nplain\n';
+  assert.deepEqual(parseMemoryFile(lf.replace(/\n/g, '\r\n')), parseMemoryFile(lf));
+});

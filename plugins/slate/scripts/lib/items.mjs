@@ -12,7 +12,7 @@ export function isHeading(line) {
 export function parseItemLine(line) {
   const m = ITEM.exec(line);
   if (!m) return null;
-  return { id: m[1] + m[2], type: m[1], num: Number(m[2]), turn: Number(m[3]), text: m[4] };
+  return { id: m[1] + Number(m[2]), type: m[1], num: Number(m[2]), turn: Number(m[3]), text: m[4] };
 }
 
 export function formatItem({ id, turn, text }) {
@@ -23,7 +23,7 @@ export function parseRetiredLine(line) {
   const m = RETIRED.exec(line);
   if (!m) return null;
   return {
-    id: m[1] + m[2], type: m[1], num: Number(m[2]), turn: Number(m[3]),
+    id: m[1] + Number(m[2]), type: m[1], num: Number(m[2]), turn: Number(m[3]),
     retiredTurn: Number(m[4]), text: m[5], reason: m[6],
   };
 }
@@ -35,7 +35,7 @@ export function formatRetired(r) {
 // Headings (including the file title) land in no list.
 export function parseMemoryFile(text) {
   const out = { items: [], retired: [], plain: [] };
-  for (const line of String(text).split('\n')) {
+  for (const line of String(text).split(/\r?\n/)) {
     if (line.trim() === '') continue;
     if (isHeading(line)) continue;
     const item = parseItemLine(line);

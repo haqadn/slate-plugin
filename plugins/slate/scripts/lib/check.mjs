@@ -1,4 +1,4 @@
-import { ITEM_FILES, MEMORY_FILES, isHeading, parseMemoryFile } from './items.mjs';
+import { ITEM_FILES, MEMORY_FILES, isHeading, parseMemoryFile, formatItem, formatRetired } from './items.mjs';
 
 const NOW_MAX_LINES = 10;
 const ITEM_FILE_NAMES = Object.values(ITEM_FILES);
@@ -23,8 +23,18 @@ function liveItems(p) {
   return ITEM_FILE_NAMES.flatMap(f => p[f].items);
 }
 
+const rawLines = text => String(text ?? '').split(/\r?\n/);
+
+const HEADING_FILES = [...ITEM_FILE_NAMES, 'superseded.md'];
+
+// Headings of a file; the first heading (the title) is optionally left out.
+function headingsOf(text, skipTitle) {
+  const hs = rawLines(text).filter(isHeading);
+  return skipTitle ? hs.slice(1) : hs;
+}
+
 function bodyLines(text) {
-  return String(text ?? '').split('\n').filter(l => l.trim() !== '' && !isHeading(l));
+  return rawLines(text).filter(l => l.trim() !== '' && !isHeading(l));
 }
 
 // Returns a list of violations; an empty list means the curator's edit is safe to keep.
@@ -39,10 +49,19 @@ export function checkCuratorEdit(before, after, turn) {
   const aRetired = a['superseded.md'].retired;
 
   // Placement problems: parse is fine, but the line is in the wrong kind of file.
+  // Only lines that are new compared with before count, so old hand-edit mess cannot freeze memory.
+  const beforeMisplaced = new Set([
+    ...ITEM_FILE_NAMES.flatMap(f => b[f].retired.map(formatRetired)),
+    ...b['superseded.md'].items.map(formatItem),
+  ]);
   for (const f of ITEM_FILE_NAMES) {
-    for (const r of a[f].retired) v.push(`${r.id} retired line outside superseded.md`);
+    for (const r of a[f].retired) {
+      if (!beforeMisplaced.has(formatRetired(r))) v.push(`${r.id} retired line outside superseded.md`);
+    }
   }
-  for (const i of a['superseded.md'].items) v.push(`${i.id} live item in superseded.md`);
+  for (const i of a['superseded.md'].items) {
+    if (!beforeMisplaced.has(formatItem(i))) v.push(`${i.id} live item in superseded.md`);
+  }
 
   // 1. Every ID live before stays live with identical text, or is properly retired.
   const aLiveById = new Map();
@@ -78,20 +97,28 @@ export function checkCuratorEdit(before, after, turn) {
   const maxBefore = {};
   for (const x of [...bLive, ...bRetired]) maxBefore[x.type] = Math.max(maxBefore[x.type] ?? 0, x.num);
 
-  const seen = new Map();
-  for (const x of [...aLive, ...aRetired, ...a['superseded.md'].items, ...ITEM_FILE_NAMES.flatMap(f => a[f].retired)]) {
-    seen.set(x.id, (seen.get(x.id) ?? 0) + 1);
-  }
-  for (const [id, n] of seen) if (n > 1) v.push(`${id} duplicated`);
+  const idCounts = p => {
+    const m = new Map();
+    for (const x of [...liveItems(p), ...p['superseded.md'].retired, ...p['superseded.md'].items, ...ITEM_FILE_NAMES.flatMap(f => p[f].retired)]) {
+      m.set(x.id, (m.get(x.id) ?? 0) + 1);
+    }
+    return m;
+  };
+  const seenBefore = idCounts(b);
+  for (const [id, n] of idCounts(a)) if (n > 1 && n > (seenBefore.get(id) ?? 0)) v.push(`${id} duplicated`);
 
   const adopted = new Set();
   for (const x of [...aLive, ...aRetired]) {
     if (knownBefore.has(x.id)) continue;
     const max = maxBefore[x.type] ?? 0;
     if (x.num <= max) v.push(`${x.id} not above previous max ${x.type}${max}`);
-    const isAdoption = x.turn === 0 && !x.retiredTurn && beforePlain.has(x.text);
+    const isAdoption = x.turn === 0 && beforePlain.has(x.text);
     if (isAdoption) adopted.add(x.text);
     else if (x.turn !== turn) v.push(`${x.id} tagged t${x.turn}, expected t${turn}`);
+    if (x.retiredTurn !== undefined) {
+      if (x.retiredTurn !== turn) v.push(`${x.id} retired at t${x.retiredTurn}, expected t${turn}`);
+      if (x.reason.trim() === '') v.push(`${x.id} retired without reason`);
+    }
   }
 
   // 4. Every plain bullet from before still exists word for word, adopted or not.
@@ -100,8 +127,29 @@ export function checkCuratorEdit(before, after, turn) {
     if (!afterPlain.has(id) && !adopted.has(id)) v.push(`plain line lost: "${id}"`);
   }
 
+  // Headings (except each file's title) must survive, counted; they may move between files.
+  const headingPool = new Map();
+  for (const f of HEADING_FILES) {
+    for (const h of headingsOf(after[f], false)) headingPool.set(h, (headingPool.get(h) ?? 0) + 1);
+  }
+  for (const f of HEADING_FILES) {
+    for (const h of headingsOf(before[f], true)) {
+      const n = headingPool.get(h) ?? 0;
+      if (n === 0) v.push(`heading lost: "${h}"`);
+      else headingPool.set(h, n - 1);
+    }
+  }
+
+  // New item-looking lines that do not parse would otherwise become protected plain text.
+  const beforeLines = new Set(MEMORY_FILES.flatMap(f => rawLines(before[f])));
+  for (const f of HEADING_FILES) {
+    for (const l of a[f].plain) {
+      if (/^- \[[IAF]/.test(l) && !beforeLines.has(l)) v.push(`malformed item line: "${l}"`);
+    }
+  }
+
   // 5. now.md is free text, at most 10 non-blank lines.
-  const nowLines = String(after['now.md'] ?? '').split('\n').filter(l => l.trim() !== '').length;
+  const nowLines = rawLines(after['now.md']).filter(l => l.trim() !== '').length;
   if (nowLines > NOW_MAX_LINES) v.push(`now.md has ${nowLines} lines, max ${NOW_MAX_LINES}`);
 
   return [...new Set(v)];

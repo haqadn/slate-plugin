@@ -221,3 +221,103 @@ test('retired line outside superseded.md and item in superseded.md fail', () => 
   const a2 = withFile(BASE, 'superseded.md', BASE['superseded.md'] + '- [F5 t5] x\n');
   has(checkCuratorEdit(BASE, a2, 5), 'F5 live item in superseded.md');
 });
+
+// ---- fix round 1 ----
+const PLAIN = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- use tabs\n');
+
+test('FIX1: new retired line needs retired turn and non-empty reason', () => {
+  const bad = withFile(PLAIN, 'superseded.md', PLAIN['superseded.md'] + '- [I7 t0 retired t0] use tabs (reason: )\n');
+  const a = withFile(bad, 'instructions.md', BASE['instructions.md']);
+  const v = checkCuratorEdit(PLAIN, a, 5);
+  has(v, 'I7 retired at t0, expected t5');
+  has(v, 'I7 retired without reason');
+});
+
+test('FIX1: adopting a plain bullet straight into superseded passes', () => {
+  const a = mem({
+    ...BASE,
+    'superseded.md': BASE['superseded.md'] + '- [I7 t0 retired t5] use tabs (reason: user switched)\n',
+  });
+  assert.deepEqual(checkCuratorEdit(PLAIN, a, 5), []);
+});
+
+test('FIX1: new retired line created and retired this turn passes; wrong tag fails', () => {
+  const ok = withFile(BASE, 'superseded.md', BASE['superseded.md'] + '- [I7 t5 retired t5] x (reason: y)\n');
+  assert.deepEqual(checkCuratorEdit(BASE, ok, 5), []);
+  const bad = withFile(BASE, 'superseded.md', BASE['superseded.md'] + '- [I7 t3 retired t5] x (reason: y)\n');
+  has(checkCuratorEdit(BASE, bad, 5), 'I7 tagged t3, expected t5');
+});
+
+const HB = mem({
+  'instructions.md': '# Instructions\n## Never do these\n- push to main\n',
+  'superseded.md': '# Superseded\n## Old\n- [I9 t1 retired t2] old (reason: r)\n',
+});
+
+test('FIX2: deleting a non-title heading fails', () => {
+  const a = withFile(HB, 'instructions.md', '# Instructions\n- push to main\n');
+  has(checkCuratorEdit(HB, a, 5), 'heading lost: "## Never do these"');
+  const a2 = withFile(HB, 'superseded.md', '# Superseded\n- [I9 t1 retired t2] old (reason: r)\n');
+  has(checkCuratorEdit(HB, a2, 5), 'heading lost: "## Old"');
+});
+
+test('FIX2: title may change, heading may move files, added headings are fine', () => {
+  assert.deepEqual(checkCuratorEdit(HB, withFile(HB, 'instructions.md', '# Renamed\n## Never do these\n- push to main\n## New\n'), 5), []);
+  const moved = mem({ ...HB, 'instructions.md': '# Instructions\n- push to main\n', 'facts.md': '# Facts\n## Never do these\n' });
+  assert.deepEqual(checkCuratorEdit(HB, moved, 5), []);
+});
+
+test('FIX2: duplicate headings are counted', () => {
+  const b = withFile(HB, 'facts.md', '# Facts\n## Same\n## Same\n');
+  const a = withFile(HB, 'facts.md', '# Facts\n## Same\n');
+  has(checkCuratorEdit(b, a, 5), 'heading lost: "## Same"');
+});
+
+test('FIX3: pre-existing duplicate or misplaced lines do not freeze a no-op', () => {
+  const b = mem({
+    ...BASE,
+    'assumptions.md': '# A\n- [I1 t1] use npm\n',
+    'facts.md': BASE['facts.md'] + '- [F8 t1 retired t2] r (reason: z)\n',
+    'superseded.md': BASE['superseded.md'] + '- [I8 t1] live in superseded\n',
+  });
+  assert.deepEqual(checkCuratorEdit(b, { ...b }, 5), []);
+});
+
+test('FIX3: a newly added duplicate is still flagged on top of an old one', () => {
+  const b = withFile(BASE, 'assumptions.md', '# A\n- [I1 t1] use npm\n');
+  const a = withFile(b, 'facts.md', b['facts.md'] + '- [I1 t1] use npm\n');
+  has(checkCuratorEdit(b, a, 5), 'I1 duplicated');
+});
+
+test('FIX4: new malformed item-looking line is a violation', () => {
+  const a = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- [I7] use pnpm\n');
+  has(checkCuratorEdit(BASE, a, 5), 'malformed item line: "- [I7] use pnpm"');
+  const a2 = withFile(BASE, 'facts.md', BASE['facts.md'] + '- [Q1 t5] x\n- [I7 t5 retired t5] no reason\n');
+  has(checkCuratorEdit(BASE, a2, 5), 'malformed item line: "- [I7 t5 retired t5] no reason"');
+});
+
+test('FIX4: pre-existing malformed line is not flagged, even when moved', () => {
+  const b = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- [I7] old\n');
+  assert.deepEqual(checkCuratorEdit(b, b, 5), []);
+  const moved = mem({ ...BASE, 'facts.md': BASE['facts.md'] + '- [I7] old\n' });
+  assert.deepEqual(checkCuratorEdit(b, moved, 5), []);
+});
+
+test('FIX5: leading zeros do not create distinct IDs', () => {
+  const a = withFile(BASE, 'instructions.md', '# Instructions\n- [I01 t1] use npm\n- [I2 t2] always run tests\n');
+  assert.deepEqual(checkCuratorEdit(BASE, a, 5), []);
+  const dup = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- [I01 t5] again\n');
+  has(checkCuratorEdit(BASE, dup, 5), 'I1 duplicated');
+  const reword = withFile(BASE, 'instructions.md', '# Instructions\n- [I001 t1] changed\n- [I2 t2] always run tests\n');
+  has(checkCuratorEdit(BASE, reword, 5), 'I1 reworded');
+});
+
+test('FIX6: CRLF files behave like LF', () => {
+  const crlf = o => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, v.replace(/\n/g, '\r\n')]));
+  const b = crlf(PLAIN);
+  assert.deepEqual(checkCuratorEdit(b, b, 5), []);
+  const a = crlf(withFile(PLAIN, 'instructions.md', PLAIN['instructions.md'] + '- [I7 t5] new\n'));
+  assert.deepEqual(checkCuratorEdit(b, a, 5), []);
+  has(checkCuratorEdit(b, crlf(BASE), 5), 'plain line lost: "use tabs"');
+  const sup = crlf(withFile(BASE, 'superseded.md', BASE['superseded.md'] + '- [I7 t5 retired t5] x (reason: y)\n'));
+  assert.deepEqual(checkCuratorEdit(crlf(BASE), sup, 5), []);
+});
