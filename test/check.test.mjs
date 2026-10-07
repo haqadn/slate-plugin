@@ -321,3 +321,27 @@ test('FIX6: CRLF files behave like LF', () => {
   const sup = crlf(withFile(BASE, 'superseded.md', BASE['superseded.md'] + '- [I7 t5 retired t5] x (reason: y)\n'));
   assert.deepEqual(checkCuratorEdit(crlf(BASE), sup, 5), []);
 });
+
+// ---- fix round 2 ----
+test('R2-1: no-op on an old different-text duplicate ID passes; rewording one copy fails', () => {
+  const b = mem({
+    ...BASE,
+    'assumptions.md': '# A\n- [I1 t1] something else\n',
+  });
+  assert.deepEqual(checkCuratorEdit(b, { ...b }, 5), []);
+  const a = withFile(b, 'assumptions.md', '# A\n- [I1 t1] changed\n');
+  has(checkCuratorEdit(b, a, 5), 'I1 reworded');
+  const a2 = withFile(b, 'assumptions.md', '# A\n');
+  has(checkCuratorEdit(b, a2, 5), 'I1 reworded'); // dropping one copy is not allowed either
+});
+
+test('R2-1: I07 and I7 both present before is a passing no-op', () => {
+  const b = mem({ 'instructions.md': '# I\n- [I07 t1] a\n- [I7 t1] b\n' });
+  assert.deepEqual(checkCuratorEdit(b, { ...b }, 5), []);
+});
+
+test('R2-2: malformed line cannot be laundered through now.md', () => {
+  const b = withFile(BASE, 'now.md', '# Now\n- [I7] use pnpm\n');
+  const a = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- [I7] use pnpm\n');
+  has(checkCuratorEdit(b, a, 5), 'malformed item line: "- [I7] use pnpm"');
+});

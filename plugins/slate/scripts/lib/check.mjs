@@ -64,21 +64,23 @@ export function checkCuratorEdit(before, after, turn) {
   }
 
   // 1. Every ID live before stays live with identical text, or is properly retired.
-  const aLiveById = new Map();
-  for (const i of aLive) if (!aLiveById.has(i.id)) aLiveById.set(i.id, i);
-  const aRetiredById = new Map();
-  for (const r of aRetired) if (!aRetiredById.has(r.id)) aRetiredById.set(r.id, r);
+  // Old copies are matched one by one on (ID, text), so old duplicate IDs cannot freeze a no-op.
+  const livePool = new Map();
+  for (const i of aLive) {
+    const k = i.id + "\0" + i.text;
+    livePool.set(k, (livePool.get(k) ?? 0) + 1);
+  }
   for (const old of bLive) {
-    const live = aLiveById.get(old.id);
-    if (live) {
-      if (live.text !== old.text) v.push(`${old.id} reworded`);
-      continue;
-    }
-    const ret = aRetiredById.get(old.id);
-    if (!ret) { v.push(`${old.id} deleted`); continue; }
+    const k = old.id + "\0" + old.text;
+    const n = livePool.get(k) ?? 0;
+    if (n > 0) { livePool.set(k, n - 1); continue; }
+    if (aLive.some(i => i.id === old.id)) { v.push(`${old.id} reworded`); continue; }
+    const rets = aRetired.filter(r => r.id === old.id);
+    if (rets.length === 0) { v.push(`${old.id} deleted`); continue; }
+    const ret = rets.find(r => r.text === old.text) ?? rets[0];
     if (ret.text !== old.text) v.push(`${old.id} reworded`);
     if (ret.retiredTurn !== turn) v.push(`${old.id} retired at t${ret.retiredTurn}, expected t${turn}`);
-    if (ret.reason.trim() === '') v.push(`${old.id} retired without reason`);
+    if (ret.reason.trim() === "") v.push(`${old.id} retired without reason`);
   }
 
   // 2. superseded.md only gained lines.
@@ -141,7 +143,7 @@ export function checkCuratorEdit(before, after, turn) {
   }
 
   // New item-looking lines that do not parse would otherwise become protected plain text.
-  const beforeLines = new Set(MEMORY_FILES.flatMap(f => rawLines(before[f])));
+  const beforeLines = new Set(HEADING_FILES.flatMap(f => rawLines(before[f])));
   for (const f of HEADING_FILES) {
     for (const l of a[f].plain) {
       if (/^- \[[IAF]/.test(l) && !beforeLines.has(l)) v.push(`malformed item line: "${l}"`);
