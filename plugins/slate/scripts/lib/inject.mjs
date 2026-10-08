@@ -1,9 +1,9 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { ITEM_FILES, parseMemoryFile, formatItem } from './items.mjs';
+import { ITEM_FILES, MEMORY_FILES, parseMemoryFile, formatItem } from './items.mjs';
 import { readSession, writeSession, readMemory } from './session.mjs';
 
-// Nothing here ever reads superseded.md into output; it is only named by path (in rules.md).
+// Nothing here ever puts superseded.md text into output. Retired texts are read only to filter lines out.
 
 const MAX = 10000; // SessionStart / UserPromptSubmit additionalContext cap
 const RULES_FILE = new URL('../../rules.md', import.meta.url);
@@ -11,12 +11,31 @@ const COMPACT_LINE = 'Memory below wins where it differs from the summary.';
 const REMINDER = 'slate: offload heavy reads to slate:offload; reply briefly.';
 const MAX_ADDS = 5;
 const MAX_WARNINGS = 5;
-const WARNING_CHARS = 300;
+const WARNING_CHARS = 200; // before the "(see …curator.log)" tail
 // Change-line order: as in the memory block (instructions, facts, assumptions).
 const TYPE_ORDER = ['I', 'F', 'A'];
-// A malformed retired line still carries retired text; keep it out.
-const RETIRED_LIKE = /^\s*- \[[IAF]\d+ t\d+ retired\b/;
-const LOG_LINE = /^\S+ (t\d+) (restored|error): (.*)$/;
+// Any line with a retired-style tag, however mangled, carries retired text; keep it out.
+const RETIRED_LIKE = /\[[IAF]\d+\b[^\]]*\bretired\b/i;
+const LOG_LINE = /^\S+ (t\d+) (restored|error)(?::(.*))?$/;
+const ID_TOKEN = /\b[IAF]\d+\b/g;
+// Violation kinds (from check.mjs messages) a warning may name. Only these labels are echoed.
+const KINDS = [
+  [/retired line outside superseded\.md/, 'retired line misplaced'],
+  [/live item in superseded\.md/, 'live item in superseded.md'],
+  [/superseded\.md lost line/, 'superseded line lost'],
+  [/plain line lost/, 'plain line lost'],
+  [/heading lost/, 'heading lost'],
+  [/\breworded\b/, 'reworded'],
+  [/\bdeleted\b/, 'deleted'],
+  [/\bretired at t\d+/, 'wrong retire turn'],
+  [/retired without reason/, 'no retire reason'],
+  [/\bduplicated\b/, 'duplicated'],
+  [/not above previous max/, 'ID not above max'],
+  [/\btagged t\d+/, 'wrong turn tag'],
+  [/malformed item line/, 'malformed line'],
+  [/\.md missing\b/, 'file missing'],
+  [/now\.md has \d+ lines/, 'now.md too long'],
+];
 
 const clip = (s, n) => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
 
@@ -37,26 +56,40 @@ function seenOf(items) {
   return seen;
 }
 
+// Full texts of every retired item, wherever its line sits.
+function retiredTexts(memory) {
+  const out = new Set();
+  for (const f of MEMORY_FILES) {
+    for (const r of parseMemoryFile(memory[f]).retired) if (r.text.trim()) out.add(r.text.trim());
+  }
+  return [...out];
+}
+
+// A non-item line is safe if it has no retired-style tag and holds no retired item's text.
+const safeText = (retired) => (l) => !RETIRED_LIKE.test(l) && !retired.some((t) => l.includes(t));
+
 // Live lines of an item file: items with their IDs, then plain (hand-written) lines.
-function liveLines(text) {
+function liveLines(text, retired) {
   const p = parseMemoryFile(text);
-  return [...p.items.map(formatItem), ...p.plain.filter((l) => !RETIRED_LIKE.test(l))];
+  return [...p.items.map(formatItem).filter((l) => !RETIRED_LIKE.test(l)), ...p.plain.filter(safeText(retired))];
 }
 
 // now.md is free text: every non-blank line, in order, headings included.
-const nowLines = (text) => String(text).split(/\r?\n/).filter((l) => l.trim() !== '' && !RETIRED_LIKE.test(l));
+const nowLines = (text, retired) =>
+  String(text).split(/\r?\n/).filter((l) => l.trim() !== '').filter(safeText(retired));
 
 export async function memoryBlock(dir, { afterCompact = false } = {}) {
   const memory = await readMemory(dir);
   const head = afterCompact ? `# slate memory\n${COMPACT_LINE}` : '# slate memory';
   const rules = (await rulesText(dir)).trim();
+  const retired = retiredTexts(memory);
   const sections = [
     ['Instructions', 'instructions.md'],
     ['Now', 'now.md'],
     ['Facts', 'facts.md'],
     ['Assumptions', 'assumptions.md'],
   ].map(([title, file]) => {
-    const lines = file === 'now.md' ? nowLines(memory[file]) : liveLines(memory[file]);
+    const lines = file === 'now.md' ? nowLines(memory[file], retired) : liveLines(memory[file], retired);
     return { title, file, lines, body: lines.join('\n') };
   });
   const byFile = Object.fromEntries(sections.map((s) => [s.file, s]));
@@ -70,7 +103,7 @@ export async function memoryBlock(dir, { afterCompact = false } = {}) {
     if (s.lines.length) s.body = `${s.lines.length} lines, too long to show; read ${where(s)} when needed.`;
   }
   // Still over: keep the first lines that fit and point at the file for the rest.
-  for (const file of ['instructions.md', 'now.md']) {
+  for (const file of ['now.md', 'instructions.md']) {
     if (render().length <= MAX) break;
     const s = byFile[file];
     if (!s.lines.length) continue;
@@ -94,12 +127,25 @@ export async function memoryBlock(dir, { afterCompact = false } = {}) {
   return out;
 }
 
+// One warning line from known-safe tokens only: turn, status, ID tokens, violation kinds.
+// Free text from the log is never echoed; it can quote superseded.md in any form.
+function warningLine(turn, status, detail, log) {
+  const ids = [...new Set(detail.match(ID_TOKEN) ?? [])].slice(0, 10);
+  const kinds = KINDS.map(([re, label]) => [detail.search(re), label])
+    .filter(([at]) => at >= 0)
+    .sort((a, b) => a[0] - b[0])
+    .map(([, label]) => label);
+  const what = [ids.join(' '), [...new Set(kinds)].join(', ')].filter(Boolean).join('; ');
+  return `slate warning: ${clip(`${turn} ${status}${what ? `: ${what}` : ''}`, WARNING_CHARS)} (see ${log})`;
+}
+
 // curator.log lines `<ISO> t<N> <status>: <detail>` not yet shown, restored/error only.
 // Only complete lines are consumed; session.logSeen holds the byte offset already read.
 async function newWarnings(dir, session) {
+  const log = path.join(dir, 'curator.log');
   let buf;
   try {
-    buf = await fs.readFile(path.join(dir, 'curator.log'));
+    buf = await fs.readFile(log);
   } catch (e) {
     if (e.code === 'ENOENT') return [];
     throw e;
@@ -112,8 +158,7 @@ async function newWarnings(dir, session) {
   const out = [];
   for (const raw of buf.subarray(start, end).toString('utf8').split('\n')) {
     const m = LOG_LINE.exec(raw.replace(/\r$/, ''));
-    // Safety-check details quote raw lines (superseded.md ones included): never echo quoted text.
-    if (m) out.push(`${m[1]} ${m[2]}: ${m[3].replace(/".*"/, '"…"')}`);
+    if (m) out.push(warningLine(m[1], m[2], m[3] ?? '', log));
   }
   return out;
 }
@@ -132,7 +177,8 @@ export async function changeLine(dir, { waiting = false } = {}) {
     for (const type of TYPE_ORDER) {
       for (const it of items[type]) {
         if (session.seen[it.id] === it.text) continue;
-        if (shown < MAX_ADDS) {
+        // Text with a retired-style tag is never shown; the item goes to the "+N more" pointer.
+        if (shown < MAX_ADDS && !RETIRED_LIKE.test(it.text)) {
           entries.push(`+${it.id} ${it.text}`);
           shown++;
         } else {
@@ -157,7 +203,7 @@ export async function changeLine(dir, { waiting = false } = {}) {
   const warnings = await newWarnings(dir, session);
   const lines = [REMINDER];
   if (entries.length) lines.push(`slate: ${entries.join(' · ')}`);
-  for (const w of warnings.slice(0, MAX_WARNINGS)) lines.push(clip(`slate warning: ${w}`, WARNING_CHARS));
+  lines.push(...warnings.slice(0, MAX_WARNINGS));
   if (warnings.length > MAX_WARNINGS) {
     lines.push(`slate warning: +${warnings.length - MAX_WARNINGS} more in ${path.join(dir, 'curator.log')}`);
   }

@@ -30,14 +30,20 @@ const lines = (prefix, n, size) =>
 test('rules.md carries the main-thread rules', async () => {
   const raw = await fs.readFile(new URL('../plugins/slate/rules.md', import.meta.url), 'utf8');
   for (const s of ['lead with the answer', 'offload', 'slate:offload', 'read-only', 'CLAUDE.md', 'AGENTS.md',
-    '{{dir}}/instructions.md', '{{dir}}/reports/<slug>.md', '{{dir}}/superseded.md', '{{dir}}/conversation/NNNN.md',
-    'Return ≤10 lines']) {
+    '{{dir}}/instructions.md', '{{dir}}/reports/<slug>.md', 'superseded.md', 'conversation/NNNN.md',
+    'Return ≤10 lines', 'instead of doing it yourself', 'when unsure, offload', 'memory still updating',
+    'slate warning', 'Task line', 'replaces']) {
     assert.ok(raw.includes(s), `rules.md lacks ${JSON.stringify(s)}`);
   }
+  // the folder once near the top, then only the brief template's two full paths
+  assert.equal(raw.split('{{dir}}').length - 1, 3);
+  assert.ok(raw.indexOf('{{dir}}') < 200);
 });
 
-test('rulesText fills every {{dir}} and stays under ~1,500 chars with a real path', async () => {
-  const dir = '/Users/someone/Projects/my-project/.slate/0b7e8f5c-1234-4abc-9def-0123456789ab';
+test('rulesText fills every {{dir}} and stays ≤1,500 chars with a 120-char path', async () => {
+  const id = '0b7e8f5c-1234-4abc-9def-0123456789ab';
+  const dir = `/Users/someone/${'p'.repeat(120 - '/Users/someone//.slate/'.length - id.length)}/.slate/${id}`;
+  assert.equal(dir.length, 120);
   const t = await rulesText(dir);
   assert.ok(!t.includes('{{dir}}'));
   assert.ok(t.includes(`${dir}/instructions.md`));
@@ -72,7 +78,7 @@ test('core: no superseded text reaches either builder', async () => {
   const line = await changeLine(dir, { waiting: false });
   assert.ok(!line.includes('ZZ-RETIRED-ZZ'), line);
   assert.ok(line.includes('retired I3'), line);
-  assert.ok(line.includes('t2 restored: superseded.md lost line: "…"; I9 deleted'), line);
+  assert.ok(line.includes(`slate warning: t2 restored: I3 I9; superseded line lost, deleted (see ${path.join(dir, 'curator.log')})`), line);
 
   for (const afterCompact of [false, true]) {
     const block = await memoryBlock(dir, { afterCompact });
@@ -85,6 +91,55 @@ test('core: no superseded text reaches either builder', async () => {
   const cut = await memoryBlock(dir, { afterCompact: true });
   assert.ok(!cut.includes('ZZ-RETIRED-ZZ'));
   assert.ok(!(await changeLine(dir, { waiting: true })).includes('ZZ-RETIRED-ZZ'));
+});
+
+const RETIRED_SHAPES = [
+  '* [I7 t1 retired t2] ZZ-RETIRED-ZZ star bullet (reason: r)',
+  '> - [I8 t1 retired t2] ZZ-RETIRED-ZZ quoted (reason: r)',
+  '- [I6 retired t2] ZZ-RETIRED-ZZ no turn',
+  '- [I9 t1 Retired t2] ZZ-RETIRED-ZZ capitalised (reason: r)',
+  'note [A2 t1 RETIRED t3] ZZ-RETIRED-ZZ mid-line',
+  '- remember: ZZ-RETIRED-ZZ use npm, as before', // holds a retired item's full text
+];
+
+test('core: retired-looking lines and copies of retired text stay out of the block', async () => {
+  const dir = await session();
+  await write(dir, 'superseded.md', '# Superseded\n- [I3 t1 retired t2] ZZ-RETIRED-ZZ use npm (reason: pnpm now)\n');
+  await write(dir, 'instructions.md', `# Instructions\n- [I4 t2] use pnpm\n- live hand edit\n${RETIRED_SHAPES.join('\n')}\n`);
+  await write(dir, 'now.md', `Goal: ship\n${RETIRED_SHAPES.join('\n')}\nNext: tests\n`);
+  const b = await memoryBlock(dir, { afterCompact: false });
+  assert.ok(!b.includes('ZZ-RETIRED-ZZ'), b);
+  for (const s of ['- [I4 t2] use pnpm', '- live hand edit', 'Goal: ship', 'Next: tests']) assert.ok(b.includes(s), s);
+});
+
+test('core: an item whose text carries a retired tag is shown by ID only', async () => {
+  const dir = await session();
+  await write(dir, 'instructions.md', '# Instructions\n- [I1 t1] fine\n- [I5 t2] [I3 t1 retired t2] ZZ-RETIRED-ZZ x\n');
+  const line = await changeLine(dir, { waiting: false });
+  assert.ok(!line.includes('ZZ-RETIRED-ZZ'), line);
+  assert.ok(line.includes('+I1 fine') && line.includes(`+1 more (see ${path.join(dir, 'instructions.md')})`), line);
+  assert.ok(!(await memoryBlock(dir, { afterCompact: false })).includes('ZZ-RETIRED-ZZ'));
+});
+
+test('core: warnings echo only status, IDs and violation kinds, never log text', async () => {
+  const dir = await session();
+  const log = path.join(dir, 'curator.log');
+  await write(dir, 'curator.log', [
+    't1 restored: superseded.md lost line: "- [I3 t1 retired t2] ZZ-RETIRED-ZZ unbalanced',
+    't2 restored: I4 reworded from ZZ-RETIRED-ZZ use npm to use pnpm',
+    "t3 restored: plain line lost: 'ZZ-RETIRED-ZZ single'",
+    't4 restored: heading lost: \u201cZZ-RETIRED-ZZ curly\u201d; F2 duplicated',
+    't5 error: ZZ-RETIRED-ZZ claude exited 1',
+  ].map((l) => `2026-10-07T10:00:00.000Z ${l}\n`).join(''));
+  const out = await changeLine(dir, { waiting: false });
+  assert.ok(!out.includes('ZZ-RETIRED-ZZ'), out);
+  for (const w of [
+    't1 restored: I3; superseded line lost',
+    't2 restored: I4; reworded',
+    't3 restored: plain line lost',
+    't4 restored: F2; heading lost, duplicated',
+    't5 error',
+  ]) assert.ok(out.includes(`slate warning: ${w} (see ${log})`), `${w}\n${out}`);
 });
 
 // --- memoryBlock ---
@@ -145,8 +200,21 @@ test('memoryBlock: facts then assumptions spill, then instructions are cut with 
   b = await memoryBlock(dir, { afterCompact: true });
   assert.ok(b.length <= MAX, `${b.length}`);
   assert.ok(b.includes('- [I1 t1] '), 'first instructions kept');
-  assert.ok(b.includes(path.join(dir, 'instructions.md')));
+  assert.ok(b.includes(`more; read ${path.join(dir, 'instructions.md')}`));
   assert.ok(b.includes(COMPACT_LINE));
+});
+
+test('memoryBlock: now.md is cut before instructions', async () => {
+  const dir = await session();
+  // instructions fit alone, not together with now
+  const n = Math.floor((MAX - (await rulesText(dir)).length - 200) / 1012);
+  await write(dir, 'now.md', `${'n'.repeat(100)}\n`.repeat(15));
+  await write(dir, 'instructions.md', `# Instructions\n${lines('I', n, 1000)}\n`);
+  const b = await memoryBlock(dir, { afterCompact: false });
+  assert.ok(b.length <= MAX, `${b.length}`);
+  for (let i = 1; i <= n; i++) assert.ok(b.includes(`- [I${i} t1] `), `I${i} kept in full`);
+  assert.ok(b.includes(`more; read ${path.join(dir, 'now.md')}`), 'now.md cut with a pointer');
+  assert.ok(!b.includes(`more; read ${path.join(dir, 'instructions.md')}`), 'instructions not cut');
 });
 
 test('memoryBlock: never exceeds 10,000 even with a huge now.md', async () => {
@@ -190,6 +258,23 @@ test('changeLine: add shows full text, retire shows the ID only, no change shows
   assert.equal(await changeLine(dir, { waiting: false }), REMINDER);
 });
 
+test('changeLine: an item moved to another file is not a change', async () => {
+  const dir = await session();
+  await write(dir, 'assumptions.md', '# Assumptions\n- [A1 t1] user is on macOS\n');
+  await memoryBlock(dir, { afterCompact: false });
+  await write(dir, 'assumptions.md', '# Assumptions\n');
+  await write(dir, 'facts.md', '# Facts\n- [A1 t1] user is on macOS\n');
+  assert.equal(await changeLine(dir, { waiting: false }), REMINDER);
+});
+
+test('changeLine: a hand edit to a known ID shows the new text under that ID', async () => {
+  const dir = await session();
+  await write(dir, 'instructions.md', '# Instructions\n- [I1 t1] Use npm\n');
+  await memoryBlock(dir, { afterCompact: false });
+  await write(dir, 'instructions.md', '# Instructions\n- [I1 t1] Use pnpm\n');
+  assert.equal(await changeLine(dir, { waiting: false }), `${REMINDER}\nslate: +I1 Use pnpm`);
+});
+
 test('changeLine: exact format', async () => {
   const dir = await session();
   const s = await readSession(dir);
@@ -228,9 +313,10 @@ test('changeLine: curator.log restored/error lines show once, other statuses nev
     '2026-10-07T10:01:00.000Z t2 restored: I3 removed without retiring\n' +
     '2026-10-07T10:02:00.000Z t3 error: claude exited 1\n');
   const first = await changeLine(dir, { waiting: false });
-  assert.ok(first.includes('t2 restored: I3 removed without retiring'), first);
-  assert.ok(first.includes('t3 error: claude exited 1'), first);
-  assert.ok(!first.includes('kept'), first);
+  const log = path.join(dir, 'curator.log');
+  assert.ok(first.includes(`slate warning: t2 restored: I3 (see ${log})`), first);
+  assert.ok(first.includes(`slate warning: t3 error (see ${log})`), first);
+  assert.ok(!first.includes('kept') && !first.includes('removed') && !first.includes('exited'), first);
   assert.ok(!first.includes('2026-10-07T'), 'timestamps dropped');
   assert.equal(await changeLine(dir, { waiting: false }), REMINDER);
 
@@ -243,7 +329,7 @@ test('changeLine: curator.log restored/error lines show once, other statuses nev
   assert.equal(await changeLine(dir, { waiting: true }), `${REMINDER}\nslate: memory still updating`);
   await append(dir, 'curator.log', 'ored: F1 text changed\n');
   const later = await changeLine(dir, { waiting: false });
-  assert.ok(later.includes('t4 restored: F1 text changed'), later);
+  assert.ok(later.includes(`slate warning: t4 restored: F1 (see ${log})`), later);
   assert.ok(!later.includes('t2 restored'), later);
   assert.equal(await changeLine(dir, { waiting: false }), REMINDER);
 });
@@ -253,7 +339,7 @@ test('changeLine: a log replaced by a shorter one is read from the start', async
   await write(dir, 'curator.log', `${'2026-10-07T10:00:00.000Z t1 ok: fine\n'.repeat(5)}`);
   await changeLine(dir, { waiting: false });
   await write(dir, 'curator.log', '2026-10-07T11:00:00.000Z t9 error: boom\n');
-  assert.ok((await changeLine(dir, { waiting: false })).includes('t9 error: boom'));
+  assert.ok((await changeLine(dir, { waiting: false })).includes('slate warning: t9 error (see'));
 });
 
 test('changeLine stays within the hook cap with huge items and many warnings', async () => {

@@ -1,19 +1,11 @@
-# slate rules
+slate session folder: {{dir}}; files below are in it. A background curator updates it; it's read-only for you and subagents, except their reports.
 
-Session memory lives in {{dir}}, kept by a background curator. Its files are read-only for you and subagents; subagents only add reports.
-
-Replies
-- Short and plain, like a colleague: lead with the answer, no essay. Give detail when asked.
-
-Offload
-- Use the `slate:offload` agent for broad searches, more than a couple of files, logs, test or build output, web research, multi-file reviews.
+- Reply like a colleague: short, plain, lead with the answer, no essay. Detail if asked.
+- Offload to the `slate:offload` agent instead of doing it yourself: broad searches, more than a couple of files, logs, test/build output, web research, multi-file reviews; when unsure, offload.
 - Keep conversation, decisions, small targeted reads here.
-- Brief the agent: "Read {{dir}}/instructions.md, facts.md, now.md. Task: … Write details to {{dir}}/reports/<slug>.md. Return ≤10 lines." Point at files; never retell instructions.
-
-Memory
-- Memory wins over earlier conversation where they differ.
-- A `slate:` line lists memory changes. `+I14 text`: new. `retired I3`: I3 no longer applies. `memory still updating`: the last exchange isn't in memory yet, so it wins.
-- Relay a `slate warning` to the user in one line.
-- Open {{dir}}/superseded.md only to learn why something changed.
-- Read {{dir}}/conversation/NNNN.md only for exact earlier wording.
-- Don't save notes to CLAUDE.md, AGENTS.md or any other memory file.
+- Agent brief: "Read {{dir}}/instructions.md, facts.md, now.md. Task: … Write details to {{dir}}/reports/<slug>.md. Return ≤10 lines." Never retell instructions.
+- Memory wins over earlier conversation.
+- A `slate:` line lists changes: `+I14 text` adds I14 or replaces its text; `retired I3` drops I3.
+- After `memory still updating` or a `slate warning` (tell the user), memory may miss the latest exchange; it wins. Put its newest unsaved instruction in the brief's Task line (the only retelling allowed).
+- Read superseded.md only for why things changed; conversation/NNNN.md only for exact wording.
+- Never save notes to CLAUDE.md, AGENTS.md or other memory files.
