@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { handle, curatorWaitMs } from '../plugins/slate/scripts/hook.mjs';
+import { handle, curatorWaitMs, HARNESS_PREFIXES } from '../plugins/slate/scripts/hook.mjs';
 import { initSession, readSession, readTurn, readMemory, sessionDir } from '../plugins/slate/scripts/lib/session.mjs';
 import { acquire } from '../plugins/slate/scripts/lib/lock.mjs';
 
@@ -240,6 +240,43 @@ test('notification while curator A runs: no new turn; the continuation is curate
   assert.equal(s.turn, 1);
 });
 
+test('HARNESS_PREFIXES: the five harness message shapes', () => {
+  assert.deepEqual(HARNESS_PREFIXES, [
+    '<task-notification', '<agent-message', '<cross-session-message', '<teammate-message', '[SYSTEM NOTIFICATION',
+  ]);
+});
+
+for (const prefix of [
+  '<task-notification', '<agent-message', '<cross-session-message', '<teammate-message', '[SYSTEM NOTIFICATION',
+]) {
+  test(`harness message ${prefix}: not a turn, no conversation file, change line injected`, async () => {
+    const { root, env, dir, id } = await activeSession();
+    const text = `${prefix} from="a1">\n  report text that must not be recorded as the user's\n`;
+    const n = await handle('UserPromptSubmit', prompt(id, root, text), env);
+    assert.ok(ctx(n).startsWith(REMINDER));
+    const s = await readSession(dir);
+    assert.equal(s.turn, 0);
+    assert.equal(s.lastKind, 'notification');
+    assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), []);
+  });
+}
+
+test('<agent-message> after a user turn: the following Stop appends a continuation to that turn', async () => {
+  const { root, env, dir, id } = await activeSession();
+  await handle('UserPromptSubmit', prompt(id, root, 'find the TODOs'), env);
+  await handle('Stop', stop(id, root, 'running in the background'), env);
+  const n = await handle('UserPromptSubmit', prompt(id, root, '<agent-message from="a1">\n  Found 12.\n</agent-message>'), env);
+  assert.ok(ctx(n).startsWith(REMINDER));
+  const s2 = await handle('Stop', stop(id, root, '12 files.'), env);
+  assert.deepEqual(s2.spawned, [CURATE, dir, '1', 'sonnet']);
+  const t = await readTurn(dir, 1);
+  assert.equal(t.message, 'find the TODOs');
+  assert.equal(t.answer, 'running in the background\n\n12 files.');
+  assert.equal((await readSession(dir)).turn, 1);
+  await until(async () => !(await exists(lockOf(dir))) && (await logLines(dir)).length >= 1);
+  await until(async () => !(await exists(lockOf(dir))));
+});
+
 test('notification before any user turn: change line only; the Stop does nothing', async () => {
   const { root, env, dir, id } = await activeSession();
   const n = await handle('UserPromptSubmit', prompt(id, root, '<task-notification>x'), env);
@@ -248,6 +285,62 @@ test('notification before any user turn: change line only; the Stop does nothing
   assert.equal(st.spawned, undefined);
   assert.equal((await readSession(dir)).turn, 0);
   assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), []);
+});
+
+// --- SubagentStop ---
+
+const subStop = (id, root, fields = {}) => ({
+  hook_event_name: 'SubagentStop', session_id: id, cwd: root, agent_id: 'a1', agent_type: 'slate:offload',
+  stop_hook_active: false, last_assistant_message: 'x'.repeat(801), ...fields,
+});
+const BLOCK_801 = {
+  decision: 'block',
+  reason: 'Return is 801 chars. Rewrite it in ≤600 chars, ≤10 lines; details belong in the report.',
+};
+
+test('SubagentStop: a slate:offload return over 800 chars is blocked once with its length', async () => {
+  const { root, env, dir, id } = await activeSession();
+  const before = await fs.readFile(path.join(dir, 'session.json'), 'utf8');
+  const r = await handle('SubagentStop', subStop(id, root), env);
+  assert.deepEqual(r.output, BLOCK_801);
+  assert.equal(r.spawned, undefined);
+  assert.equal(await fs.readFile(path.join(dir, 'session.json'), 'utf8'), before, 'session untouched');
+  // The rewrite stops with stop_hook_active set: never blocked twice.
+  const again = await handle('SubagentStop', subStop(id, root, { stop_hook_active: true }), env);
+  assert.equal(again.output, null);
+});
+
+test('SubagentStop: length counts characters, not UTF-16 units', async () => {
+  const { root, env, id } = await activeSession();
+  const r = await handle('SubagentStop', subStop(id, root, { last_assistant_message: '≤'.repeat(800) + '😀' }), env);
+  assert.equal(r.output.reason, 'Return is 801 chars. Rewrite it in ≤600 chars, ≤10 lines; details belong in the report.');
+  const ok = await handle('SubagentStop', subStop(id, root, { last_assistant_message: '😀'.repeat(800) }), env);
+  assert.equal(ok.output, null);
+});
+
+test('SubagentStop: nothing for ≤800 chars, other agents, no folder, or inside the curator', async () => {
+  const { root, env, id } = await activeSession();
+  const cases = [
+    subStop(id, root, { last_assistant_message: 'x'.repeat(800) }),
+    subStop(id, root, { agent_type: 'Explore' }),
+    subStop(id, root, { agent_type: '' }),
+    subStop(id, root, { agent_type: undefined }),
+    subStop(id, root, { last_assistant_message: undefined }),
+    subStop('other-session', root),
+  ];
+  for (const c of cases) assert.equal((await handle('SubagentStop', c, env)).output, null, JSON.stringify(c).slice(0, 120));
+  assert.equal((await handle('SubagentStop', subStop(id, root), { ...env, SLATE_CURATOR: '1' })).output, null);
+  const bare = await project();
+  assert.equal((await handle('SubagentStop', subStop('sid', bare.root), bare.env)).output, null);
+  assert.equal(await exists(path.join(bare.root, '.slate')), false);
+});
+
+test('CLI: SubagentStop prints the block JSON', async () => {
+  const { root, env, id } = await activeSession();
+  const r = await run('SubagentStop', JSON.stringify(subStop(id, root)), env);
+  assert.equal(r.code, 0);
+  assert.equal(r.stderr, '');
+  assert.deepEqual(JSON.parse(r.stdout), BLOCK_801);
 });
 
 // --- Stop ---
@@ -492,16 +585,18 @@ test('CLI: bad input exits 0 with one stderr line and no stdout', async () => {
 
 // --- hooks.json ---
 
-test('hooks.json: four events, matcher, timeouts, quoted plugin-root commands', async () => {
+test('hooks.json: five events, matcher, timeouts, quoted plugin-root commands', async () => {
   const cfg = JSON.parse(await fs.readFile(HOOKS_JSON, 'utf8'));
   assert.deepEqual(Object.keys(cfg), ['hooks']);
-  assert.deepEqual(Object.keys(cfg.hooks).sort(), [...EVENTS].sort());
-  const want = { SessionStart: 60, UserPromptSubmit: 30, Stop: 10, PreCompact: 90 };
-  for (const event of EVENTS) {
+  const events = [...EVENTS, 'SubagentStop'];
+  assert.deepEqual(Object.keys(cfg.hooks).sort(), [...events].sort());
+  const want = { SessionStart: 60, UserPromptSubmit: 30, Stop: 10, PreCompact: 90, SubagentStop: 10 };
+  for (const event of events) {
     const groups = cfg.hooks[event];
     assert.equal(groups.length, 1, event);
     const [group] = groups;
     if (event === 'SessionStart') assert.equal(group.matcher, 'startup|resume|clear|compact|fork');
+    else if (event === 'SubagentStop') assert.equal(group.matcher, 'slate:offload'); // matched on agent_type
     else assert.equal(group.matcher, undefined, event);
     assert.deepEqual(group.hooks, [{
       type: 'command',

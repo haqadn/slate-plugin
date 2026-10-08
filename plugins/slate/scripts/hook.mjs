@@ -1,4 +1,4 @@
-// Hook dispatcher for SessionStart, UserPromptSubmit, Stop and PreCompact.
+// Hook dispatcher for SessionStart, UserPromptSubmit, Stop, PreCompact and SubagentStop.
 // CLI: node hook.mjs <Event>, hook JSON on stdin, hook JSON (or nothing) on stdout. Always exits 0.
 import fs from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
@@ -21,6 +21,15 @@ const COMPACT_WAIT_MS = 60000;
 const MAX_WAIT_MS = 25000;
 // A session ID becomes a folder name; anything that could leave .slate/ is not ours.
 const SAFE_ID = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
+// Prompts the harness injects (a background agent finishing, a subagent hand-back, messages from
+// other sessions or teammates, system notices). They continue the current turn; they are never
+// the user's words.
+export const HARNESS_PREFIXES = [
+  '<task-notification', '<agent-message', '<cross-session-message', '<teammate-message', '[SYSTEM NOTIFICATION',
+];
+const isHarness = (prompt) => HARNESS_PREFIXES.some((p) => prompt.startsWith(p));
+const OFFLOAD_AGENT = 'slate:offload';
+const RETURN_LIMIT = 800; // chars; above this an offload return is sent back once for a rewrite
 
 const exists = (p) => fs.access(p).then(() => true, () => false);
 const hasFolder = (dir) => exists(path.join(dir, 'session.json'));
@@ -99,9 +108,9 @@ async function userPromptSubmit(input, dir, env) {
     await setKind(dir, 'slate');
     return { output: null };
   }
-  if (prompt.startsWith('<task-notification>')) {
-    // A background agent finished; its answer continues the current turn. Don't wait, but don't
-    // diff memory a running curator may still restore either.
+  if (isHarness(prompt)) {
+    // E.g. a background agent finished; the answer that follows continues the current turn. Don't
+    // wait, but don't diff memory a running curator may still restore either.
     await setKind(dir, 'notification');
     const waiting = !(await waitFree(dir, 0));
     return { output: context('UserPromptSubmit', await changeLine(dir, { waiting })) };
@@ -131,14 +140,34 @@ async function stop(input, dir, env) {
   return { output: null, spawned: spawnCurator(dir, s.turn, env) };
 }
 
+// An offload agent's return goes into the main thread. Over the limit, send it back once for a
+// shorter rewrite; the second stop carries stop_hook_active and always passes.
+function subagentStop(input) {
+  const text = input.last_assistant_message;
+  if (input.agent_type !== OFFLOAD_AGENT || input.stop_hook_active === true || typeof text !== 'string') {
+    return { output: null };
+  }
+  const chars = [...text].length;
+  if (chars <= RETURN_LIMIT) return { output: null };
+  return {
+    output: {
+      decision: 'block',
+      reason: `Return is ${chars} chars. Rewrite it in ≤600 chars, ≤10 lines; details belong in the report.`,
+    },
+  };
+}
+
 export async function handle(event, input, env = process.env) {
   if (env.SLATE_CURATOR === '1') return { output: null };
-  if (!input || typeof input !== 'object' || input.agent_id) return { output: null };
+  if (!input || typeof input !== 'object') return { output: null };
+  // SubagentStop always carries the subagent's agent_id; every other event with one fired inside a subagent.
+  if (input.agent_id && event !== 'SubagentStop') return { output: null };
   const root = env.CLAUDE_PROJECT_DIR || input.cwd;
   const id = input.session_id;
   if (!root || typeof id !== 'string' || !SAFE_ID.test(id)) return { output: null };
   const dir = sessionDir(root, id);
 
+  if (event === 'SubagentStop') return (await hasFolder(dir)) ? subagentStop(input) : { output: null };
   if (event === 'SessionStart') return sessionStart(input, root, dir, env);
   if (!(await hasFolder(dir))) return { output: null };
   switch (event) {

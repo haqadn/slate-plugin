@@ -57,6 +57,7 @@ Long brainstorming and coding sessions without context rot:
 | UserPromptSubmit hook | Waits up to 20s for a running curator. Increments the turn and writes the message verbatim to `conversation/NNNN.md`. Injects the change line. |
 | Stop hook | Appends `last_assistant_message` to `conversation/NNNN.md`. Starts the curator detached, then returns immediately. |
 | PreCompact hook | Waits up to 60s for a running curator. Never blocks compaction. |
+| SubagentStop hook (`slate:offload`) | Sends a return over 800 chars back to the agent once, for a rewrite in ≤600 chars. |
 | Curator (`scripts/curate.mjs`) | Snapshot, then a `claude -p` edit pass, then the safety check, then keep or restore |
 | Agent `offload` | Reads the memory files named in its brief and does the heavy task. Writes details to `reports/<slug>.md`, returns ≤10 lines, and never edits memory files. |
 | `rules.md` | One source for the main-thread rules. Used by the init skill and by the SessionStart block. |

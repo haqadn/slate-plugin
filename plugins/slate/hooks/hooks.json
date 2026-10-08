@@ -28,6 +28,14 @@
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs\" PreCompact", "timeout": 90 }
         ]
       }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "slate:offload",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs\" SubagentStop", "timeout": 10 }
+        ]
+      }
     ]
   }
 }

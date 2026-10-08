@@ -23,11 +23,11 @@ test('plugin.json and marketplace.json agree and carry userConfig.curatorModel',
   assert.ok(opt.title && opt.description);
 });
 
-test('hooks.json wraps four events and every plugin-root path exists', async () => {
+test('hooks.json wraps five events and every plugin-root path exists', async () => {
   const cfg = await json(`${PLUGIN}hooks/hooks.json`);
-  assert.deepEqual(Object.keys(cfg.hooks).sort(), ['PreCompact', 'SessionStart', 'Stop', 'UserPromptSubmit']);
+  assert.deepEqual(Object.keys(cfg.hooks).sort(), ['PreCompact', 'SessionStart', 'Stop', 'SubagentStop', 'UserPromptSubmit']);
   const cmds = Object.values(cfg.hooks).flat().flatMap((g) => g.hooks.map((h) => h.command));
-  assert.equal(cmds.length, 4);
+  assert.equal(cmds.length, 5);
   for (const c of cmds) {
     for (const [, rel] of c.matchAll(/\$\{CLAUDE_PLUGIN_ROOT\}\/([^"\s]+)/g)) {
       assert.ok(await exists(PLUGIN + rel), rel);
