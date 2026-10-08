@@ -7,19 +7,33 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { runCurator } from '../plugins/slate/scripts/curate.mjs';
+import { runCurator, resolveClaudeBin, CURATOR_ENV_DENY } from '../plugins/slate/scripts/curate.mjs';
 import { initSession, writeMessage, appendAnswer, readMemory, writeMemory } from '../plugins/slate/scripts/lib/session.mjs';
 import { acquire } from '../plugins/slate/scripts/lib/lock.mjs';
 import { MEMORY_FILES } from '../plugins/slate/scripts/lib/items.mjs';
 import { checkCuratorEdit } from '../plugins/slate/scripts/lib/check.mjs';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-claude.mjs', import.meta.url));
+const SHIM = fileURLToPath(new URL('./fixtures/fake-claude-shim.sh', import.meta.url));
 const CURATE = fileURLToPath(new URL('../plugins/slate/scripts/curate.mjs', import.meta.url));
 const RULES = fileURLToPath(new URL('../plugins/slate/curator-rules.md', import.meta.url));
-const ENV_KEYS = ['FAKE_MODE', 'FAKE_RECORD', 'SLATE_CLAUDE_BIN', 'SLATE_TEST_INHERITED'];
+// Tests must never reach a real claude: drop what resolveClaudeBin would pick up from this shell.
+delete process.env.SLATE_CLAUDE_BIN;
+delete process.env.CLAUDE_CODE_EXECPATH;
+const ENV_KEYS = [...new Set([
+  'FAKE_MODE', 'FAKE_RECORD', 'SLATE_CLAUDE_BIN', 'SLATE_TEST_INHERITED',
+  'CLAUDECODE', 'CLAUDE_CODE_CHILD_SESSION', 'ANTHROPIC_BASE_URL', ...CURATOR_ENV_DENY,
+])];
 const SAVED_ENV = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 
 const temps = [];
+// Belt and braces: a bin that falls through to plain `claude` hits this stub, never a real model.
+const NO_CLAUDE = await fs.mkdtemp(path.join(os.tmpdir(), 'slate-noclaude-'));
+temps.push(NO_CLAUDE);
+await fs.writeFile(path.join(NO_CLAUDE, 'claude'), '#!/bin/sh\necho "test reached claude on PATH" >&2\nexit 97\n', {
+  mode: 0o755,
+});
+process.env.PATH = `${NO_CLAUDE}${path.delimiter}${process.env.PATH}`;
 after(async () => {
   for (const d of temps) await fs.rm(d, { recursive: true, force: true });
 });
@@ -103,7 +117,7 @@ test('command: prompt first, every flag, path-scoped rules, env, cwd, stdin igno
   assert.equal(flag(args, '--tools'), 'Read,Edit,Write');
 
   const real = realpathSync(dir);
-  assert.notEqual(real, dir, 'tmpdir should go through a symlink on macOS');
+  if (process.platform === 'darwin') assert.notEqual(real, dir, 'tmpdir goes through a symlink on macOS');
   const rules = MEMORY_FILES.flatMap((f) => [`Read(/${path.join(real, f)})`, `Edit(/${path.join(real, f)})`]);
   // --allowedTools is variadic, so it comes last and takes exactly the ten rules.
   assert.deepEqual(args.slice(args.indexOf('--allowedTools') + 1), rules);
@@ -117,9 +131,10 @@ test('command: prompt first, every flag, path-scoped rules, env, cwd, stdin igno
   assert.equal(call.stdinRdev, statSync('/dev/null').rdev);
 });
 
-test('command: --model override; bin defaults to SLATE_CLAUDE_BIN', async () => {
+test('command: --model override; bin defaults to SLATE_CLAUDE_BIN over CLAUDE_CODE_EXECPATH', async () => {
   const { dir, record } = await setup('good');
   process.env.SLATE_CLAUDE_BIN = FAKE;
+  process.env.CLAUDE_CODE_EXECPATH = '/usr/bin/false';
   const r = await runCurator({ dir, turn: TURN, model: 'haiku' });
   assert.equal(r.ok, true);
   const [call] = await calls(record);
@@ -140,6 +155,7 @@ test('prompt: rules, turn, full message, capped answer, five absolute paths', as
 
   assert.ok(prompt.includes((await fs.readFile(RULES, 'utf8')).trim()), 'rules');
   assert.ok(prompt.includes('Current turn: 2'), 'turn');
+  assert.ok(prompt.includes('Adopted plain bullets get `t0`.'), 'adoption tag');
   assert.ok(prompt.includes(message), 'message verbatim');
   assert.ok(prompt.includes('a'.repeat(12000)), 'answer kept up to the cap');
   assert.ok(!prompt.includes('ANSWER_TAIL'), 'answer capped');
@@ -156,6 +172,62 @@ test('prompt: a short answer is passed whole, without a truncation note', async 
   assert.ok(prompt.includes('Done, using pnpm.'));
   assert.ok(!prompt.includes('[answer truncated]'));
   assert.ok(!prompt.includes('rejected'));
+});
+
+test('prompt: a message over 100,000 chars is capped, pointing at the turn file', async () => {
+  const message = `${'m'.repeat(100000)}MESSAGE_TAIL`;
+  const { dir, record } = await setup('good', { message });
+  await runCurator({ dir, turn: TURN, bin: FAKE });
+  const [{ prompt }] = await calls(record);
+  assert.ok(prompt.includes('m'.repeat(100000)));
+  assert.ok(!prompt.includes('MESSAGE_TAIL'));
+  const turnFile = path.join(realpathSync(dir), 'conversation', '0002.md');
+  assert.ok(prompt.includes(`[message truncated; full text in ${turnFile}]`));
+});
+
+test('env: deny-listed session vars are stripped, everything else is inherited', async () => {
+  const { dir, record } = await setup('good');
+  assert.deepEqual([...CURATOR_ENV_DENY].sort(), [
+    'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_PARENT_SESSION_ID',
+    'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_CODE_SESSION_KIND', 'CLAUDE_CODE_SESSION_NAME',
+    'CLAUDE_CODE_SESSION_LOG', 'CLAUDE_CODE_SESSION_ATTENDED',
+    'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_JOB_DIR',
+    'CLAUDE_CODE_SSE_PORT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_ENV_FILE', 'CLAUDE_EFFORT',
+  ].sort());
+  for (const k of CURATOR_ENV_DENY) process.env[k] = `deny-${k}`;
+  process.env.CLAUDECODE = '1';
+  process.env.CLAUDE_CODE_CHILD_SESSION = '1';
+  process.env.ANTHROPIC_BASE_URL = 'http://slate.test';
+  const r = await runCurator({ dir, turn: TURN, bin: FAKE });
+  assert.equal(r.ok, true);
+  const [{ env }] = await calls(record);
+  for (const k of CURATOR_ENV_DENY) assert.ok(!(k in env), k);
+  assert.equal(env.PATH, process.env.PATH);
+  assert.equal(env.HOME, process.env.HOME);
+  assert.equal(env.ANTHROPIC_BASE_URL, 'http://slate.test');
+  assert.equal(env.CLAUDECODE, '1');
+  assert.equal(env.CLAUDE_CODE_CHILD_SESSION, '1');
+  assert.equal(env.SLATE_CURATOR, '1');
+  assert.equal(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1');
+});
+
+test('bin: SLATE_CLAUDE_BIN, then an executable absolute CLAUDE_CODE_EXECPATH, then claude', () => {
+  assert.equal(resolveClaudeBin({ SLATE_CLAUDE_BIN: '/x/fake', CLAUDE_CODE_EXECPATH: FAKE }), '/x/fake');
+  assert.equal(resolveClaudeBin({ CLAUDE_CODE_EXECPATH: FAKE }), FAKE);
+  assert.equal(resolveClaudeBin({ CLAUDE_CODE_EXECPATH: RULES }), 'claude', 'not executable');
+  assert.equal(resolveClaudeBin({ CLAUDE_CODE_EXECPATH: path.dirname(FAKE) }), 'claude', 'a directory');
+  assert.equal(resolveClaudeBin({ CLAUDE_CODE_EXECPATH: '/nonexistent/claude' }), 'claude');
+  assert.equal(resolveClaudeBin({ CLAUDE_CODE_EXECPATH: 'test/fixtures/fake-claude.mjs' }), 'claude', 'relative');
+  assert.equal(resolveClaudeBin({}), 'claude');
+});
+
+test('bin: runCurator uses CLAUDE_CODE_EXECPATH, read before it is stripped from the child env', async () => {
+  const { dir, record } = await setup('good');
+  process.env.CLAUDE_CODE_EXECPATH = FAKE;
+  const r = await runCurator({ dir, turn: TURN });
+  assert.equal(r.ok, true);
+  const [{ env }] = await calls(record);
+  assert.ok(!('CLAUDE_CODE_EXECPATH' in env));
 });
 
 test('good: keeps the edit, logs ok, releases the lock', async () => {
@@ -236,6 +308,44 @@ test('timeout: kills the child, logs error: timeout, leaves files unchanged', as
   assert.ok(await lockGone(dir));
 });
 
+test('timeout under a shim that does not exec: the whole group dies, no late edit', async () => {
+  const { dir, record, before } = await setup('sleep');
+  const r = await runCurator({ dir, turn: TURN, bin: SHIM, timeoutMs: 1000 });
+  assert.deepEqual(r, { ok: false, attempts: 1, violations: ['error: timeout'] });
+  assert.ok(await lockGone(dir));
+  await new Promise((res) => setTimeout(res, 3000)); // the fake would have edited by now
+  assert.deepEqual(await readMemory(dir), before);
+  const [{ pid }] = await calls(record);
+  assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+});
+
+test('a process outside the group holding stderr open does not keep the runner waiting', async () => {
+  const { dir, record } = await setup('orphan');
+  const t0 = Date.now();
+  try {
+    const r = await runCurator({ dir, turn: TURN, bin: FAKE });
+    assert.ok(Date.now() - t0 < 2500, `took ${Date.now() - t0}ms`);
+    assert.equal(r.ok, true);
+  } finally {
+    try {
+      process.kill(Number(await fs.readFile(`${record}.orphan`, 'utf8')), 'SIGKILL');
+    } catch {}
+  }
+});
+
+test('restore is byte for byte and keeps an absent file absent', async () => {
+  const { dir } = await setup('fail');
+  const odd = Buffer.concat([
+    Buffer.from('﻿# Instructions\r\n- [I1 t1] use npm\r\n- caf'), Buffer.from([0xff]), Buffer.from('\r\n'),
+  ]);
+  await fs.writeFile(path.join(dir, 'instructions.md'), odd);
+  await fs.rm(path.join(dir, 'now.md'));
+  const r = await runCurator({ dir, turn: TURN, bin: FAKE });
+  assert.equal(r.ok, false);
+  assert.ok((await fs.readFile(path.join(dir, 'instructions.md'))).equals(odd));
+  assert.ok(!(await exists(path.join(dir, 'now.md'))), 'now.md stays absent');
+});
+
 test('lock held: returns without running and without logging', async () => {
   const { dir, record, before } = await setup('good');
   const release = await acquire(dir);
@@ -265,6 +375,29 @@ test("curator-rules.md: the worked example passes the safety check", async () =>
     'superseded.md': `# Superseded\n${retired}\n`,
   };
   assert.deepEqual(checkCuratorEdit(before, afterEdit, 4), []);
+});
+
+test('curator-rules.md: wording the curator relies on', async () => {
+  const rules = await fs.readFile(RULES, 'utf8');
+  for (const s of [
+    "Every item line you don't retire stays exactly as it is.",
+    'To retire a plain user bullet (no ID), adopt it as `- [<ID> t0] <exact text>` and retire that ID in the same edit.',
+    '"use the staging DB for this"',
+    'If `now.md` is over 10 lines, shorten it.',
+  ]) assert.ok(rules.includes(s), s);
+});
+
+test('retiring a plain user bullet by adopting it at t0 passes the safety check', () => {
+  const empty = { 'assumptions.md': '# Assumptions\n', 'facts.md': '# Facts\n', 'now.md': '' };
+  const before = {
+    ...empty, 'instructions.md': '# Instructions\n- [I1 t1] use npm\n- prefer tabs\n', 'superseded.md': '# Superseded\n',
+  };
+  const afterEdit = {
+    ...empty,
+    'instructions.md': '# Instructions\n- [I1 t1] use npm\n- [I3 t2] use spaces\n',
+    'superseded.md': '# Superseded\n- [I2 t0 retired t2] prefer tabs (reason: user switched to spaces)\n',
+  };
+  assert.deepEqual(checkCuratorEdit(before, afterEdit, 2), []);
 });
 
 test('CLI: node curate.mjs <dir> <turn> [model]', async () => {

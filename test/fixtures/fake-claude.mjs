@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Fake `claude` for curator tests. Records each call to $FAKE_RECORD (one JSON line) and edits
-// the memory files named in the prompt, per $FAKE_MODE: good | bad | bad-then-good | fail | sleep.
+// the memory files named in the prompt, per $FAKE_MODE: good | bad | bad-then-good | fail | sleep | orphan.
 import fs from 'node:fs';
 
 const args = process.argv.slice(2);
@@ -56,9 +56,22 @@ switch (mode) {
     else good();
     break;
   case 'fail':
-    good(); // a crash after a partial edit; the runner must undo it
+    // A crash after a partial edit; the runner must undo it, including a file it created.
+    good();
+    fs.writeFileSync(fileFor('now.md'), 'Goal: fake\n');
     process.stderr.write('fake-claude: failing on purpose\n');
     process.exit(1);
+  case 'orphan': {
+    // Leaves a process in its own group holding our stderr open, then succeeds.
+    const { spawn } = await import('node:child_process');
+    const o = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 5000)'], {
+      detached: true, stdio: ['ignore', 'ignore', 'inherit'],
+    });
+    if (record) fs.writeFileSync(`${record}.orphan`, String(o.pid));
+    o.unref();
+    good();
+    break;
+  }
   case 'sleep':
     await new Promise((r) => setTimeout(r, 3000));
     good();
