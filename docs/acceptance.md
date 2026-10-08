@@ -6,6 +6,8 @@ Run on 2026-10-07 (local time) with Claude Code **2.1.293**, macOS. In this docu
 
 | Run | Checks | Result |
 |---|---|---|
+| **I2**: interactive, `/clear` during curation, final review | 7 / 7 | **PASS**. The curator was aborted and requeued; the block carried the "may not include turn 2" note; the drain re-curated turn 2 in the new folder. |
+| **I1**: interactive, same script, lighter turn 2 | 4 / 7 | The abort path was not reached: the curator finished inside SessionStart's 20 s wait, so the abort, note and drain checks have no case. The rest passed. I2 covers the missing three. |
 | **R3**: real settings, turns 1–3, round 3 | 13 / 13 | **PASS**. A 869-char hand-back was denied once, and the 608-char retry went through. |
 | **C**: isolated, 6 turns, round 2 | 19 / 19 | **PASS**. Run end to end on the round-2 script; checks 5, 9 and 19 recomputed from its data (see below). |
 | **B**: isolated, 6 turns, round 2 | 19 / 19 | **PASS**, after the round-2 measurement fix to check 18. Checks 5, 9 and 19 recomputed. |
@@ -13,7 +15,7 @@ Run on 2026-10-07 (local time) with Claude Code **2.1.293**, macOS. In this docu
 
 - **Isolated runs not rerun in round 3.** Round 3 changed the PreToolUse hook (`SubagentHandback` only), the `agent_id` guard, which unit tests cover, and three check definitions.
   - Recomputed from the recorded data: B and C's post-turn-4 Agent call was `slate:offload` (check 5); both wrote `CONTRIBUTING.md` (check 9); neither agent used the hand-back tool (check 19, so it has no cases).
-- **The interactive `/clear` and `/compact` check** passed in round 0. No later round touched those paths.
+- **The interactive `/clear` and `/compact` check** passed in round 0 and was rerun in the final review (I1, I2) with one added step: `/clear` while the curator runs. The `-p` runs (B, C, R3) were not rerun; the final review changed the curator rules (no `.slate/` path facts), the safety check, SessionStart and the drain, which unit tests cover.
 
 ## Setup
 
@@ -238,7 +240,7 @@ slate turns are one behind the script's turns. t2 and t5 each ran twice: once fo
   - In run C the offload agent reported "11 matches, 11 files", but its own table lists all 12.
   - The main thread flagged the mismatch, and the curator stored the count as an unverified A item, not a fact.
   - Model accuracy; the slate flow handled it well.
-- **Report-location notes are still saved as facts:** F2 and F8 in run C, F4 in R3. The curator rule says facts are about the project. Paths to slate's own reports slip through.
+- **Report-location notes are still saved as facts:** F2 and F8 in run C, F4 in R3. The curator rule says facts are about the project. Paths to slate's own reports slip through. The final review added a curator rule against them (never store a fact that points to a report file or a `.slate/` path); the `-p` runs were not repeated to measure it.
 - **R3's `now.md` noted that "the answer said a background search was still running".** The interim answer from the hand-back flow was curated as if it were part of the final answer. Harmless, but noisy.
 
 ## Timings
@@ -278,6 +280,37 @@ A Python `pty` script ran at 120×40 in a fresh temp dir with `--plugin-dir <rep
 | The answer after `/clear` uses reloaded memory | PASS | "Deploy only on Fridays." |
 | `/compact` reloads memory | PASS | The screen showed "Compacted" and PreCompact "completed successfully". The SessionStart attachment starts `# slate memory` / `Memory below wins where it differs from the summary.`, with I1. |
 
+## Interactive `/clear` during curation (final review)
+
+**Setup.** A Python `pty` driver (not committed) ran at 120×40 in a fresh `<tmp>/slate-live-*` dir: `~/.local/share/claude/versions/2.1.293 --plugin-dir <repo>/plugins/slate --model sonnet --setting-sources project,local`. Env was limited to `HOME USER LOGNAME PATH SHELL LANG TMPDIR`, plus `TERM=xterm-256color`. The curator ran on its default (`sonnet`). Repo at `f7d7d49`.
+
+**Steps.** `/slate:init`; `remember: deploy only on Fridays`, then wait for the curator; a long turn 2 (37 standing rules, 10 facts, a goal, one-line acknowledgement asked); `/clear` as soon as `curator.lock` appeared; wait for the drain; `Which branch do we deploy from, and on which day? One line.`; `/compact`; `/exit`. Evidence comes from the folder, `curator.log` and the hook attachments in the transcripts.
+
+**I2** added 80 more rules to turn 2 (a 7,529-char message, 118 rules in all), so the curator would outlast the 20 s wait.
+
+| Check | I2 | Evidence (I2) |
+|---|---|---|
+| `/clear` lands while the curator holds the lock | PASS | Turn 2 answered at 31.69 s; `curator.lock` seen at 31.71 s; `/clear` sent at 32.64 s. |
+| The running curator is aborted and its turn requeued | PASS | `t2 aborted: requeued` at 03:10:09.628Z, 20 s after the `/clear` (the SessionStart wait), before the move. |
+| The folder moved | PASS | `5731870f-…` → `092cf357-…`; `session.json` has `from: "5731870f-…"` and the same pid; the old folder is gone. |
+| The injected block carries the note | PASS | SessionStart attachment at 03:10:09.679Z (1,776 chars) starts `# slate memory` / `slate: memory may not include turn 2 yet — read <tmp>/slate-live-iYwaHz/.slate/092cf357-…/conversation/0002.md before acting on recent instructions.` Its `# Instructions` holds only `- [I1 t1] deploy only on Fridays`: the block was built from the restored memory. |
+| A drain ran in the new folder | PASS | `t2 ok: attempt 1, changed instructions.md, facts.md, now.md` at 03:10:39.543Z; `curated.json` reached turn 2. 118 I items and 10 F items. |
+| The next message's change line shows the curated delta | PASS | Turn-3 UserPromptSubmit attachment: `slate: +I2 always use pnpm for package commands · +I3 deploy only from the release/2.4 branch · +I4 … · +I5 … · +I6 indent .py files with 4 spaces · +122 more (see …/instructions.md, facts.md)`. The answer: "Deploy from `release/2.4`, on Fridays only." |
+| `/compact` reloads memory | PASS | SessionStart(compact) attachment, 9,850 chars, starts `# slate memory` / `Memory below wins where it differs from the summary.`; no lag note (caught up). |
+
+**I1** (turn 2 with 37 rules): `/clear` was sent 0.9 s after `curator.lock` appeared, but this curator took about 17 s. SessionStart waited it out: `t2 ok` at 03:08:07.262Z, the SessionStart attachment at 03:08:07.292Z. No abort, so no note, which is correct for a caught-up folder; the block held I1–I38 and F1–F10. Every other step passed: the move (`ab38a298-…` → `dbaf6bb9-…`), the turn-3 answer ("Deploy from `release/2.4`, on Fridays."), and the compact reload.
+
+**After both runs:** no `curate.mjs` or curator `claude -p` process was left running.
+
+**Final curator.log (I2):**
+
+```
+2026-10-08T03:09:44.603Z t1 ok: attempt 1, changed instructions.md
+2026-10-08T03:10:09.628Z t2 aborted: requeued
+2026-10-08T03:10:39.543Z t2 ok: attempt 1, changed instructions.md, facts.md, now.md
+2026-10-08T03:10:53.982Z t3 ok: attempt 1, no change
+```
+
 ## Earlier rounds
 
 **Round 0:** 5 turns and 8 checks, all passed. The review then found two gaps:
@@ -293,9 +326,16 @@ A Python `pty` script ran at 120×40 in a fresh temp dir with `--plugin-dir <rep
 
 **Round 3** added the PreToolUse cap on `SubagentHandback`, check 19, and tighter checks 5 and 9. It reran only the real-settings pass, as R3.
 
+**Final review** fixed folder theft by `/clear` and `/branch` after an in-process `/resume`, the silent memory gap after a `/clear` during curation, and a trailing-whitespace freeze, plus minor items. It reran only the interactive check, as I1 and I2.
+
 ## Cleanup
 
 Removed after recording these results:
+
+- **Final review:**
+  - `<tmp>/slate-live-SifItX` (I1), `<tmp>/slate-live-iYwaHz` (I2) and `<tmp>/slate-driver-9PBA1O` (the driver and its logs)
+  - `~/.claude/projects/-private-var-folders-…-T-slate-live-SifItX` and `…-slate-live-iYwaHz`
+  - `/private/tmp/claude-<uid>/-private-var-folders-…-T-slate-live-SifItX` and `…-slate-live-iYwaHz`
 
 - **Round 3:**
   - `<tmp>/slate-acc-ktCqBt` (R3) and `<tmp>/slate-r3probe-CnnRzZ` (the probe run)
