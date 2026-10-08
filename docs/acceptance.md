@@ -7,7 +7,7 @@ Run on 2026-10-07 (local time) with Claude Code **2.1.293**, macOS. In this docu
 | Run | Checks | Result |
 |---|---|---|
 | **I2**: interactive, `/clear` during curation, final review | 7 / 7 | **PASS**. The curator was aborted and requeued; the block carried the "may not include turn 2" note; the drain re-curated turn 2 in the new folder. |
-| **I1**: interactive, same script, lighter turn 2 | 4 / 7 | The abort path was not reached: the curator finished inside SessionStart's 20 s wait, so the abort, note and drain checks have no case. The rest passed. I2 covers the missing three. |
+| **I1**: interactive, same script, lighter turn 2 | 3 / 7 | The abort path was not reached: the curator finished inside SessionStart's 20 s wait. So the abort, note, drain and change-line checks have no case (the block was already caught up, and the turn-3 change line was only the reminder). The other three passed. I2 covers all seven. |
 | **R3**: real settings, turns 1–3, round 3 | 13 / 13 | **PASS**. A 869-char hand-back was denied once, and the 608-char retry went through. |
 | **C**: isolated, 6 turns, round 2 | 19 / 19 | **PASS**. Run end to end on the round-2 script; checks 5, 9 and 19 recomputed from its data (see below). |
 | **B**: isolated, 6 turns, round 2 | 19 / 19 | **PASS**, after the round-2 measurement fix to check 18. Checks 5, 9 and 19 recomputed. |
