@@ -23,11 +23,11 @@ test('plugin.json and marketplace.json agree and carry userConfig.curatorModel',
   assert.ok(opt.title && opt.description);
 });
 
-test('hooks.json wraps five events and every plugin-root path exists', async () => {
+test('hooks.json wraps six events and every plugin-root path exists', async () => {
   const cfg = await json(`${PLUGIN}hooks/hooks.json`);
-  assert.deepEqual(Object.keys(cfg.hooks).sort(), ['PreCompact', 'SessionStart', 'Stop', 'SubagentStop', 'UserPromptSubmit']);
+  assert.deepEqual(Object.keys(cfg.hooks).sort(), ['PreCompact', 'PreToolUse', 'SessionStart', 'Stop', 'SubagentStop', 'UserPromptSubmit']);
   const cmds = Object.values(cfg.hooks).flat().flatMap((g) => g.hooks.map((h) => h.command));
-  assert.equal(cmds.length, 5);
+  assert.equal(cmds.length, 6);
   for (const c of cmds) {
     for (const [, rel] of c.matchAll(/\$\{CLAUDE_PLUGIN_ROOT\}\/([^"\s]+)/g)) {
       assert.ok(await exists(PLUGIN + rel), rel);
@@ -45,4 +45,5 @@ test('skill and agent frontmatter', async () => {
   assert.match(agent, /^---\nname: offload\n/);
   assert.match(agent, /description: .+/);
   assert.doesNotMatch(agent.split('\n---')[0], /^tools:/m);
+  assert.match(agent, /hand-back tool.*600|600.*hand-back tool/i, 'the return limit also covers a hand-back message');
 });

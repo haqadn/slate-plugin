@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { handle, curatorWaitMs, HARNESS_PREFIXES } from '../plugins/slate/scripts/hook.mjs';
+import { handle, curatorWaitMs, HARNESS_PREFIXES, HANDBACK_TOOLS } from '../plugins/slate/scripts/hook.mjs';
 import { initSession, readSession, readTurn, readMemory, sessionDir } from '../plugins/slate/scripts/lib/session.mjs';
 import { acquire } from '../plugins/slate/scripts/lib/lock.mjs';
 
@@ -343,6 +343,89 @@ test('CLI: SubagentStop prints the block JSON', async () => {
   assert.deepEqual(JSON.parse(r.stdout), BLOCK_801);
 });
 
+// --- PreToolUse (hand-back cap) ---
+
+const handback = (id, root, fields = {}) => ({
+  hook_event_name: 'PreToolUse', session_id: id, cwd: root, agent_id: 'a435d85d2980fd4d2', agent_type: 'slate:offload',
+  tool_name: 'SubagentHandback', tool_input: { message: 'x'.repeat(801) }, tool_use_id: 't1', ...fields,
+});
+const DENY_801 = {
+  hookSpecificOutput: {
+    hookEventName: 'PreToolUse',
+    permissionDecision: 'deny',
+    permissionDecisionReason: 'Hand-back is 801 chars. Call SubagentHandback again with ≤600 chars, ≤10 lines; details belong in the report.',
+  },
+};
+const marker = (dir, agent = 'a435d85d2980fd4d2') => path.join(dir, 'handbacks', agent);
+
+test('HANDBACK_TOOLS: the hand-back tool', () => {
+  assert.deepEqual(HANDBACK_TOOLS, ['SubagentHandback']);
+});
+
+test('PreToolUse: an offload hand-back over 800 chars is denied once, then allowed', async () => {
+  const { root, env, dir, id } = await activeSession();
+  const before = await fs.readFile(path.join(dir, 'session.json'), 'utf8');
+  const r = await handle('PreToolUse', handback(id, root), env);
+  assert.deepEqual(r.output, DENY_801);
+  assert.ok(await exists(marker(dir)), 'marker written');
+  const again = await handle('PreToolUse', handback(id, root, { tool_input: { message: 'y'.repeat(2000) } }), env);
+  assert.equal(again.output, null, 'second hand-back of the same agent goes through');
+  assert.equal(await fs.readFile(path.join(dir, 'session.json'), 'utf8'), before, 'session untouched');
+  // A different offload agent gets its own single denial.
+  const other = await handle('PreToolUse', handback(id, root, { agent_id: 'b1' }), env);
+  assert.deepEqual(other.output, DENY_801);
+});
+
+test('PreToolUse: length counts code points; ≤800 passes and writes no marker', async () => {
+  const { root, env, dir, id } = await activeSession();
+  const ok = await handle('PreToolUse', handback(id, root, { tool_input: { message: '😀'.repeat(800) } }), env);
+  assert.equal(ok.output, null);
+  assert.equal(await exists(marker(dir)), false);
+  const r = await handle('PreToolUse', handback(id, root, { tool_input: { message: '≤'.repeat(800) + '😀' } }), env);
+  assert.equal(r.output.hookSpecificOutput.permissionDecisionReason, DENY_801.hookSpecificOutput.permissionDecisionReason);
+});
+
+test('PreToolUse: nothing for other agents, other tools, no message, no folder, or inside the curator', async () => {
+  const { root, env, dir, id } = await activeSession();
+  const cases = [
+    handback(id, root, { agent_type: 'Explore' }),
+    handback(id, root, { agent_type: undefined, agent_id: undefined }), // the main thread
+    handback(id, root, { tool_name: 'Write', tool_input: { message: 'x'.repeat(900), file_path: '/tmp/x' } }),
+    handback(id, root, { tool_input: {} }),
+    handback(id, root, { tool_input: { message: 42 } }),
+    handback('other-session', root),
+  ];
+  for (const c of cases) assert.equal((await handle('PreToolUse', c, env)).output, null, JSON.stringify(c).slice(0, 140));
+  const inCurator = { ...env };
+  inCurator.SLATE_CURATOR = '1';
+  assert.equal((await handle('PreToolUse', handback(id, root), inCurator)).output, null);
+  assert.equal(await exists(path.join(dir, 'handbacks')), false);
+  const bare = await project();
+  assert.equal((await handle('PreToolUse', handback('sid', bare.root), bare.env)).output, null);
+  assert.equal(await exists(path.join(bare.root, '.slate')), false);
+});
+
+test('PreToolUse: a bad agent_id is never used as a path; the hand-back is allowed', async () => {
+  const { root, env, dir, id } = await activeSession();
+  for (const agent of ['../escape', '..', '.', 'a/b', '', 42]) {
+    const r = await handle('PreToolUse', handback(id, root, { agent_id: agent }), env);
+    assert.equal(r.output, null, String(agent));
+  }
+  assert.equal(await exists(path.join(dir, 'handbacks')), false);
+  assert.equal(await exists(path.join(dir, 'escape')), false);
+  assert.equal(await exists(path.join(path.dirname(dir), 'escape')), false);
+});
+
+test('CLI: PreToolUse prints the deny JSON once', async () => {
+  const { root, env, id } = await activeSession();
+  const r = await run('PreToolUse', JSON.stringify(handback(id, root)), env);
+  assert.equal(r.code, 0);
+  assert.equal(r.stderr, '');
+  assert.deepEqual(JSON.parse(r.stdout), DENY_801);
+  const again = await run('PreToolUse', JSON.stringify(handback(id, root)), env);
+  assert.deepEqual(again, { code: 0, stdout: '', stderr: '' });
+});
+
 // --- Stop ---
 
 test('Stop: appends the answer, spawns the curator detached, returns within 1s; curator logs ok', async () => {
@@ -588,15 +671,16 @@ test('CLI: bad input exits 0 with one stderr line and no stdout', async () => {
 test('hooks.json: five events, matcher, timeouts, quoted plugin-root commands', async () => {
   const cfg = JSON.parse(await fs.readFile(HOOKS_JSON, 'utf8'));
   assert.deepEqual(Object.keys(cfg), ['hooks']);
-  const events = [...EVENTS, 'SubagentStop'];
+  const events = [...EVENTS, 'SubagentStop', 'PreToolUse'];
   assert.deepEqual(Object.keys(cfg.hooks).sort(), [...events].sort());
-  const want = { SessionStart: 60, UserPromptSubmit: 30, Stop: 10, PreCompact: 90, SubagentStop: 10 };
+  const want = { SessionStart: 60, UserPromptSubmit: 30, Stop: 10, PreCompact: 90, SubagentStop: 10, PreToolUse: 10 };
   for (const event of events) {
     const groups = cfg.hooks[event];
     assert.equal(groups.length, 1, event);
     const [group] = groups;
     if (event === 'SessionStart') assert.equal(group.matcher, 'startup|resume|clear|compact|fork');
     else if (event === 'SubagentStop') assert.equal(group.matcher, 'slate:offload'); // matched on agent_type
+    else if (event === 'PreToolUse') assert.equal(group.matcher, HANDBACK_TOOLS.join('|'));
     else assert.equal(group.matcher, undefined, event);
     assert.deepEqual(group.hooks, [{
       type: 'command',

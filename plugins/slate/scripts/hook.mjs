@@ -1,4 +1,4 @@
-// Hook dispatcher for SessionStart, UserPromptSubmit, Stop, PreCompact and SubagentStop.
+// Hook dispatcher for SessionStart, UserPromptSubmit, Stop, PreCompact, SubagentStop and PreToolUse.
 // CLI: node hook.mjs <Event>, hook JSON on stdin, hook JSON (or nothing) on stdout. Always exits 0.
 import fs from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
@@ -28,6 +28,8 @@ export const HARNESS_PREFIXES = [
   '<task-notification', '<agent-message', '<cross-session-message', '<teammate-message', '[SYSTEM NOTIFICATION',
 ];
 const isHarness = (prompt) => HARNESS_PREFIXES.some((p) => prompt.startsWith(p));
+// Tools a subagent can return through instead of a final text answer; hooks.json matches these.
+export const HANDBACK_TOOLS = ['SubagentHandback'];
 const OFFLOAD_AGENT = 'slate:offload';
 const RETURN_LIMIT = 800; // chars; above this an offload return is sent back once for a rewrite
 
@@ -157,17 +159,47 @@ function subagentStop(input) {
   };
 }
 
+// The same cap for an offload agent that returns through a hand-back tool (its SubagentStop then
+// has no last_assistant_message). The first message over the limit is denied; the marker
+// handbacks/<agent_id> makes the agent's next hand-back go through, whatever its length.
+async function preToolUse(input, dir) {
+  const text = input.tool_input?.message;
+  const agent = input.agent_id;
+  if (input.agent_type !== OFFLOAD_AGENT || !HANDBACK_TOOLS.includes(input.tool_name) || typeof text !== 'string') {
+    return { output: null };
+  }
+  const chars = [...text].length;
+  if (chars <= RETURN_LIMIT || typeof agent !== 'string' || !SAFE_ID.test(agent)) return { output: null };
+  try {
+    await fs.mkdir(path.join(dir, 'handbacks'), { recursive: true });
+    await fs.writeFile(path.join(dir, 'handbacks', agent), '', { flag: 'wx' });
+  } catch {
+    return { output: null }; // already denied once (EEXIST), or the marker can't be written: allow
+  }
+  return {
+    output: {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: `Hand-back is ${chars} chars. Call ${input.tool_name} again with ≤600 chars, ≤10 lines; details belong in the report.`,
+      },
+    },
+  };
+}
+
 export async function handle(event, input, env = process.env) {
   if (env.SLATE_CURATOR === '1') return { output: null };
   if (!input || typeof input !== 'object') return { output: null };
-  // SubagentStop always carries the subagent's agent_id; every other event with one fired inside a subagent.
-  if (input.agent_id && event !== 'SubagentStop') return { output: null };
+  // SubagentStop and a subagent's PreToolUse carry its agent_id; any other event with one fired
+  // inside a subagent.
+  if (input.agent_id && event !== 'SubagentStop' && event !== 'PreToolUse') return { output: null };
   const root = env.CLAUDE_PROJECT_DIR || input.cwd;
   const id = input.session_id;
   if (!root || typeof id !== 'string' || !SAFE_ID.test(id)) return { output: null };
   const dir = sessionDir(root, id);
 
   if (event === 'SubagentStop') return (await hasFolder(dir)) ? subagentStop(input) : { output: null };
+  if (event === 'PreToolUse') return (await hasFolder(dir)) ? preToolUse(input, dir) : { output: null };
   if (event === 'SessionStart') return sessionStart(input, root, dir, env);
   if (!(await hasFolder(dir))) return { output: null };
   switch (event) {
