@@ -17,7 +17,7 @@ import { spawn, execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { readSession, turnState } from '../../plugins/slate/scripts/lib/session.mjs';
-import { HARNESS_PREFIXES } from '../../plugins/slate/scripts/hook.mjs';
+import { HARNESS_PREFIXES, HANDBACK_TOOLS } from '../../plugins/slate/scripts/hook.mjs';
 
 const argv = process.argv.slice(2);
 
@@ -292,6 +292,7 @@ export function subagentTools(transcriptFile, sessionId) {
   const dir = path.join(path.dirname(transcriptFile), sessionId, 'subagents');
   const writes = [];
   const denials = [];
+  const handbacks = [];
   let files = [];
   try {
     files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl'));
@@ -301,7 +302,12 @@ export function subagentTools(transcriptFile, sessionId) {
     for (const e of entries(path.join(dir, f))) {
       for (const b of Array.isArray(e.message?.content) ? e.message.content : []) {
         if (b.type === 'tool_use') {
-          calls.set(b.id, { agent: f, tool: b.name, file: b.input?.file_path ?? null, command: b.input?.command?.slice(0, 120) ?? null, error: null, result: null });
+          const message = typeof b.input?.message === 'string' ? b.input.message : null;
+          calls.set(b.id, {
+            agent: f, agentId: f.replace(/^agent-|\.jsonl$/g, ''), tool: b.name, file: b.input?.file_path ?? null,
+            command: b.input?.command?.slice(0, 120) ?? null, chars: message === null ? null : [...message].length,
+            error: null, result: null,
+          });
         }
         if (b.type === 'tool_result' && calls.has(b.tool_use_id)) {
           const c = calls.get(b.tool_use_id);
@@ -312,10 +318,11 @@ export function subagentTools(transcriptFile, sessionId) {
     }
     for (const c of calls.values()) {
       if (WRITE_TOOLS.includes(c.tool)) writes.push(c);
+      if (HANDBACK_TOOLS.includes(c.tool)) handbacks.push(c);
       if (c.error && /permission|denied/i.test(c.result ?? '')) denials.push(c);
     }
   }
-  return { writes, denials };
+  return { writes, denials, handbacks };
 }
 
 // --- SubagentStop probe ---------------------------------------------------------------------
@@ -356,7 +363,7 @@ if (i.hook_event_name === 'PreToolUse') {
 // as one hook_blocking_error attachment (its text also appears in a "Stop hook feedback" message,
 // so count attachments, not text matches); a block also makes the agent stop again with
 // stop_hook_active set.
-export function offloadBlocks(offloadStops, subagentsDir) {
+export function offloadBlocks(offloadStops, subagentsDir, handedBack = new Set()) {
   const blockEvents = (id) => entries(path.join(subagentsDir, `agent-${id}.jsonl`))
     .filter((e) => e.type === 'attachment' && e.attachment?.type === 'hook_blocking_error'
       && e.attachment.hookEvent === 'SubagentStop'
@@ -364,15 +371,29 @@ export function offloadBlocks(offloadStops, subagentsDir) {
     .map((e) => e.attachment.blockingError.blockingError);
   const blocks = offloadStops.map((p, i) => ({
     ...p,
-    // No last_assistant_message (e.g. the agent ended with a hand-back tool call): the return
-    // was invisible to the cap, so it counts as over and unblocked.
-    over: p.stop_hook_active !== true && (p.chars === null || p.chars > 800),
+    // No last_assistant_message: the agent returned through a hand-back tool, whose cap is
+    // checked separately (PreToolUse); without a hand-back the return was invisible to any cap, so
+    // it counts as over and unblocked.
+    over: p.stop_hook_active !== true && (p.chars === null ? !handedBack.has(p.agent_id) : p.chars > 800),
     blocked: blockEvents(p.agent_id).some((t) => t.startsWith(`Return is ${p.chars} chars.`))
       || offloadStops.slice(i + 1).some((q) => q.agent_id === p.agent_id && q.stop_hook_active === true),
   }));
   const ids = [...new Set(offloadStops.map((p) => p.agent_id))];
   const blockCounts = ids.map((id) => blockEvents(id).length);
   return { blocks, blockCounts };
+}
+
+// Per offload agent that handed back: its hand-back calls in order, with length and outcome. The cap
+// holds when the first call over 800 chars was denied with the cap's reason and no other call was.
+export function handbackDenials(handbacks, offloadIds) {
+  const denied = (c) => c.error === true && /Hand-back is \d+ chars\./.test(c.result ?? '');
+  return [...new Set(handbacks.map((c) => c.agentId))].filter((id) => offloadIds.has(id)).map((id) => {
+    const calls = handbacks.filter((c) => c.agentId === id);
+    const firstOver = calls.findIndex((c) => c.chars !== null && c.chars > 800);
+    const deniedAt = calls.map((c, i) => (denied(c) ? i : -1)).filter((i) => i >= 0);
+    const ok = firstOver < 0 ? deniedAt.length === 0 : deniedAt.length === 1 && deniedAt[0] === firstOver;
+    return { id, calls: calls.map((c) => ({ chars: c.chars, denied: denied(c), error: c.error })), ok };
+  });
 }
 
 // --- main ------------------------------------------------------------------------------------
@@ -466,7 +487,7 @@ async function main() {
   const offload3 = a.agentCalls.filter((c) => c.turn === 3 && c.subagent_type === 'slate:offload');
   const bigResults = a.toolResults.filter((r) => r.chars > MAIN_THREAD_MAX);
   const bigNotes = a.notifications.filter((n) => n.chars > MAIN_THREAD_MAX);
-  const afterSwitch = a.agentCalls.filter((c) => c.turn >= 5);
+  const afterSwitch = a.agentCalls.filter((c) => c.turn >= 5 && c.subagent_type === 'slate:offload');
   const lateAgents = a.agentCalls.filter((c) => c.turn >= 4);
   const npmAgents = lateAgents.filter((c) => NPM_CMD.test(JSON.stringify(c.input)));
   const npmRules = ['instructions.md', 'assumptions.md', 'now.md'].filter((f) => NPM.test(mem[f] ?? ''));
@@ -475,10 +496,14 @@ async function main() {
   const preToolUses = (readText(probeLogs.preToolUse) ?? '').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   const offloadStops = probes.filter((p) => p.agent_type === 'slate:offload');
   const SHAPE = ['agent_type', 'last_assistant_message', 'stop_hook_active', 'session_id', 'agent_id'];
-  const { blocks, blockCounts } = offloadBlocks(offloadStops, path.join(path.dirname(tp), sessionId, 'subagents'));
+  const { writes, denials, handbacks } = subagentTools(tp, sessionId);
+  const offloadIds = new Set(offloadStops.map((p) => p.agent_id));
+  const handedBack = new Set(handbacks.filter((c) => offloadIds.has(c.agentId) && c.error === false).map((c) => c.agentId));
+  const { blocks, blockCounts } = offloadBlocks(offloadStops, path.join(path.dirname(tp), sessionId, 'subagents'), handedBack);
+  const hb = handbackDenials(handbacks, offloadIds);
+  const probeHandbacks = preToolUses.filter((x) => HANDBACK_TOOLS.includes(x.tool_name));
   const userTurns = turns.slice(1).map((t) => t.n);
   const noChangeLine = userTurns.filter((n) => !a.hookContext.some((h) => h.turn === n && h.event === 'UserPromptSubmit' && h.text.includes(REMINDER)));
-  const { writes, denials } = subagentTools(tp, sessionId);
   const reports = exists(path.join(dir, 'reports')) ? fs.readdirSync(path.join(dir, 'reports')) : [];
   const initReply = turns[0]?.result ?? '';
   const BOTH = ['full', 'real'];
@@ -488,11 +513,11 @@ async function main() {
     [BOTH, 'turn 3 used an Agent call with slate:offload', offload3.length > 0, `${offload3.length} slate:offload call(s) in turn 3; all Agent calls: ${a.agentCalls.map((c) => `t${c.turn} ${c.subagent_type}`).join(', ') || 'none'}`],
     [BOTH, `no main-thread tool_result over ${MAIN_THREAD_MAX} chars`, bigResults.length === 0, `max ${Math.max(0, ...a.toolResults.map((r) => r.chars))} chars over ${a.toolResults.length} results${bigResults.length ? `; over: ${JSON.stringify(bigResults)}` : ''}`],
     [BOTH, `no main-thread harness message (task-notification, agent-message, …) over ${MAIN_THREAD_MAX} chars`, bigNotes.length === 0, `${a.notifications.map((n) => `t${n.turn} ${n.kind} ${n.chars} chars (result ${n.resultChars})`).join(', ') || 'none'}`],
-    [FULL, 'at least one Agent call after turn 4', afterSwitch.length > 0, `${afterSwitch.length}: ${afterSwitch.map((c) => `t${c.turn} ${c.subagent_type}`).join(', ') || 'none'}`],
+    [FULL, 'at least one slate:offload Agent call after turn 4', afterSwitch.length > 0, `${afterSwitch.length}: ${afterSwitch.map((c) => `t${c.turn} ${c.subagent_type}`).join(', ') || 'none'}; all after turn 4: ${a.agentCalls.filter((c) => c.turn >= 5).map((c) => `t${c.turn} ${c.subagent_type}`).join(', ') || 'none'}`],
     [FULL, 'no Agent brief from turn 4 on contains an npm command', npmAgents.length === 0, `${lateAgents.length} Agent call(s) from turn 4 on, ${npmAgents.length} with ${NPM_CMD}`],
     [FULL, 'no npm in instructions.md, assumptions.md or now.md (facts exempt)', npmRules.length === 0, npmRules.join(', ') || 'none match'],
     [FULL, 'superseded.md matches /\\bnpm\\b/', NPM.test(mem['superseded.md'] ?? ''), ''],
-    [FULL, 'CONTRIBUTING.md, if written, uses pnpm and has no npm command', contributing === null || (/\bpnpm\b/.test(contributing) && !NPM_CMD.test(contributing)), contributing === null ? 'not written' : `${contributing.length} chars, pnpm ${/\bpnpm\b/.test(contributing)}, npm command ${NPM_CMD.test(contributing)}`],
+    [FULL, 'CONTRIBUTING.md exists, uses pnpm and has no npm command', contributing !== null && /\bpnpm\b/.test(contributing) && !NPM_CMD.test(contributing), contributing === null ? 'not written' : `${contributing.length} chars, pnpm ${/\bpnpm\b/.test(contributing)}, npm command ${NPM_CMD.test(contributing)}`],
     [FULL, 'turn-5 answer contains pnpm', /pnpm/.test(turn5), JSON.stringify(turn5)],
     [BOTH, 'stg-7.internal is in live memory', live.includes('stg-7.internal'), LIVE_FILES.filter((f) => (mem[f] ?? '').includes('stg-7.internal')).join(', ') || 'absent'],
     [BOTH, 'curator.log has no line matching /\\b(restored|error)\\b/i', badLog.length === 0, badLog.join(' | ')],
@@ -500,14 +525,15 @@ async function main() {
     [BOTH, 'slate counted only user prompts as turns', slateTurns === userTurns.length, `${slateTurns} slate turn(s) for ${userTurns.length} user prompt(s); harness messages seen: ${a.notifications.map((n) => `t${n.turn} ${n.kind}`).join(', ') || 'none'}`],
     [BOTH, 'curator.log has an ok line for every slate turn', slateTurns > 0 && okMissing.length === 0, `${slateTurns} slate turn(s)${okMissing.length ? `; no ok for t${okMissing.join(', t')}` : ''}`],
     [BOTH, 'offload report written, no subagent Write/Edit failed', reports.length > 0 && writes.every((w) => !w.error), `reports: ${reports.join(', ') || 'none'}; writes: ${writes.map((w) => `${w.tool} ${path.basename(w.file ?? '?')} ${w.error ? `ERROR ${w.result}` : 'ok'}`).join('; ') || 'none'}; denied (any tool): ${denials.map((d) => `${d.tool} ${d.command ?? d.file ?? ''}`).join('; ') || 'none'}`],
-    [BOTH, 'SubagentStop input carries agent_type, last_assistant_message, stop_hook_active, agent_id and the main session_id', offloadStops.length > 0 && offloadStops.every((p) => SHAPE.every((k) => p.keys.includes(k)) && p.session_id === sessionId), `${probes.length} SubagentStop(s), ${offloadStops.length} slate:offload; keys: ${[...new Set(probes.flatMap((p) => p.keys))].join(',')}`],
+    [BOTH, 'SubagentStop input carries agent_type, stop_hook_active, agent_id, the main session_id, and last_assistant_message unless the agent handed back', offloadStops.length > 0 && offloadStops.every((p) => SHAPE.every((k) => p.keys.includes(k) || (k === 'last_assistant_message' && handedBack.has(p.agent_id))) && p.session_id === sessionId), `${probes.length} SubagentStop(s), ${offloadStops.length} slate:offload; keys: ${[...new Set(probes.flatMap((p) => p.keys))].join(',')}`],
     [BOTH, 'every slate:offload return over 800 chars was sent back, at most once per agent', blocks.every((b) => !b.over || b.blocked) && blockCounts.every((n) => n <= 1), blocks.map((b) => `${String(b.agent_id ?? "?").slice(0, 6)} ${b.chars === null ? 'no last_assistant_message' : `${b.chars} chars`}${b.stop_hook_active ? ' (stop_hook_active)' : ''}${b.over ? (b.blocked ? ' blocked' : ' NOT blocked') : ''}`).join('; ') || 'no offload stops'],
+    [BOTH, 'every slate:offload hand-back over 800 chars was denied exactly once', hb.every((h) => h.ok), `${hb.map((h) => `${h.id.slice(0, 6)}: ${h.calls.map((c) => `${c.chars ?? '?'} chars ${c.denied ? 'denied' : c.error ? 'error' : 'ok'}`).join(' → ')}`).join('; ') || 'no hand-backs'}; probe saw ${probeHandbacks.length} hand-back PreToolUse(s)${probeHandbacks.length ? ` (agent_type ${[...new Set(probeHandbacks.map((x) => x.agent_type))].join(',')}; tool_input ${[...new Set(probeHandbacks.map((x) => x.input_keys.join('+')))].join(',')})` : ''}`],
   ].filter(([profiles]) => profiles.includes(REAL ? 'real' : 'full'))
     .map(([, name, pass, detail, softIn]) => ({ name, pass, detail, soft: Boolean(softIn?.includes(REAL ? 'real' : 'full')) }));
 
   const results = {
     profile: REAL ? 'real-settings' : 'isolated', project, sessionId, transcript: tp, claude: { bin, version }, model: MODEL, fileCount,
-    turns, checks, subagentStops: probes, contributing, agentCalls: a.agentCalls, toolResults: a.toolResults, notifications: a.notifications, subagentWrites: writes, subagentDenials: denials,
+    turns, checks, subagentStops: probes, preToolUses: probeHandbacks, handbacks: hb, contributing, agentCalls: a.agentCalls, toolResults: a.toolResults, notifications: a.notifications, subagentWrites: writes, subagentDenials: denials,
     hookContext: a.hookContext.map((h) => ({ ...h, text: h.text.slice(0, 600) })),
     curatorProcesses: sampler.seen(),
     memory: mem,
