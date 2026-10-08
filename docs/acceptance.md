@@ -1,91 +1,203 @@
 # Live acceptance
 
-Run on 2026-10-07 (local time) with Claude Code **2.1.293**, macOS. **Result: all 8 checks pass, and the interactive `/clear` and `/compact` check passes.**
+Run on 2026-10-07 (local time) with Claude Code **2.1.293**, macOS. In this document, `<tmp>` stands for `$TMPDIR` and `~` for the home dir.
+
+**Result: not yet passing.**
+
+| Run | Failed checks |
+|---|---|
+| Full run (6 turns, isolated settings) | 3 of 15: the subagent return is over 2,000 chars, and npm appears in a brief and in live memory, both caused by turn 6. |
+| Real-settings pass (turns 1–3) | 3 of 10: the init reply was not one line, the subagent return is over 2,000 chars, and the hand-back was counted as a user turn. |
+
+The interactive `/clear` and `/compact` check passed in round 0. It was not rerun in this round.
 
 ## Setup
 
-- **Script:** `node test/live/acceptance.mjs --live`. `npm test` registers it as skipped.
-- **Project:** a fresh temp dir outside the repo (`$TMPDIR/slate-acc-GxsSoL`) holding a fake repo of 200 files:
-  - 12 files contain `TODO(perf)` in different comment styles (`//`, `#`, `/* */`, `<!-- -->`, `--`, `{/* */}`), with and without a colon, plus one `!!`.
-  - Near misses: `todo(perf)`, `TODO(perf, alice)`, `FIXME(perf)`, `TODO(security)`, `TODO perf:`.
-- **Main session:** `/Users/adnan/.local/share/claude/versions/2.1.293`, called directly rather than through the terminal-wrapper shim.
-  - Flags on every turn: `-p <prompt> --plugin-dir <repo>/plugins/slate --model sonnet --setting-sources project,local --permission-mode acceptEdits --output-format json`.
-  - Turn 1 used `--session-id 7ba82ce1-c859-4cf0-a546-63a146ed495a`. Turns 2–5 used `--resume` with that ID.
-  - Env was limited to `HOME USER LOGNAME PATH SHELL TERM LANG TMPDIR`, so the parent session's `CLAUDE_*` and terminal vars stayed out. `PATH` still had the shim first.
-  - `--setting-sources project,local` keeps the user's own plugins and hooks out, as in `docs/verified.md`. `acceptEdits` lets the offload agent write its report without a prompt.
-- **Between turns:** the script polled every 0.75s, for at most 180s. It waited until `curator.lock` was gone, `curated.json` matched `session.json`'s turn and the size of that turn's file, and this held on two polls in a row.
-- **Curator:** its default model (`sonnet`). No `curatorModel` was set.
+- **Script:** `node test/live/acceptance.mjs --live [--real-settings]`. `npm test` registers it as skipped.
+- **Project:** a fresh temp dir, `<tmp>/slate-acc-*`, holding a fake repo of 200 files.
+  - 12 files contain `TODO(perf)` in different comment styles. Near misses: `todo(perf)`, `TODO(perf, alice)`, `FIXME(perf)`, `TODO(security)`, `TODO perf:`.
+  - For turn 6 there are install commands in `scripts/setup.sh`, `Dockerfile` and `packages/web/package.json`. All use pnpm; none uses npm.
+- **Main session:** the real binary `~/.local/share/claude/versions/2.1.293`, not the terminal-wrapper shim.
+  - Every turn: `-p <prompt> --plugin-dir <repo>/plugins/slate --model sonnet --output-format json`.
+  - Turn 1 used `--session-id <uuid>`. Later turns used `--resume <uuid>`.
+  - Env was limited to `HOME USER LOGNAME PATH SHELL TERM LANG TMPDIR`. `PATH` still had the shim first.
+- **Two profiles:**
+
+| Profile | Extra flags | What loads |
+|---|---|---|
+| Isolated (default, 6 turns) | `--setting-sources project,local --permission-mode acceptEdits` | Only slate. Subagents can't use Bash. |
+| Real settings (`--real-settings`, turns 1–3) | none | The user's plugins, hooks, CLAUDE.md and permission rules |
+
+- **Between turns:** the script polled every 0.75s, for at most 180s. It waited until `curator.lock` was gone and `curated.json` matched both `session.json`'s turn and that turn file's size, on two polls in a row.
+- **Curator:** its default model (`sonnet`).
+
+**Turns:**
+1. `/slate:init`
+2. `For this project, always give package-manager commands using npm. Also: the staging host is stg-7.internal.`
+3. `Find every file that mentions "TODO(perf)" and summarize the patterns.`
+4. `Change of plan: this project uses pnpm now.`
+5. `What command installs lodash? Reply with only the command.`
+6. `Scan every package.json and script in this repo and summarize the install commands they use.`
 
 ## Checks
 
-The main transcript is `~/.claude/projects/<slug>/7ba82ce1-….jsonl`. Sidechain entries are excluded.
+The main transcript is `~/.claude/projects/<slug>/<uuid>.jsonl`, with sidechain entries excluded.
 
-| # | Check | Result | Evidence |
+A subagent's return reaches the main thread in one of two ways:
+- a `<task-notification>` user message, when the agent ran in the background
+- an `<agent-message>` user message, when the agent used the hand-back tool, which happened under real settings
+
+Check 4 counts both.
+
+| # | Check | Full run | Real settings |
 |---|---|---|---|
-| 1 | Turn 3 used an Agent call with `slate:offload` | PASS | 1 call, `subagent_type: "slate:offload"`. It was the only Agent call in the session. |
-| 2 | No main-thread `tool_result` over 2,000 chars | PASS | Only 1 tool_result in the whole session: the Agent launch notice, 1,106 chars. The search's own tool output stayed in the subagent. |
-| 3 | No Agent input from turn 4 on matches `/\bnpm\b/` | PASS | 0 Agent calls in turns 4–5, so this check is vacuous: nothing needed offloading. |
-| 4 | Live memory files don't match `/\bnpm\b/` | PASS | None of `instructions.md`, `assumptions.md`, `facts.md` or `now.md` match. |
-| 5 | `superseded.md` matches `/\bnpm\b/` | PASS | `[I1 t1 retired t3]`, see below. |
-| 6 | Turn-5 answer contains `pnpm` | PASS | `` `pnpm add lodash` `` |
-| 7 | `stg-7.internal` is in live memory | PASS | `facts.md` F1 |
-| 8 | `curator.log` has no `restored` or `error` lines | PASS | 5 `ok` lines, all on attempt 1 |
+| 1 | `/slate:init` created the folder and replied in one line | PASS | **FAIL** |
+| 2 | Turn 3 used an Agent call with `slate:offload` | PASS | PASS |
+| 3 | No main-thread `tool_result` over 2,000 chars | PASS (max 1,106) | PASS (max 1,106) |
+| 4 | No main-thread subagent return over 2,000 chars | **FAIL** (t3 1,830; t6 2,209) | **FAIL** (agent-message 2,096) |
+| 5 | At least one Agent call after turn 4 | PASS (t6 `slate:offload`) | n/a |
+| 6 | No Agent input from turn 4 on matches `/\bnpm\b/` | **FAIL** (the t6 brief) | n/a |
+| 7 | Live memory files don't match `/\bnpm\b/` | **FAIL** (`facts.md` F9) | n/a |
+| 8 | `superseded.md` matches `/\bnpm\b/` | PASS | n/a |
+| 9 | Turn-5 answer contains `pnpm` | PASS: `` `pnpm add lodash` `` | n/a |
+| 10 | `stg-7.internal` is in live memory | PASS | PASS |
+| 11 | `curator.log` has no line matching `/\b(restored\|error)\b/i` | PASS | PASS |
+| 12 | Every user turn got the slate change line | PASS (turns 2–6) | PASS (turns 2–3) |
+| 13 | slate counted only user prompts as turns | PASS (5 for 5) | **FAIL** (3 for 2) |
+| 14 | `curator.log` has an `ok` line for every slate turn | PASS (5 turns) | PASS (3 turns) |
+| 15 | Offload report written, and no subagent Write/Edit failed | PASS | PASS |
 
-These cover the spec's four acceptance checks:
-- The search went through offload (1, 2).
-- No brief after the switch mentions npm (3).
-- npm appears only in `superseded.md`, and the answer uses pnpm (4, 5, 6).
-- The first message's detail is kept (7).
+Two things were added after the runs: the `<agent-message>` channel in check 4, and check 13. Both came out of this round's results, and neither run was repeated.
+- Check 4's 2,096-char real-settings figure was measured on that run's transcript with the committed `analyse()`.
+- Check 13 is computed from each run's `session.json` turn count.
 
-### Turn 3's brief (the only Agent call)
+## Failures
+
+### Check 4: subagent returns are still over the cap
+
+Evidence:
+- **Full run, t3:** a `<task-notification>` of 1,830 chars, of which the `<result>` is 1,074.
+- **Full run, t6:** 2,209 chars, of which the result is 1,447.
+- **Real settings, t3:** the hand-back `<agent-message>` is 2,096 chars. A 904-char `<task-notification>` only pointed to it.
+- The notification frame itself costs about 760 chars, so a return of about 600 chars would fit.
+
+**Likely cause:** the offload agent ignores the new "about 600 characters" limit in `offload.md`. In both isolated turns it also spent lines explaining Bash denials.
+
+### Check 6: the turn-6 brief mentions npm
+
+The brief's Task line:
 
 ```
-Read <dir>/instructions.md, facts.md, now.md. Task: Find every file under <project> that mentions "TODO(perf)"
-(exclude the .slate folder), and summarize the patterns (what kinds of perf issues, where they cluster, recurring
-themes). Write details to <dir>/reports/todo-perf.md. Return ≤10 lines.
+scan every package.json and every script (shell, Makefile, CI configs, Dockerfiles, docs) under <project> (skip .slate/)
+and summarize the install commands they use (npm/yarn/pnpm/etc., ci vs install, flags, lockfiles, packageManager field).
+Flag any that conflict with the project's pnpm convention.
 ```
 
-The agent ran in the background. Its result came back as a `<task-notification>` of 2,274 chars, which is a user message, not a tool_result. The count was right: 12 exact `TODO(perf)` hits in 12 files.
+**Likely cause:** turn 6 asks about install commands in general, so the brief lists package managers to look for. It is not the retired rule coming back; the brief applies the pnpm rule.
 
-## Answers
+### Check 7: live memory mentions npm
 
-| Turn | Prompt | Answer |
-|---|---|---|
-| 1 | `/slate:init` | Slate is on for this session. |
-| 2 | always npm; staging host is stg-7.internal | Noted: npm for all package-manager commands, and staging host is stg-7.internal. |
-| 3 | find every `TODO(perf)`, summarize patterns | 12 hits in 12 files, plus grouped bullets with patterns (1,381 chars) |
-| 4 | Change of plan: pnpm | Got it, pnpm from now on instead of npm. |
-| 5 | What command installs lodash? | `` `pnpm add lodash` `` |
+`facts.md` had one match:
 
-## Final memory files
+```
+- [F9 t5] No npm, yarn, bun or npx usage found; neither package.json has a `packageManager` field (install scan, partial)
+```
+
+It was added at slate turn 5, which is script turn 6. At the end of the run it was the only live line matching npm. Earlier states weren't snapshotted.
+
+**Likely cause:** a true negative finding from the turn-6 scan, which the curator recorded as a fact. It is not the stale rule.
+
+### Check 1 (real settings): the init reply had two paragraphs
+
+```
+Slate is on for this session.
+
+Separately, these servers need authorization before use: claude.ai Ramp, and the plugin servers asana, atlassian,
+datadog, github, notion and pagerduty. I can't run the OAuth flow here. Use your claude.ai connector settings, or
+`/mcp` in an interactive session.
+```
+
+**Likely cause:** the user's environment reports MCP servers that need authorization, and the model mentioned them despite the skill's "one line". slate's own line was correct.
+
+### Check 13 (real settings): the subagent's hand-back was recorded as a user turn
+
+- With the user's settings, the offload agent returned through the hand-back tool.
+- UserPromptSubmit then fired with a prompt starting `<agent-message from="…">`.
+- `hook.mjs` treats only prompts starting with `<task-notification>` as non-user. So this one became slate turn 3.
+- `conversation/0003.md` holds the subagent's report as `<!-- slate:message -->`, and the curator was told it was "the user's message, verbatim".
+- Here the curator labelled what it saved `(subagent report)`, so nothing was mis-attributed. But a subagent's words could become I items.
+
+**Likely cause:** the `<agent-message>` prompt shape is missing from the prompt classifier.
+
+## Real settings: does slate work alongside the user's setup?
+
+- **Init:** worked. The folder was created and the rules were loaded. The startup context also carried another plugin's SessionStart block and learned rules.
+- **Change lines:** the slate reminder was injected on turns 2 and 3, next to the other plugins' hooks.
+- **Curator:** 3 `ok` lines, all on attempt 1. It ran the same real binary on `sonnet`.
+- **Offload:** used in turn 3.
+- **Report write: not blocked, and no prompt.**
+  - The user's permission rules allow Bash. The agent ran `grep -rn "TODO(perf)" …` and wrote the report with a Bash heredoc (`mkdir -p … && cat > …/reports/todo-perf.md`), so no Write tool was used.
+  - No tool call was denied, and `permission_denials` was empty on every turn.
+- **For comparison, the isolated profile (`acceptEdits`)** denied Bash to the subagents twice:
+  - t3: the first attempt to write the report through Bash. The agent then used Write, which succeeded.
+  - t6: a `find` command. The scan was then incomplete, and the agent asked for Bash.
+- **Cost:** about $0.46 for 3 turns, against $0.27 for the same 3 turns isolated. The extra context from the user's plugins is the likely reason.
+- **Side effects outside the temp dirs.** The user's self-improvement plugin wrote usage notes for this session:
+  - `~/.claude/self-improvement/notes/86553720-….json` and `…/state/86553720-….loaded.json`
+  - No corrections and no new rules
+  - Left in place
+
+## Full run: answers
+
+| Turn | Answer (chars) |
+|---|---|
+| 1 | Slate is on for this session. (29) |
+| 2 | Got it: I'll use npm for all package-manager commands, and I've noted the staging host as stg-7.internal. (105) |
+| 3 | 12 hits in 12 files, grouped, plus a note about a denied Bash write and the report path (961, 8 paragraphs or bullets) |
+| 4 | Got it. From now on I'll give package-manager commands with pnpm instead of npm. (80) |
+| 5 | `` `pnpm add lodash` `` (17) |
+| 6 | All the install commands found use pnpm; the scan is incomplete because Bash was denied. Then bullets and the report path. (1,361) |
+
+The new rule "answer in 2–3 lines and point to the report" was not followed in turns 3 and 6. This isn't asserted.
+
+## Full run: final memory files
 
 `instructions.md`
 ```
 # Instructions
-- [I2 t3] For this project, use pnpm
+- [I2 t3] This project uses pnpm; give package-manager commands using pnpm
 ```
 
 `assumptions.md`
 ```
 # Assumptions
+- [A1 t5] No pnpm-lock.yaml exists, so --frozen-lockfile installs would fail (not in file listing, which may be cut off at 200 lines; unverified)
 ```
 
 `facts.md`
 ```
 # Facts
 - [F1 t1] The staging host is stg-7.internal (user)
-- [F2 t2] 12 "TODO(perf)" mentions, one in each of 12 files, all on line 33; full list in .slate/7ba82ce1-c859-4cf0-a546-63a146ed495a/reports/todo-perf.md (search report)
-- [F3 t2] The report's first line "12 hits? No: 11 files" is a leftover miscount; "12 hits across 12 files" is correct (search report)
-- [F4 t2] Categories: Database 5, Frontend 3, Memory/algorithms 3, Caching 1; only urgent (`!!`) one is hard-coded pool size of 4 in src/db/pool.rs (search report)
-- [F5 t2] The tag appears both with and without a colon, so grepping one form misses the other (search report)
+- [F2 t2] 12 files mention "TODO(perf)", one hit each, all at line 33 (background agent search)
+- [F3 t2] Data access TODOs (5): N+1 query in src/api/users.py, missing orders(created_at) index, nightly full-table scan in docs/architecture.md, unpaginated loading in src/api/orders.py, pool size hard-coded to 4 in src/db/pool.rs (marked `!!`) (agent report)
+- [F4 t2] Other TODO(perf) groups: frontend 3 (memoization, table virtualization, lazy-load hero image); memory/algorithmic 3 (buffer copying, O(n^2) dedupe, non-streaming JSON ingest); caching 1 (DNS caching in config/resolver.yaml) (agent report)
+- [F5 t2] Full TODO(perf) report is at <tmp>/slate-acc-z66xm2/.slate/297d5ee6-c7b3-4444-be30-59297a82e48b/reports/todo-perf.md (agent output)
+- [F6 t5] Dockerfile runs `corepack enable && pnpm install --prod --frozen-lockfile` (install scan, partial)
+- [F7 t5] scripts/setup.sh runs `pnpm install --frozen-lockfile` (install scan, partial)
+- [F8 t5] packages/web `bootstrap` script runs plain `pnpm install` (install scan, partial)
+- [F9 t5] No npm, yarn, bun or npx usage found; neither package.json has a `packageManager` field (install scan, partial)
+- [F10 t5] packages/web `postinstall` calls scripts/patch-deps.js, which wasn't in the file listing (install scan)
+- [F11 t5] Install scan was incomplete: Bash denied, so no grep; module_* files, docs/architecture.md, public/index.html not scanned (install scan)
+- [F12 t5] Install commands report is at <tmp>/slate-acc-z66xm2/.slate/297d5ee6-c7b3-4444-be30-59297a82e48b/reports/install-commands.md (agent output)
 ```
 
 `now.md`
 ```
-Goal: find every file that mentions "TODO(perf)" and summarize the patterns.
-Focus: search done and summarized (12 files; see F2-F5); themes: unbounded growth, orders entity in 3 hits, 8 of 12 under src/.
-Open: none.
-Next: await the user's follow-up (e.g. fix the urgent pool size in src/db/pool.rs).
+Goal: scan every package.json and script in the repo and summarize the install commands they use.
+Focus: partial summary delivered (turn 5); all found commands use pnpm; scan incomplete because Bash was denied.
+Open: does pnpm-lock.yaml exist? Does scripts/patch-deps.js exist? Remaining files unscanned.
+Last: turn 4 answered lodash install with `pnpm add lodash`.
+Next: if user allows Bash, rerun scan with grep and confirm lockfile; give pnpm commands and use stg-7.internal for staging.
 ```
 
 `superseded.md`
@@ -94,83 +206,79 @@ Next: await the user's follow-up (e.g. fix the urgent pool size in src/db/pool.r
 - [I1 t1 retired t3] For this project, always give package-manager commands using npm (reason: user switched project to pnpm)
 ```
 
-## `curator.log`
+The round-0 problem of a report's draft line becoming a fact did not recur. F5 and F12, which only give report locations, are still process notes recorded as facts.
+
+## Full run: `curator.log`
 
 ```
-2026-10-08T01:41:20.305Z t1 ok: attempt 1, changed instructions.md, facts.md, now.md
-2026-10-08T01:41:37.461Z t2 ok: attempt 1, changed now.md
-2026-10-08T01:42:05.606Z t2 ok: attempt 1, changed facts.md, now.md
-2026-10-08T01:42:21.868Z t3 ok: attempt 1, changed instructions.md, superseded.md
-2026-10-08T01:42:32.612Z t4 ok: attempt 1, no change
+2026-10-08T01:53:18.707Z t1 ok: attempt 1, changed instructions.md, facts.md, now.md
+2026-10-08T01:53:36.761Z t2 ok: attempt 1, changed now.md
+2026-10-08T01:54:31.390Z t2 ok: attempt 1, changed facts.md, now.md
+2026-10-08T01:54:47.975Z t3 ok: attempt 1, changed instructions.md, now.md, superseded.md
+2026-10-08T01:55:02.883Z t4 ok: attempt 1, changed now.md
+2026-10-08T01:55:21.239Z t5 ok: attempt 1, changed now.md
+2026-10-08T01:56:00.022Z t5 ok: attempt 1, changed assumptions.md, facts.md, now.md
 ```
 
 - slate turns are one behind the script's turns, because `/slate:init` is not a turn.
-- t2 ran twice: once for the interim "search started" answer, then again when the background agent's result grew the turn file.
+- t2 and t5 each ran twice: once for the interim answer, then again when the background agent's result grew the turn file.
 
 ## Timings
 
-| Turn | `claude -p` wall | Wait for curator after exit | Curator runs (start → log line) |
-|---|---|---|---|
-| 1 `/slate:init` | 3.4 s | 0.8 s (none) | — |
-| 2 npm + staging | 4.4 s | 12.8 s | t1: 11.8 s |
-| 3 search | 25.3 s | 20.3 s | t2: 9.7 s (interim, during the turn), then 19.1 s |
-| 4 pnpm | 4.7 s | 11.3 s | t3: 10.3 s |
-| 5 lodash | 3.4 s | 7.5 s | t4: 6.6 s |
+| Turn | Full: `-p` wall | Full: curator wait | Real: `-p` wall | Real: curator wait |
+|---|---|---|---|---|
+| 1 init | 4.8 s | 0.8 s (none) | 6.1 s | 0.8 s (none) |
+| 2 npm + staging | 3.2 s | 12.8 s | 5.3 s | 11.3 s |
+| 3 search | 56.1 s | 16.5 s | 31.2 s | 13.5 s |
+| 4 pnpm | 4.1 s | 12.8 s | | |
+| 5 lodash | 3.5 s | 11.3 s | | |
+| 6 install scan | 35.3 s | 21.8 s | | |
 
-- Run starts are from `ps` samples taken every 0.3s.
-- `total_cost_usd` from `-p` read 0.029, 0.092, 0.272, 0.292 and 0.304. The figure grows across resumes, so the main session cost about $0.30 in all.
-- Curator cost isn't captured, because its stdout is discarded.
+`total_cost_usd` grows across resumes. The full run cost about $0.43 and the real-settings pass about $0.46. Curator cost isn't captured.
 
 ## Curator binary
 
-The script sampled `ps` for children of this session's `curate.mjs` and read each child's executable with `lsof`. All 5 curator runs showed the same thing:
+The script sampled `ps` for children of this session's `curate.mjs` and read each child's executable with `lsof`. All 10 curator runs (7 full, 3 real) showed the same thing:
 
 | argv[0] | Executable (lsof txt) | Flags |
 |---|---|---|
-| `/Users/adnan/.local/bin/claude` | `/Users/adnan/.local/share/claude/versions/2.1.293` | `-p … --model sonnet` |
+| `~/.local/bin/claude` | `~/.local/share/claude/versions/2.1.293` | `-p … --model sonnet` |
 
-- The curator ran the real binary, not the terminal-wrapper shim that is first on `PATH`.
 - argv[0] is an absolute path, so it came from `CLAUDE_CODE_EXECPATH`. The `PATH` fallback would show the bare name `claude`.
-- Claude Code set `CLAUDE_CODE_EXECPATH` to its launcher symlink `~/.local/bin/claude`, even though the session was started through the versioned path.
+- The terminal-wrapper shim was not used.
 
-## Interactive `/clear` and `/compact` check
+## Interactive `/clear` and `/compact` check (round 0, not rerun)
 
-A Python `pty` script ran at 120×40 in a second fresh temp dir (`$TMPDIR/slate-pty-0jrcenc0`). It used the same binary, with `--plugin-dir <repo>/plugins/slate --model sonnet --setting-sources project,local`. The whole check took 64 s, and no trust dialog appeared.
+A Python `pty` script ran at 120×40 in a fresh temp dir, with `--plugin-dir <repo>/plugins/slate --model sonnet --setting-sources project,local`. It ran before this round's wording changes to `rules.md`, `offload.md` and `curator-rules.md`.
 
 | Step | Result | Evidence |
 |---|---|---|
-| `/slate:init` | PASS | Folder `3681dc40-…` was created. The reply was "slate is on for this session." |
-| `remember: deploy only on Fridays` | PASS | The Stop hook wrote the answer. The curator settled in 11.4 s and wrote `- [I1 t1] deploy only on Fridays`. |
+| `/slate:init` | PASS | The folder was created. The reply was "slate is on for this session." |
+| `remember: deploy only on Fridays` | PASS | The curator settled in 11.4 s and wrote `- [I1 t1] deploy only on Fridays`. |
 | `/clear` moves the folder | PASS | `3681dc40-…` → `ce99b436-…`. `session.json` has `from: "3681dc40-…"`, and the old folder is gone. |
-| SessionStart(clear) reloads memory | PASS | The new transcript has a SessionStart `hook_additional_context` containing `# slate memory`, the rules, `# Instructions` with I1, and `# Now`. |
+| SessionStart(clear) reloads memory | PASS | The attachment has `# slate memory`, the rules, I1 and `# Now`. |
 | First message after `/clear` gets the change line | PASS | The UserPromptSubmit attachment was `slate: offload heavy reads to slate:offload; reply briefly.` |
-| The answer after `/clear` uses reloaded memory | PASS | To "What is our deploy rule?" it answered "Deploy only on Fridays.", recorded as turn 2 in the moved folder. Its curator settled in 6.1 s. |
-| `/compact` reloads memory | PASS | The screen showed "Compacted" and "PreCompact … completed successfully". 10 s later the transcript had a SessionStart attachment starting `# slate memory` / `Memory below wins where it differs from the summary.`, with I1. |
+| The answer after `/clear` uses reloaded memory | PASS | "Deploy only on Fridays." |
+| `/compact` reloads memory | PASS | The screen showed "Compacted" and PreCompact "completed successfully". The SessionStart attachment starts `# slate memory` / `Memory below wins where it differs from the summary.`, with I1. |
 
-The change line after `/clear` has only the reminder. SessionStart(clear) had just shown every item, and nothing changed before the next message.
+## Round 0, for reference
 
-## Observations (not failures)
+The first run had 5 turns and the original 8 checks, and all 8 passed. The review then found two gaps:
+- Check 3 measured only `tool_result`, but the 2,274-char return arrived as a task-notification.
+- The npm-brief check was vacuous, because no Agent call came after the switch.
 
-- **The turn-3 answer was long.** The main thread restated the offload return as 1,381 chars of grouped bullets. The user asked for a summary, but the rules say short.
-- **The offload return was long too.** It was 1,518 chars in 10 long lines, within the "≤10 lines" wording but not its intent.
-- **Report noise reached memory.**
-  - The offload report's first line contradicts itself ("12 hits? No: 11 files").
-  - The main thread repeated that note, and the curator saved it as F3.
-  - Likely cause: the curator records verified facts from the answer as written, and the agent left a draft line in its report.
-- **The change line in `-p` mode shows only the reminder.** Each `--resume` fires SessionStart(resume), which injects the whole memory block and marks every item as seen. So a later turn has no `+I…` entries to show. This is expected.
+This round adds checks 4 and 5 and turn 6.
 
 ## Cleanup
 
 Removed after recording these results:
 
-- `/private/var/folders/yn/n1h_qdds3g57ndq635ryl38w0000gn/T/slate-acc-GxsSoL`
-- `/private/var/folders/yn/n1h_qdds3g57ndq635ryl38w0000gn/T/slate-pty-0jrcenc0`
-- `~/.claude/projects/-private-var-folders-yn-n1h-qdds3g57ndq635ryl38w0000gn-T-slate-acc-GxsSoL`
-- `~/.claude/projects/-private-var-folders-yn-n1h-qdds3g57ndq635ryl38w0000gn-T-slate-pty-0jrcenc0`
-- `/private/tmp/claude-501/-private-var-folders-yn-n1h-qdds3g57ndq635ryl38w0000gn-T-slate-acc-GxsSoL` (task output)
-- `/private/tmp/claude-501/-private-var-folders-yn-n1h-qdds3g57ndq635ryl38w0000gn-T-slate-pty-0jrcenc0` (task output)
+- `<tmp>/slate-acc-z66xm2` and `<tmp>/slate-acc-39j7qc` (round 1); `<tmp>/slate-acc-GxsSoL` and `<tmp>/slate-pty-0jrcenc0` (round 0)
+- The matching `~/.claude/projects/-private-var-folders-…-T-slate-acc-*` and `…-slate-pty-*` folders, one per temp dir
+- The matching `/private/tmp/claude-<uid>/-private-var-folders-…-T-slate-*` task-output dirs
 
 Not removed, because they fall outside the cleanup ruling. All are harmless.
 
-- Empty `~/.claude/session-env/` dirs: `7ba82ce1-c859-4cf0-a546-63a146ed495a`, `3681dc40-878a-4d6c-94f3-7b00d5bf2554`, `ce99b436-523c-4dee-b89a-ada36fff9091`.
-- Mentions of the two temp paths in `~/.claude.json` (project entries). That file was left alone.
+- Empty `~/.claude/session-env/<uuid>` dirs for the five session IDs. The real-settings one holds a hook script written by another plugin.
+- The two self-improvement usage notes for the real-settings session (see above).
+- Mentions of the temp paths in `~/.claude.json` (project entries).

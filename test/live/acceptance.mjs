@@ -1,7 +1,10 @@
 #!/usr/bin/env node
-// Live acceptance: a real five-turn `claude -p` session with slate loaded through --plugin-dir.
+// Live acceptance: a real six-turn `claude -p` session with slate loaded through --plugin-dir.
 // Real model calls, so it is opt-in and `npm test` only registers it as skipped:
-//   node test/live/acceptance.mjs --live [--out <results.json>]
+//   node test/live/acceptance.mjs --live [--real-settings] [--out <results.json>]
+// Default: user settings, plugins and hooks kept out (--setting-sources project,local) and
+// --permission-mode acceptEdits. --real-settings: turns 1-3 only, with neither flag, so the
+// user's own plugins, hooks, CLAUDE.md and permission rules load.
 // Env: SLATE_LIVE_CLAUDE (main-session binary; default CLAUDE_CODE_EXECPATH, else `claude`),
 //      SLATE_LIVE_MODEL (main-session model; default sonnet). The curator uses its own default.
 // It leaves the temp project and ~/.claude/projects/<slug>/ in place and prints both paths;
@@ -21,17 +24,20 @@ const PLUGIN = path.join(REPO, 'plugins', 'slate');
 const MODEL = process.env.SLATE_LIVE_MODEL || 'sonnet';
 const TURN_TIMEOUT_MS = 15 * 60_000;
 const CURATOR_WAIT_MS = 180_000;
-const TOOL_RESULT_MAX = 2000;
+const MAIN_THREAD_MAX = 2000; // chars, per tool_result and per task-notification
 const LIVE_FILES = ['instructions.md', 'assumptions.md', 'facts.md', 'now.md'];
 const MEMORY_FILES = [...LIVE_FILES, 'superseded.md'];
 const NPM = /\bnpm\b/;
+const REMINDER = 'slate: offload heavy reads to slate:offload; reply briefly.';
+const REAL = argv.includes('--real-settings');
 const PROMPTS = [
   '/slate:init',
   'For this project, always give package-manager commands using npm. Also: the staging host is stg-7.internal.',
   'Find every file that mentions "TODO(perf)" and summarize the patterns.',
   'Change of plan: this project uses pnpm now.',
   'What command installs lodash? Reply with only the command.',
-];
+  'Scan every package.json and script in this repo and summarize the install commands they use.',
+].slice(0, REAL ? 3 : 6);
 // Outside-the-plugin failures that earn one retry.
 const TRANSIENT = /rate.?limit|overloaded|\b(429|500|502|503|529)\b|ECONNRESET|ETIMEDOUT|socket hang up|authenticat|oauth|401|403/i;
 
@@ -94,9 +100,15 @@ export function buildRepo(root) {
     fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
     fs.writeFileSync(path.join(root, rel), text);
   };
-  write('package.json', `${JSON.stringify({ name: 'acme-shop', version: '1.4.0', private: true, scripts: { test: 'node --test' } }, null, 2)}\n`);
+  const pkg = (o) => `${JSON.stringify(o, null, 2)}\n`;
+  // Install commands for turn 6 to find. None uses npm: a project fact naming npm would
+  // legitimately land in live memory and confound the "no npm in live memory" check.
+  write('package.json', pkg({ name: 'acme-shop', version: '1.4.0', private: true, scripts: { test: 'node --test', setup: 'sh scripts/setup.sh' } }));
+  write('packages/web/package.json', pkg({ name: '@acme/web', private: true, scripts: { bootstrap: 'pnpm install', build: 'vite build', postinstall: 'node ../../scripts/patch-deps.js' } }));
+  write('scripts/setup.sh', '#!/bin/sh\nset -e\ncorepack enable\npnpm install --frozen-lockfile\n');
+  write('Dockerfile', 'FROM node:24-slim\nWORKDIR /app\nCOPY . .\nRUN corepack enable && pnpm install --prod --frozen-lockfile\nCMD ["node", "lib/server.js"]\n');
   write('README.md', '# acme-shop\n\nA demo storefront.\n');
-  let count = 2;
+  let count = 5;
   for (const [rel, line] of PERF) {
     write(rel, filler(rel, 12, [line]));
     count++;
@@ -227,7 +239,7 @@ const blockText = (content) =>
     : Array.isArray(content) ? content.map((b) => (b?.type === 'text' ? b.text : typeof b === 'string' ? b : '')).join('')
       : '';
 
-function analyse(all, ranges) {
+export function analyse(all, ranges) {
   const main = all.map((e, i) => ({ e, i })).filter(({ e }) => !e.isSidechain);
   const turnOf = (i) => ranges.findIndex(([a, b]) => i >= a && i < b) + 1;
   const toolUses = new Map();
@@ -250,14 +262,52 @@ function analyse(all, ranges) {
         toolResults.push({ turn: turnOf(i), tool: toolUses.get(b.tool_use_id) ?? '?', chars: blockText(b.content).length });
       }
     }
-    if (e.type === 'user' && blockText(content).startsWith('<task-notification>')) {
-      notifications.push({ turn: turnOf(i), chars: blockText(content).length });
+    // A subagent's return reaches the main thread as a <task-notification> (background agent) or,
+    // where the hand-back tool is on, as an <agent-message> user message. Both count.
+    const text = e.type === 'user' ? blockText(content) : '';
+    if (text.startsWith('<task-notification>') || /^[^\n]*\n?<agent-message from=/.test(text)) {
+      const kind = text.startsWith('<task-notification>') ? 'task-notification' : 'agent-message';
+      const result = kind === 'task-notification' ? /<result>([\s\S]*?)<\/result>/.exec(text)?.[1] ?? '' : text;
+      notifications.push({ turn: turnOf(i), kind, chars: text.length, resultChars: result.length, result });
     }
     if (e.type === 'attachment' && e.attachment?.type === 'hook_additional_context') {
       hookContext.push({ turn: turnOf(i), event: e.attachment.hookEvent, text: (e.attachment.content ?? []).join('\n') });
     }
   }
   return { agentCalls, toolResults, hookContext, notifications };
+}
+
+// The subagents' tool calls: file writes (Write/Edit) with their outcome, and every call of any tool
+// that was denied (in -p a denial is an error result, never a prompt).
+const WRITE_TOOLS = ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'];
+export function subagentTools(transcriptFile, sessionId) {
+  const dir = path.join(path.dirname(transcriptFile), sessionId, 'subagents');
+  const writes = [];
+  const denials = [];
+  let files = [];
+  try {
+    files = fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl'));
+  } catch {}
+  for (const f of files) {
+    const calls = new Map();
+    for (const e of entries(path.join(dir, f))) {
+      for (const b of Array.isArray(e.message?.content) ? e.message.content : []) {
+        if (b.type === 'tool_use') {
+          calls.set(b.id, { agent: f, tool: b.name, file: b.input?.file_path ?? null, command: b.input?.command?.slice(0, 120) ?? null, error: null, result: null });
+        }
+        if (b.type === 'tool_result' && calls.has(b.tool_use_id)) {
+          const c = calls.get(b.tool_use_id);
+          c.error = Boolean(b.is_error);
+          c.result = blockText(b.content).slice(0, 300);
+        }
+      }
+    }
+    for (const c of calls.values()) {
+      if (WRITE_TOOLS.includes(c.tool)) writes.push(c);
+      if (c.error && /permission|denied/i.test(c.result ?? '')) denials.push(c);
+    }
+  }
+  return { writes, denials };
 }
 
 // --- main ------------------------------------------------------------------------------------
@@ -272,7 +322,7 @@ async function main() {
   const dir = path.join(project, '.slate', sessionId);
   const transcript = () => transcriptPath(project, sessionId);
   const out = outArg >= 0 ? path.resolve(argv[outArg + 1]) : path.join(os.tmpdir(), `slate-acc-results-${sessionId}.json`);
-  console.log(`project ${project} (${fileCount} files)\nsession ${sessionId}\nclaude ${bin} (${version}), main model ${MODEL}`);
+  console.log(`project ${project} (${fileCount} files)\nsession ${sessionId}\nclaude ${bin} (${version}), main model ${MODEL}, ${REAL ? 'real settings' : 'isolated settings'}`);
 
   const sampler = curatorSampler(sessionId);
   const turns = [];
@@ -283,8 +333,7 @@ async function main() {
       ...(t === 0 ? ['--session-id', sessionId] : ['--resume', sessionId]),
       '--plugin-dir', PLUGIN,
       '--model', MODEL,
-      '--setting-sources', 'project,local',
-      '--permission-mode', 'acceptEdits',
+      ...(REAL ? [] : ['--setting-sources', 'project,local', '--permission-mode', 'acceptEdits']),
       '--output-format', 'json',
     ];
     const before = lineCount(transcript());
@@ -317,6 +366,7 @@ async function main() {
       isError: r.json?.is_error ?? null,
       costUsd: r.json?.total_cost_usd ?? null,
       numTurns: r.json?.num_turns ?? null,
+      permissionDenials: r.json?.permission_denials ?? null,
       stderr: r.stderr.trim().slice(-500),
     };
     turns.push(turn);
@@ -340,26 +390,45 @@ async function main() {
   const mem = Object.fromEntries(MEMORY_FILES.map((f) => [f, readText(path.join(dir, f))]));
   const live = LIVE_FILES.map((f) => mem[f] ?? '').join('\n');
   const log = readText(path.join(dir, 'curator.log')) ?? '';
-  const badLog = log.split('\n').filter((l) => /^\S+ t\d+ (restored|error)\b/.test(l));
+  const badLog = log.split('\n').filter((l) => /\b(restored|error)\b/i.test(l));
+  const slateTurns = exists(path.join(dir, 'session.json')) ? (await readSession(dir)).turn : 0;
+  const okMissing = Array.from({ length: slateTurns }, (_, i) => i + 1).filter((t) => !new RegExp(`^\\S+ t${t} ok:`, 'm').test(log));
   const turn5 = turns[4]?.result ?? '';
   const offload3 = a.agentCalls.filter((c) => c.turn === 3 && c.subagent_type === 'slate:offload');
-  const bigResults = a.toolResults.filter((r) => r.chars > TOOL_RESULT_MAX);
+  const bigResults = a.toolResults.filter((r) => r.chars > MAIN_THREAD_MAX);
+  const bigNotes = a.notifications.filter((n) => n.chars > MAIN_THREAD_MAX);
+  const afterSwitch = a.agentCalls.filter((c) => c.turn >= 5);
   const lateAgents = a.agentCalls.filter((c) => c.turn >= 4);
   const npmAgents = lateAgents.filter((c) => NPM.test(JSON.stringify(c.input)));
+  const userTurns = turns.slice(1).map((t) => t.n);
+  const noChangeLine = userTurns.filter((n) => !a.hookContext.some((h) => h.turn === n && h.event === 'UserPromptSubmit' && h.text.includes(REMINDER)));
+  const { writes, denials } = subagentTools(tp, sessionId);
+  const reports = exists(path.join(dir, 'reports')) ? fs.readdirSync(path.join(dir, 'reports')) : [];
+  const initReply = turns[0]?.result ?? '';
+  const BOTH = ['full', 'real'];
+  const FULL = ['full'];
   const checks = [
-    ['turn 3 used an Agent call with slate:offload', offload3.length > 0, `${offload3.length} slate:offload call(s) in turn 3; all Agent calls: ${a.agentCalls.map((c) => `t${c.turn} ${c.subagent_type}`).join(', ') || 'none'}`],
-    [`no main-thread tool_result over ${TOOL_RESULT_MAX} chars`, bigResults.length === 0, `max ${Math.max(0, ...a.toolResults.map((r) => r.chars))} chars over ${a.toolResults.length} results${bigResults.length ? `; over: ${JSON.stringify(bigResults)}` : ''}`],
-    ['no Agent input from turn 4 on matches /\\bnpm\\b/', npmAgents.length === 0, `${lateAgents.length} Agent call(s) from turn 4 on, ${npmAgents.length} mention npm`],
-    ['live memory files do not match /\\bnpm\\b/', !NPM.test(live), LIVE_FILES.filter((f) => NPM.test(mem[f] ?? '')).join(', ') || 'none match'],
-    ['superseded.md matches /\\bnpm\\b/', NPM.test(mem['superseded.md'] ?? ''), ''],
-    ['turn-5 answer contains pnpm', /pnpm/.test(turn5), JSON.stringify(turn5)],
-    ['stg-7.internal is in live memory', live.includes('stg-7.internal'), LIVE_FILES.filter((f) => (mem[f] ?? '').includes('stg-7.internal')).join(', ') || 'absent'],
-    ['curator.log has no restored or error lines', badLog.length === 0, badLog.join(' | ')],
-  ].map(([name, pass, detail]) => ({ name, pass, detail }));
+    [BOTH, '/slate:init created the folder and replied in one line', exists(path.join(dir, 'session.json')) && initReply.trim() !== '' && !initReply.trim().includes('\n'), JSON.stringify(initReply)],
+    [BOTH, 'turn 3 used an Agent call with slate:offload', offload3.length > 0, `${offload3.length} slate:offload call(s) in turn 3; all Agent calls: ${a.agentCalls.map((c) => `t${c.turn} ${c.subagent_type}`).join(', ') || 'none'}`],
+    [BOTH, `no main-thread tool_result over ${MAIN_THREAD_MAX} chars`, bigResults.length === 0, `max ${Math.max(0, ...a.toolResults.map((r) => r.chars))} chars over ${a.toolResults.length} results${bigResults.length ? `; over: ${JSON.stringify(bigResults)}` : ''}`],
+    [BOTH, `no main-thread subagent return (task-notification or agent-message) over ${MAIN_THREAD_MAX} chars`, bigNotes.length === 0, `${a.notifications.map((n) => `t${n.turn} ${n.kind} ${n.chars} chars (result ${n.resultChars})`).join(', ') || 'none'}`],
+    [FULL, 'at least one Agent call after turn 4', afterSwitch.length > 0, `${afterSwitch.length}: ${afterSwitch.map((c) => `t${c.turn} ${c.subagent_type}`).join(', ') || 'none'}`],
+    [FULL, 'no Agent input from turn 4 on matches /\\bnpm\\b/', npmAgents.length === 0, `${lateAgents.length} Agent call(s) from turn 4 on, ${npmAgents.length} mention npm`],
+    [FULL, 'live memory files do not match /\\bnpm\\b/', !NPM.test(live), LIVE_FILES.filter((f) => NPM.test(mem[f] ?? '')).join(', ') || 'none match'],
+    [FULL, 'superseded.md matches /\\bnpm\\b/', NPM.test(mem['superseded.md'] ?? ''), ''],
+    [FULL, 'turn-5 answer contains pnpm', /pnpm/.test(turn5), JSON.stringify(turn5)],
+    [BOTH, 'stg-7.internal is in live memory', live.includes('stg-7.internal'), LIVE_FILES.filter((f) => (mem[f] ?? '').includes('stg-7.internal')).join(', ') || 'absent'],
+    [BOTH, 'curator.log has no line matching /\\b(restored|error)\\b/i', badLog.length === 0, badLog.join(' | ')],
+    [BOTH, 'every user turn got the slate change line', noChangeLine.length === 0, noChangeLine.length ? `missing on turn(s) ${noChangeLine.join(', ')}` : `turns ${userTurns.join(', ')}`],
+    [BOTH, 'slate counted only user prompts as turns', slateTurns === userTurns.length, `${slateTurns} slate turn(s) for ${userTurns.length} user prompt(s)`],
+    [BOTH, 'curator.log has an ok line for every slate turn', slateTurns > 0 && okMissing.length === 0, `${slateTurns} slate turn(s)${okMissing.length ? `; no ok for t${okMissing.join(', t')}` : ''}`],
+    [BOTH, 'offload report written, no subagent Write/Edit failed', reports.length > 0 && writes.every((w) => !w.error), `reports: ${reports.join(', ') || 'none'}; writes: ${writes.map((w) => `${w.tool} ${path.basename(w.file ?? '?')} ${w.error ? `ERROR ${w.result}` : 'ok'}`).join('; ') || 'none'}; denied (any tool): ${denials.map((d) => `${d.tool} ${d.command ?? d.file ?? ''}`).join('; ') || 'none'}`],
+  ].filter(([profiles]) => profiles.includes(REAL ? 'real' : 'full'))
+    .map(([, name, pass, detail]) => ({ name, pass, detail }));
 
   const results = {
-    project, sessionId, transcript: tp, claude: { bin, version }, model: MODEL, fileCount,
-    turns, checks, agentCalls: a.agentCalls, toolResults: a.toolResults, notifications: a.notifications,
+    profile: REAL ? 'real-settings' : 'isolated', project, sessionId, transcript: tp, claude: { bin, version }, model: MODEL, fileCount,
+    turns, checks, agentCalls: a.agentCalls, toolResults: a.toolResults, notifications: a.notifications, subagentWrites: writes, subagentDenials: denials,
     hookContext: a.hookContext.map((h) => ({ ...h, text: h.text.slice(0, 600) })),
     curatorProcesses: sampler.seen(),
     memory: mem,
@@ -367,7 +436,7 @@ async function main() {
     session: readText(path.join(dir, 'session.json')),
     curated: readText(path.join(dir, 'curated.json')),
     conversation: fs.existsSync(path.join(dir, 'conversation')) ? fs.readdirSync(path.join(dir, 'conversation')) : [],
-    reports: fs.existsSync(path.join(dir, 'reports')) ? fs.readdirSync(path.join(dir, 'reports')) : [],
+    reports: Object.fromEntries(reports.map((f) => [f, readText(path.join(dir, 'reports', f))])),
   };
   fs.writeFileSync(out, `${JSON.stringify(results, null, 2)}\n`);
 
