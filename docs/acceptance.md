@@ -147,7 +147,7 @@ Both hooks act only when `agent_type` is `slate:offload` and the session has a s
 | 5 lodash | 15 | 17 | |
 | 6 CONTRIBUTING | 521 | 612 | |
 
-After an offload, the main thread still writes 500–800 chars, not the 2–3 lines `rules.md` asks for.
+After an offload, the main thread wrote 500–800 chars. Short replies are a default, not a cap (`rules.md`), so this isn't a failure.
 
 ## Run C: answers
 
