@@ -104,17 +104,21 @@ test('no folder: every event gives null and creates nothing', async () => {
 test('SLATE_CURATOR=1: null for every event, even with a folder, and nothing changes', async () => {
   const { root, env, dir, id } = await activeSession();
   env.SLATE_CURATOR = '1';
+  env.CLAUDE_PID = '1'; // a resume that ran would rewrite the pid
   for (const event of EVENTS) {
     const r = await handle(event, input(event, id, root), env);
     assert.equal(r.output, null, event);
     assert.equal(r.spawned, undefined, event);
   }
-  assert.equal((await readSession(dir)).turn, 0);
+  const s = await readSession(dir);
+  assert.equal(s.turn, 0);
+  assert.equal(s.pid, PID);
   assert.equal(await exists(path.join(dir, 'conversation', '0001.md')), false);
 });
 
 test('agent_id: hooks fired inside a subagent are no-ops', async () => {
   const { root, env, dir, id } = await activeSession();
+  env.CLAUDE_PID = '1';
   for (const event of EVENTS) {
     const r = await handle(event, { ...input(event, id, root), agent_id: 'a1', agent_type: 'slate:offload' }, env);
     assert.equal(r.output, null, event);
@@ -122,6 +126,7 @@ test('agent_id: hooks fired inside a subagent are no-ops', async () => {
   }
   const s = await readSession(dir);
   assert.equal(s.turn, 0);
+  assert.equal(s.pid, PID);
   assert.equal(s.lastKind, undefined);
 });
 
