@@ -6,7 +6,7 @@ import path from 'node:path';
 import {
   projectDir, sessionDir, initSession, readSession, writeSession, findByPid, moveSession,
   copySession, claudePid, setPid, nextTurn, writeMessage, appendAnswer, appendContinuation,
-  readTurn, readMemory, writeMemory, turnState,
+  readTurn, readMemory, writeMemory, turnState, releasePid,
 } from '../plugins/slate/scripts/lib/session.mjs';
 import { MEMORY_FILES } from '../plugins/slate/scripts/lib/items.mjs';
 
@@ -243,4 +243,25 @@ test('readSession passes unknown fields through, so nextTurn keeps them', async 
   await writeSession(dir, { ...(await readSession(dir)), logSeen: 42 });
   await nextTurn(dir);
   assert.equal((await readSession(dir)).logSeen, 42);
+});
+
+test('releasePid clears the pid in every other folder holding it; findByPid then skips them', async () => {
+  const root = await tmp();
+  const a = (await initSession(root, 'sa', 111)).dir;
+  const b = (await initSession(root, 'sb', 111)).dir;
+  const c = (await initSession(root, 'sc', 222)).dir;
+  await nextTurn(a);
+  await releasePid(root, 111, b);
+  const sa = await readSession(a);
+  assert.equal(sa.pid, null);
+  assert.equal(sa.turn, 1, 'other fields kept');
+  assert.equal((await readSession(b)).pid, 111, 'the kept folder');
+  assert.equal((await readSession(c)).pid, 222, 'another pid');
+  assert.equal(await findByPid(root, 111), b);
+  await releasePid(root, 111);
+  assert.equal((await readSession(b)).pid, null);
+  assert.equal(await findByPid(root, 111), null);
+  const bare = await tmp();
+  await releasePid(bare, 111); // no .slate: nothing to do, nothing created
+  assert.equal(await exists(path.join(bare, '.slate')), false);
 });

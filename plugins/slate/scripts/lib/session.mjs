@@ -100,6 +100,28 @@ export async function findByPid(root, pid) {
   return best;
 }
 
+// Sets pid to null in every folder holding it, except `keep`. A process that switched to another
+// session (in-process /resume) must not leave its pid on an old folder, or a later /clear or
+// /branch would move or copy that folder into the wrong session.
+export async function releasePid(root, pid, keep = null) {
+  const slate = path.join(root, '.slate');
+  let names;
+  try {
+    names = await fs.readdir(slate);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (name.startsWith('.')) continue;
+    const dir = path.join(slate, name);
+    if (dir === keep) continue;
+    try {
+      const s = await readSession(dir);
+      if (s.pid === pid) await writeSession(dir, { ...s, pid: null });
+    } catch {}
+  }
+}
+
 export async function moveSession(fromDir, toDir) {
   await fs.rename(fromDir, toDir);
   const s = await readSession(toDir);

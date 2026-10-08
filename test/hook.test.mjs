@@ -525,12 +525,70 @@ test('SessionStart fork: no pid match does nothing', async () => {
   assert.ok(await exists(parent));
 });
 
-test('SessionStart startup with no folder: nothing, even when another folder has this pid', async () => {
+test('SessionStart startup with no folder: no output; a folder holding this pid only loses the pid', async () => {
   const { root, env, dir: other } = await activeSession('other');
   const r = await handle('SessionStart', start('new', root, 'startup'), env);
   assert.equal(r.output, null);
+  assert.equal(r.spawned, undefined);
   assert.ok(await exists(other));
+  assert.equal((await readSession(other)).pid, null, 'a stale or earlier session of this process');
   assert.equal(await exists(sessionDir(root, 'new')), false);
+});
+
+// Slate session A, then an in-process /resume to a session without a folder (same process).
+async function resumedAway() {
+  const s = await activeSession('A');
+  const r = await handle('SessionStart', start('B', s.root, 'resume'), s.env);
+  assert.equal(r.output, null);
+  assert.equal(await exists(sessionDir(s.root, 'B')), false);
+  assert.equal((await readSession(s.dir)).pid, null, 'A released the pid');
+  return s;
+}
+
+test('Important 1: resume to a non-slate session, then /clear: nothing moves', async () => {
+  const { root, env, dir: a } = await resumedAway();
+  const r = await handle('SessionStart', start('C', root, 'clear'), env);
+  assert.equal(r.output, null);
+  assert.ok(await exists(a));
+  assert.equal(await exists(sessionDir(root, 'C')), false);
+});
+
+test('Important 1: resume to a non-slate session, then /branch: nothing is copied', async () => {
+  const { root, env, dir: a } = await resumedAway();
+  const r = await handle('SessionStart', start('C', root, 'fork'), env);
+  assert.equal(r.output, null);
+  assert.ok(await exists(a));
+  assert.equal(await exists(sessionDir(root, 'C')), false);
+});
+
+test('Important 1: resuming A takes the pid back from every other folder; /clear then moves A only', async () => {
+  const { root, env, dir: a } = await resumedAway();
+  const { dir: other } = await initSession(root, 'X', PID); // e.g. an earlier /branch copy
+  const r = await handle('SessionStart', start('A', root, 'resume'), env);
+  assert.ok(ctx(r).startsWith('# slate memory'));
+  assert.equal((await readSession(a)).pid, PID);
+  assert.equal((await readSession(other)).pid, null);
+  await handle('SessionStart', start('C', root, 'clear'), env);
+  assert.equal(await exists(a), false);
+  assert.equal((await readSession(sessionDir(root, 'C'))).from, 'A');
+  assert.ok(await exists(other), 'the other folder stays');
+});
+
+test('Important 1: resuming A, then /branch copies A, not another folder', async () => {
+  const { root, env, dir: a } = await resumedAway();
+  const { dir: other } = await initSession(root, 'X', PID);
+  await handle('SessionStart', start('A', root, 'resume'), env);
+  await handle('SessionStart', start('C', root, 'fork'), env);
+  assert.equal((await readSession(sessionDir(root, 'C'))).from, 'A');
+  assert.ok(await exists(a));
+  assert.equal((await readSession(other)).pid, null);
+});
+
+test('Important 1: a session start in another process never touches folders of other pids', async () => {
+  const { root, env, dir: a } = await activeSession('A');
+  const elsewhere = { ...env, CLAUDE_PID: '777' };
+  for (const source of ['startup', 'resume']) await handle('SessionStart', start('B', root, source), elsewhere);
+  assert.equal((await readSession(a)).pid, PID);
 });
 
 // A real detached curator (fake-claude `hang`) that has edited memory and is still running.

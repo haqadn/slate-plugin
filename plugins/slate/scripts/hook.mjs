@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  sessionDir, readSession, writeSession, findByPid, moveSession, copySession, setPid, claudePid,
+  sessionDir, readSession, writeSession, findByPid, moveSession, copySession, setPid, releasePid, claudePid,
   nextTurn, writeMessage, appendAnswer, appendContinuation,
 } from './lib/session.mjs';
 import { waitFree, lockHolder } from './lib/lock.mjs';
@@ -83,9 +83,11 @@ async function setKind(dir, kind) {
 async function sessionStart(input, root, dir, env) {
   const source = input.source;
   if (!(await hasFolder(dir))) {
-    if (source !== 'clear' && source !== 'fork') return { output: null };
     const pid = currentPid(env);
     if (!pid) return { output: null };
+    // This process now runs a session without a folder: no folder may keep its pid.
+    if (source === 'startup' || source === 'resume') await releasePid(root, pid);
+    if (source !== 'clear' && source !== 'fork') return { output: null };
     const found = await findByPid(root, pid);
     if (!found || found === dir) return { output: null };
     if (source === 'clear') {
@@ -96,9 +98,13 @@ async function sessionStart(input, root, dir, env) {
       await copySession(found, dir, pid);
     }
   } else if (source === 'resume') {
-    // A --resume runs in a new process; a later /clear finds the folder by this pid.
+    // A --resume runs in a new process; a later /clear finds the folder by this pid. An in-process
+    // /resume keeps the pid, which another folder may still hold: only this one keeps it.
     const pid = currentPid(env);
-    if (pid) await setPid(dir, pid);
+    if (pid) {
+      await setPid(dir, pid);
+      await releasePid(root, pid, dir);
+    }
   }
   await waitFree(dir, curatorWaitMs(env, START_WAIT_MS));
   return { output: context('SessionStart', await memoryBlock(dir, { afterCompact: source === 'compact' })) };
