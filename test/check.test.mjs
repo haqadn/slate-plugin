@@ -345,3 +345,28 @@ test('R2-2: malformed line cannot be laundered through now.md', () => {
   const a = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- [I7] use pnpm\n');
   has(checkCuratorEdit(b, a, 5), 'malformed item line: "- [I7] use pnpm"');
 });
+
+// ---- final review ----
+test('FR-3: a hand bullet with trailing whitespace can be adopted, kept or trimmed', () => {
+  const b = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- prefer tabs  \n');
+  const adopt = (line) => withFile(BASE, 'instructions.md', BASE['instructions.md'] + line);
+  assert.deepEqual(checkCuratorEdit(b, adopt('- [I7 t0] prefer tabs\n'), 5), []);
+  assert.deepEqual(checkCuratorEdit(b, adopt('- [I7 t0] prefer tabs  \n'), 5), []);
+  assert.deepEqual(checkCuratorEdit(b, adopt('- prefer tabs\n'), 5), [], 'trimming the plain line is not a loss');
+  assert.deepEqual(checkCuratorEdit(b, b, 5), [], 'a no-op passes');
+  // Retiring it in the same edit works too.
+  const retired = mem({
+    ...BASE,
+    'superseded.md': BASE['superseded.md'] + '- [I7 t0 retired t5] prefer tabs (reason: user chose spaces)\n',
+  });
+  assert.deepEqual(checkCuratorEdit(b, retired, 5), []);
+  // Only trailing whitespace is forgiven.
+  has(checkCuratorEdit(b, adopt('- [I7 t0] prefer  tabs\n'), 5), 'plain line lost: "prefer tabs"');
+  has(checkCuratorEdit(b, adopt('- [I7 t0]  prefer tabs\n'), 5), 'I7 tagged t0, expected t5');
+});
+
+test('FR-3: item text still compares exactly, trailing whitespace included', () => {
+  const b = withFile(BASE, 'instructions.md', '# Instructions\n- [I1 t1] use npm  \n- [I2 t2] always run tests\n');
+  assert.deepEqual(checkCuratorEdit(b, b, 5), []);
+  has(checkCuratorEdit(b, BASE, 5), 'I1 reworded');
+});

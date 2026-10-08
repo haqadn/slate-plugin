@@ -3,8 +3,9 @@ import { ITEM_FILES, MEMORY_FILES, isHeading, parseMemoryFile, formatItem, forma
 const NOW_MAX_LINES = 10;
 const ITEM_FILE_NAMES = Object.values(ITEM_FILES);
 
-// Identity of a plain line: its text after a leading "- ", else the whole line.
-const plainId = line => (line.startsWith('- ') ? line.slice(2) : line);
+// Identity of a plain line: its text after a leading "- ", else the whole line; trailing
+// whitespace ignored, so an editor trimming it, or an adoption without it, loses nothing.
+const plainId = line => (line.startsWith('- ') ? line.slice(2) : line).trimEnd();
 
 function parseAll(files, label, violations) {
   const parsed = {};
@@ -114,8 +115,8 @@ export function checkCuratorEdit(before, after, turn) {
     if (knownBefore.has(x.id)) continue;
     const max = maxBefore[x.type] ?? 0;
     if (x.num <= max) v.push(`${x.id} not above previous max ${x.type}${max}`);
-    const isAdoption = x.turn === 0 && beforePlain.has(x.text);
-    if (isAdoption) adopted.add(x.text);
+    const isAdoption = x.turn === 0 && beforePlain.has(x.text.trimEnd());
+    if (isAdoption) adopted.add(x.text.trimEnd());
     else if (x.turn !== turn) v.push(`${x.id} tagged t${x.turn}, expected t${turn}`);
     if (x.retiredTurn !== undefined) {
       if (x.retiredTurn !== turn) v.push(`${x.id} retired at t${x.retiredTurn}, expected t${turn}`);
