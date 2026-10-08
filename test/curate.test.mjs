@@ -287,6 +287,7 @@ for (const [name, mode, bin] of [
     assert.equal(r.attempts, 1);
     assert.equal(r.violations.length, 1);
     assert.match(r.violations[0], /^error: /);
+    assert.equal(r.error, true, 'an error, not a rejected edit: the drain retries it once');
     assert.deepEqual(await readMemory(dir), before);
     const log = await logLines(dir);
     assert.equal(log.length, 1);
@@ -300,7 +301,7 @@ test('timeout: kills the child, logs error: timeout, leaves files unchanged', as
   const t0 = Date.now();
   const r = await runCurator({ dir, turn: TURN, bin: FAKE, timeoutMs: 1000 });
   assert.ok(Date.now() - t0 < 2500, 'returned before the fake finished sleeping');
-  assert.deepEqual(r, { ok: false, attempts: 1, violations: ['error: timeout'] });
+  assert.deepEqual(r, { ok: false, attempts: 1, violations: ['error: timeout'], error: true });
   const log = await logLines(dir);
   assert.equal(log.length, 1);
   assert.equal(assertLog(log[0], 'error'), 'timeout');
@@ -313,7 +314,7 @@ test('timeout: kills the child, logs error: timeout, leaves files unchanged', as
 test('timeout under a shim that does not exec: the whole group dies, no late edit', async () => {
   const { dir, record, before } = await setup('sleep');
   const r = await runCurator({ dir, turn: TURN, bin: SHIM, timeoutMs: 1000 });
-  assert.deepEqual(r, { ok: false, attempts: 1, violations: ['error: timeout'] });
+  assert.deepEqual(r, { ok: false, attempts: 1, violations: ['error: timeout'], error: true });
   assert.ok(await lockGone(dir));
   await new Promise((res) => setTimeout(res, 3000)); // the fake would have edited by now
   assert.deepEqual(await readMemory(dir), before);
@@ -509,17 +510,56 @@ test('drain: an interrupted turn is curated with a placeholder; the newest unans
   assert.ok(!(await calls(record))[2].prompt.includes(NO_ANSWER));
 });
 
-test('drain: failed turns are logged and marked done, so the queue moves on', async () => {
+test('M6: a turn that ends in error is retried once on the next drain, then marked done', async () => {
   const { dir, record, before } = await queued('fail', 2);
-  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, false], [2, false]]);
-  assert.deepEqual(await logTurns(dir), ['t1 error', 't2 error']);
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, false]], 'the first error parks turn 1');
+  assert.deepEqual(await curated(dir), { turn: 0, size: 0, retry: 1 });
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, false], [2, false]], 'turn 1 done; turn 2 parked');
+  assert.deepEqual(await curated(dir), { turn: 1, size: await turnSize(dir, 1), retry: 2 });
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[2, false]]);
+  assert.deepEqual(await curated(dir), { turn: 2, size: await turnSize(dir, 2) });
+  assert.deepEqual(await logTurns(dir), ['t1 error', 't1 error', 't2 error', 't2 error']);
   assert.deepEqual(await readMemory(dir), before);
-  assert.equal((await curated(dir)).turn, 2);
 
   process.env.FAKE_MODE = 'good';
   await addTurn(dir, 3);
   assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[3, true]]);
-  assert.deepEqual(await promptTurns(record), [1, 2, 3]);
+  assert.deepEqual(await promptTurns(record), [1, 1, 2, 2, 3]);
+});
+
+test('M6: a retry that succeeds keeps its edit; a restored turn is never retried', async () => {
+  const { dir } = await queued('fail', 1);
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, false]]);
+  process.env.FAKE_MODE = 'good';
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, true]]);
+  assert.deepEqual(await curated(dir), { turn: 1, size: await turnSize(dir, 1) });
+  assert.equal((await readMemory(dir))['instructions.md'], '# Instructions\n- [I1 t1] fake item\n');
+
+  process.env.FAKE_MODE = 'bad'; // rewords I1: rejected twice, restored
+  await addTurn(dir, 2);
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[2, false]]);
+  assert.deepEqual(await curated(dir), { turn: 2, size: await turnSize(dir, 2) }, 'marked done at once');
+  assert.deepEqual((await drain({ dir, bin: FAKE })).runs, []);
+  assert.deepEqual(await logTurns(dir), ['t1 error', 't1 ok', 't2 retry', 't2 restored']);
+});
+
+test('M6: a drain asked for while a turn errors retries it at once, then moves on', async () => {
+  const { dir } = await queued('fail', 1);
+  let concurrent;
+  const r = await drain({
+    dir,
+    bin: FAKE,
+    beforeRelease: async () => {
+      if (concurrent) return;
+      process.env.FAKE_MODE = 'good';
+      await addTurn(dir, 2);
+      concurrent = await drain({ dir, bin: FAKE }); // turn 2's Stop, while turn 1's error holds the lock
+    },
+  });
+  assert.deepEqual(concurrent, { runs: [], locked: true, aborted: false });
+  assert.deepEqual(runTurns(r), [[1, false], [1, true], [2, true]]);
+  assert.deepEqual(await curated(dir), { turn: 2, size: await turnSize(dir, 2) });
+  assert.ok(await lockGone(dir));
 });
 
 test('drain: work added just before the release is picked up by the recheck', async () => {

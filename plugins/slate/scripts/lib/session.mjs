@@ -219,12 +219,15 @@ export async function turnState(dir, turn) {
   return { size: buf.length, answered };
 }
 
-// curated.json `{ turn, size }`: the last turn curated and its turn file's size when it was read.
-// Only the curator holding the lock writes it (curate.mjs).
+// curated.json `{ turn, size, retry? }`: the last turn curated and its turn file's size when it was
+// read, plus a turn whose curation errored once (see drain in curate.mjs, the only writer).
 export async function readCurated(dir) {
   try {
     const c = JSON.parse(await fs.readFile(path.join(dir, 'curated.json'), 'utf8'));
-    if (Number.isInteger(c?.turn) && c.turn >= 0 && Number.isInteger(c.size) && c.size >= 0) return c;
+    if (Number.isInteger(c?.turn) && c.turn >= 0 && Number.isInteger(c.size) && c.size >= 0) {
+      const retry = Number.isInteger(c.retry) && c.retry >= 1 ? { retry: c.retry } : {};
+      return { turn: c.turn, size: c.size, ...retry };
+    }
   } catch {}
   return { turn: 0, size: 0 };
 }

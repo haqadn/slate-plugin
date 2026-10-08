@@ -268,7 +268,7 @@ async function curateTurn({ dir, turn, model, bin, timeoutMs, signal }) {
       if (err) {
         await restore(dir, before);
         await log(dir, turn, 'error', err);
-        return { ok: false, attempts, violations: [`error: ${err}`] };
+        return { ok: false, attempts, violations: [`error: ${err}`], error: true };
       }
       const after = await snapshot(dir);
       violations = checkCuratorEdit(asText(before), asText(after), turn);
@@ -291,7 +291,7 @@ async function curateTurn({ dir, turn, model, bin, timeoutMs, signal }) {
       if (before) await restore(dir, before);
     } catch {}
     await log(dir, turn, 'error', detail);
-    return { ok: false, attempts, violations: [`error: ${detail}`] };
+    return { ok: false, attempts, violations: [`error: ${detail}`], error: true };
   }
 }
 
@@ -313,13 +313,21 @@ export async function runCurator({
 }
 
 // --- queue ---
-// curated.json `{ turn, size }`: the last turn curated and its turn file's size when it was read
-// (readCurated in session.mjs). Only the lock holder writes it.
+// curated.json `{ turn, size, retry? }`: the last turn curated and its turn file's size when it was
+// read (readCurated in session.mjs), plus `retry`, a later turn whose curation ended in an error
+// and gets one more try. Only the lock holder writes it.
 
 const CURATED = 'curated.json';
 
-const writeCurated = (dir, { turn, size }) =>
-  atomicWrite(path.join(dir, CURATED), `${JSON.stringify({ turn, size })}\n`);
+const writeCurated = (dir, { turn, size, retry }) =>
+  atomicWrite(path.join(dir, CURATED), `${JSON.stringify(retry ? { turn, size, retry } : { turn, size })}\n`);
+
+// Changes whenever a hook records a message or an answer, so whenever a Stop may have asked for a
+// drain.
+async function queueMark(dir) {
+  const last = (await readSession(dir)).turn;
+  return `${last}:${(await turnState(dir, last))?.size ?? 0}`;
+}
 
 // The next turn to curate, or null. First the last done turn again if its file grew (a
 // continuation), else the turn after it. The newest turn waits for its answer; an older turn
@@ -339,7 +347,9 @@ async function nextWork(dir) {
 }
 
 // Curates every pending turn in order. A curator that finds the lock held returns at once: the
-// holder rechecks after its release, so the work isn't lost. `beforeRelease` is a test seam.
+// holder rechecks after its release, so the work isn't lost. A turn whose curation ends in an
+// error (not a rejected edit) stays queued once, for the next drain: a later Stop, or one that
+// came in during this run; a second error marks it done. `beforeRelease` is a test seam.
 export async function drain({
   dir, model = 'sonnet', bin = resolveClaudeBin(), timeoutMs = TIMEOUT_MS, signal, beforeRelease,
 } = {}) {
@@ -349,12 +359,20 @@ export async function drain({
     if (signal?.aborted) return result(false);
     const release = await acquire(dir);
     if (!release) return result(true);
+    let parked = null; // the queue mark from before a turn's first error
     try {
       for (let work; !signal?.aborted && (work = await nextWork(dir));) {
         if (!work.missing) {
+          const mark = await queueMark(dir);
           const r = await curateTurn({ dir, turn: work.turn, model, bin, timeoutMs, signal });
           runs.push({ turn: work.turn, ...r });
           if (r.aborted) break; // not marked done: the next drain curates it again
+          const done = await readCurated(dir);
+          if (r.error && done.retry !== work.turn) {
+            await writeCurated(dir, { ...done, retry: work.turn }); // still queued
+            parked = mark;
+            break;
+          }
         }
         await writeCurated(dir, work);
       }
@@ -363,6 +381,8 @@ export async function drain({
       await release();
     }
     if (signal?.aborted || !(await nextWork(dir))) return result(false);
+    // A parked turn waits for the next drain, unless one was asked for while this one ran.
+    if (parked !== null && (await queueMark(dir)) === parked) return result(false);
   }
 }
 
