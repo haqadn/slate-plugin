@@ -219,6 +219,29 @@ export async function turnState(dir, turn) {
   return { size: buf.length, answered };
 }
 
+// curated.json `{ turn, size }`: the last turn curated and its turn file's size when it was read.
+// Only the curator holding the lock writes it (curate.mjs).
+export async function readCurated(dir) {
+  try {
+    const c = JSON.parse(await fs.readFile(path.join(dir, 'curated.json'), 'utf8'));
+    if (Number.isInteger(c?.turn) && c.turn >= 0 && Number.isInteger(c.size) && c.size >= 0) return c;
+  } catch {}
+  return { turn: 0, size: 0 };
+}
+
+// The turns memory does not cover yet, `{ from, to }`, or null when curation has caught up. A turn
+// counts once its message is written; a continuation appended to the last curated turn reopens it.
+export async function pendingTurns(dir) {
+  const last = (await readSession(dir)).turn;
+  const done = await readCurated(dir);
+  let from = done.turn + 1;
+  if (done.turn >= 1) {
+    const st = await turnState(dir, done.turn);
+    if (st && st.size > done.size) from = done.turn;
+  }
+  return from <= last ? { from, to: last } : null;
+}
+
 export async function readTurn(dir, turn) {
   let text;
   try {

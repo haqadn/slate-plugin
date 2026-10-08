@@ -7,7 +7,7 @@ import { realpathSync, statSync, accessSync, constants } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { writeMemory, readTurn, readSession, turnState, atomicWrite } from './lib/session.mjs';
+import { writeMemory, readTurn, readSession, readCurated, turnState, atomicWrite } from './lib/session.mjs';
 import { acquire } from './lib/lock.mjs';
 import { checkCuratorEdit } from './lib/check.mjs';
 import { MEMORY_FILES } from './lib/items.mjs';
@@ -313,18 +313,10 @@ export async function runCurator({
 }
 
 // --- queue ---
-// curated.json `{ turn, size }`: the last turn curated and its turn file's size when it was read.
-// Only the lock holder writes it.
+// curated.json `{ turn, size }`: the last turn curated and its turn file's size when it was read
+// (readCurated in session.mjs). Only the lock holder writes it.
 
 const CURATED = 'curated.json';
-
-async function readCurated(dir) {
-  try {
-    const c = JSON.parse(await fs.readFile(path.join(dir, CURATED), 'utf8'));
-    if (Number.isInteger(c?.turn) && c.turn >= 0 && Number.isInteger(c.size) && c.size >= 0) return c;
-  } catch {}
-  return { turn: 0, size: 0 };
-}
 
 const writeCurated = (dir, { turn, size }) =>
   atomicWrite(path.join(dir, CURATED), `${JSON.stringify({ turn, size })}\n`);

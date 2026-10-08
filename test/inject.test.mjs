@@ -4,7 +4,9 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { rulesText, memoryBlock, changeLine } from '../plugins/slate/scripts/lib/inject.mjs';
-import { initSession, readSession, writeSession, nextTurn } from '../plugins/slate/scripts/lib/session.mjs';
+import {
+  initSession, readSession, writeSession, nextTurn, writeMessage, appendAnswer,
+} from '../plugins/slate/scripts/lib/session.mjs';
 
 const REMINDER = 'slate: offload heavy reads to slate:offload; reply briefly.';
 const COMPACT_LINE = 'Memory below wins where it differs from the summary.';
@@ -389,4 +391,70 @@ test('changeLine stays within the hook cap with huge items and many warnings', a
   const line = await changeLine(dir, { waiting: false });
   assert.ok(line.length <= MAX, `${line.length}`);
   assert.ok(line.startsWith(REMINDER));
+});
+
+// --- memoryBlock: curation behind ---
+
+// Turns 1..n recorded and answered; curated.json says `done` (null: no curated.json).
+async function turns(n, done) {
+  const dir = await session();
+  for (let t = 1; t <= n; t++) {
+    await nextTurn(dir, { lastKind: 'user' });
+    await writeMessage(dir, t, `message ${t}`);
+    await appendAnswer(dir, t, `answer ${t}`);
+  }
+  if (done) await write(dir, 'curated.json', `${JSON.stringify(done)}\n`);
+  return dir;
+}
+const size = async (dir, t) => (await fs.stat(path.join(dir, 'conversation', `000${t}.md`))).size;
+const lag = (dir, t) =>
+  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'conversation', `000${t}.md`)} before acting on recent instructions.`;
+
+test('Important 2: memoryBlock notes the turn curation has not reached, right under the heading', async () => {
+  const dir = await turns(3, null);
+  await write(dir, 'curated.json', `${JSON.stringify({ turn: 2, size: await size(dir, 2) })}\n`);
+  const b = await memoryBlock(dir, { afterCompact: true });
+  assert.ok(b.startsWith(`# slate memory\n${COMPACT_LINE}\n${lag(dir, 3)}\n`), b.slice(0, 400));
+  assert.ok(b.length <= MAX);
+});
+
+test('Important 2: several turns behind names the range; no curated.json counts as none curated', async () => {
+  const dir = await turns(3, null);
+  const b = await memoryBlock(dir, { afterCompact: false });
+  const conv = path.join(dir, 'conversation');
+  assert.ok(b.includes(`slate: memory may not include turns 1–3 yet — read ${conv}/0001.md to 0003.md before acting on recent instructions.`), b.slice(0, 400));
+});
+
+test('Important 2: a continuation not yet curated reopens its turn', async () => {
+  const dir = await turns(2, null);
+  await write(dir, 'curated.json', `${JSON.stringify({ turn: 2, size: await size(dir, 2) })}\n`);
+  assert.ok(!(await memoryBlock(dir)).includes('may not include'), 'caught up');
+  await appendAnswer(dir, 2, 'the background agent finished');
+  assert.ok((await memoryBlock(dir)).includes(lag(dir, 2)));
+});
+
+test('Important 2: caught up, or no turns yet: no note', async () => {
+  const fresh = await session();
+  assert.ok(!(await memoryBlock(fresh)).includes('slate: memory'));
+  const dir = await turns(2, null);
+  await write(dir, 'curated.json', `${JSON.stringify({ turn: 2, size: await size(dir, 2) })}\n`);
+  assert.ok(!(await memoryBlock(dir)).includes('slate: memory'));
+});
+
+test('M2: waiting says memory is still updating, with the turn it may lack', async () => {
+  const dir = await turns(1, { turn: 0, size: 0 });
+  const b = await memoryBlock(dir, { waiting: true });
+  const file = path.join(dir, 'conversation', '0001.md');
+  assert.ok(b.startsWith(`# slate memory\nslate: memory still updating; it may not include turn 1 yet — read ${file} before acting on recent instructions.\n`), b.slice(0, 400));
+  const fresh = await session();
+  assert.ok((await memoryBlock(fresh, { waiting: true })).startsWith('# slate memory\nslate: memory still updating.\n'));
+});
+
+test('Important 2: the note survives a block cut to 10,000 chars', async () => {
+  const dir = await turns(1, null);
+  await write(dir, 'now.md', `${'y'.repeat(200)}\n`.repeat(100));
+  await write(dir, 'instructions.md', `# Instructions\n${lines('I', 30, 1000)}\n`);
+  const b = await memoryBlock(dir, { afterCompact: true, waiting: true });
+  assert.ok(b.length <= MAX, `${b.length}`);
+  assert.ok(b.includes('slate: memory still updating; it may not include turn 1 yet'));
 });

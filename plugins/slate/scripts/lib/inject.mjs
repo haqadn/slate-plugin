@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ITEM_FILES, MEMORY_FILES, RETIRED_LIKE, parseMemoryFile, formatItem } from './items.mjs';
-import { readSession, writeSession, readMemory } from './session.mjs';
+import { readSession, writeSession, readMemory, pendingTurns } from './session.mjs';
 
 // Nothing here ever puts superseded.md text into output. Retired texts are read only to filter lines out.
 
@@ -99,9 +99,24 @@ function liveLines(text, retired) {
 const nowLines = (text, retired) =>
   String(text).split(/\r?\n/).filter((l) => l.trim() !== '').filter(safeText(retired));
 
-export async function memoryBlock(dir, { afterCompact = false } = {}) {
+// One line when memory may lag the conversation: turns not curated yet (say a /clear aborted the
+// curator), or `waiting`, a curator still holding the lock. The conversation is gone after a
+// /clear, so the line points at the turn files.
+async function lagLine(dir, waiting) {
+  const p = await pendingTurns(dir);
+  if (!p) return waiting ? 'slate: memory still updating.' : '';
+  const file = (t) => `${String(t).padStart(4, '0')}.md`;
+  const conv = path.join(dir, 'conversation');
+  const what = p.from === p.to
+    ? `turn ${p.to} yet — read ${path.join(conv, file(p.to))}`
+    : `turns ${p.from}–${p.to} yet — read ${path.join(conv, file(p.from))} to ${file(p.to)}`;
+  return `slate: ${waiting ? 'memory still updating; it' : 'memory'} may not include ${what} before acting on recent instructions.`;
+}
+
+export async function memoryBlock(dir, { afterCompact = false, waiting = false } = {}) {
   const memory = await readMemory(dir);
-  const head = afterCompact ? `# slate memory\n${COMPACT_LINE}` : '# slate memory';
+  const lag = await lagLine(dir, waiting);
+  const head = ['# slate memory', afterCompact && COMPACT_LINE, lag].filter(Boolean).join('\n');
   const rules = (await rulesText(dir)).trim();
   const retired = retiredTexts(memory);
   const sections = [

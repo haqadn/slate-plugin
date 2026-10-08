@@ -1,12 +1,13 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { handle, curatorWaitMs, HARNESS_PREFIXES, HANDBACK_TOOLS } from '../plugins/slate/scripts/hook.mjs';
-import { initSession, readSession, readTurn, readMemory, sessionDir } from '../plugins/slate/scripts/lib/session.mjs';
+import { initSession, readSession, readTurn, readMemory, sessionDir, appendAnswer } from '../plugins/slate/scripts/lib/session.mjs';
 import { acquire } from '../plugins/slate/scripts/lib/lock.mjs';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-claude.mjs', import.meta.url));
@@ -614,33 +615,88 @@ async function assertAborted(dir, before, record) {
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
 }
 
-test('SessionStart clear with a curator mid-edit: aborts it, then moves; the turn is re-curated later', async () => {
+const lagNote = (dir, t) =>
+  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'conversation', `000${t}.md`)} before acting on recent instructions.`;
+
+test('Important 2: /clear mid-curation aborts, moves, notes the missing turn and drains it in the new folder', async () => {
   const { root, env, dir: old, before } = await curatorMidEdit('old');
+  env.FAKE_MODE = 'good'; // for the drain this SessionStart starts; the running curator hangs
   const t0 = Date.now();
   const r = await handle('SessionStart', start('new', root, 'clear'), env);
   assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0}ms`);
   const dir = sessionDir(root, 'new');
   assert.equal(await exists(old), false);
-  await assertAborted(dir, before, env.FAKE_RECORD);
-  assert.ok(ctx(r).startsWith('# slate memory'));
-  assert.ok(!ctx(r).includes('fake item'));
+  assert.ok(ctx(r).startsWith(`# slate memory\n${lagNote(dir, 1)}\n`), ctx(r).slice(0, 400));
+  assert.ok(!ctx(r).includes('fake item'), 'the block was built from the restored memory');
+  assert.deepEqual(r.spawned, [CURATE, dir, '1', 'sonnet']);
 
-  env.FAKE_MODE = 'good';
-  await handle('UserPromptSubmit', prompt('new', root, 'next'), env);
-  await handle('Stop', stop('new', root, 'done'), env);
-  await waitLog(dir, 3);
-  assert.deepEqual(await logTurns(dir), ['t1 aborted', 't1 ok', 't2 ok']);
+  await waitLog(dir, 2);
+  assert.deepEqual(await logTurns(dir), ['t1 aborted', 't1 ok']);
+  assert.match((await logLines(dir))[0], / t1 aborted: requeued$/);
+  const [hung, drained, ...rest] = await fakeCalls(env.FAKE_RECORD);
+  assert.deepEqual(rest, []);
+  assert.throws(() => process.kill(hung.pid, 0), { code: 'ESRCH' }, 'the aborted claude is gone');
+  assert.ok(drained.prompt.includes(path.join(realpathSync(dir), 'instructions.md')), 'drained in the new folder');
+  assert.notDeepEqual(await readMemory(dir), before);
+  assert.equal(JSON.parse(await fs.readFile(path.join(dir, 'curated.json'), 'utf8')).turn, 1);
+
+  // The next message's change line shows the drained turn's delta.
+  const next = await handle('UserPromptSubmit', prompt('new', root, 'next'), env);
+  assert.match(ctx(next), /\+I1 fake item/);
   assert.equal(await exists(old), false, 'nothing recreated the old folder');
 });
 
-test('SessionStart fork with a curator mid-edit: aborts it; the parent is restored and the copy is clean', async () => {
+test('Important 2: once curation has caught up, SessionStart adds no note and starts no drain', async () => {
+  const { root, env, dir, id } = await activeSession();
+  await handle('UserPromptSubmit', prompt(id, root, 'use pnpm'), env);
+  await handle('Stop', stop(id, root, 'ok'), env);
+  await waitLog(dir, 1);
+  for (const source of ['resume', 'compact']) {
+    const r = await handle('SessionStart', start(id, root, source), env);
+    assert.ok(!ctx(r).includes('slate: memory'), source);
+    assert.equal(r.spawned, undefined, source);
+  }
+});
+
+test('Important 2: resume with a turn left uncurated drains it', async () => {
+  const { root, env, dir, id } = await activeSession();
+  await handle('UserPromptSubmit', prompt(id, root, 'use pnpm'), env);
+  await appendAnswer(dir, 1, 'ok'); // a Stop whose curator never ran
+  const r = await handle('SessionStart', start(id, root, 'resume'), env);
+  assert.ok(ctx(r).includes(lagNote(dir, 1)));
+  assert.deepEqual(r.spawned, [CURATE, dir, '1', 'sonnet']);
+  await waitLog(dir, 1);
+  assert.deepEqual(await logTurns(dir), ['t1 ok']);
+});
+
+test('M2: SessionStart while a curator still holds the lock says memory is still updating', async () => {
+  const { root, env, dir, id } = await activeSession();
+  env.SLATE_WAIT_MS = '200';
+  await handle('UserPromptSubmit', prompt(id, root, 'use pnpm'), env);
+  await appendAnswer(dir, 1, 'ok');
+  const release = await acquire(dir);
+  try {
+    const r = await handle('SessionStart', start(id, root, 'compact'), env);
+    const file = path.join(dir, 'conversation', '0001.md');
+    assert.ok(ctx(r).includes(`\nslate: memory still updating; it may not include turn 1 yet — read ${file} before acting on recent instructions.\n`), ctx(r).slice(0, 400));
+    assert.equal(r.spawned, undefined, 'the lock holder rechecks after its release');
+  } finally {
+    await release();
+  }
+});
+
+test('SessionStart fork with a curator mid-edit: aborts it; the parent is restored, the copy notes and drains the turn', async () => {
   const { root, env, dir: parent, before } = await curatorMidEdit('parent');
+  env.FAKE_MODE = 'good';
   const r = await handle('SessionStart', start('child', root, 'fork'), env);
   const child = sessionDir(root, 'child');
   await assertAborted(parent, before, env.FAKE_RECORD);
-  await assertAborted(child, before, env.FAKE_RECORD);
   assert.equal((await readSession(child)).from, 'parent');
-  assert.ok(ctx(r).startsWith('# slate memory'));
+  assert.ok(ctx(r).startsWith(`# slate memory\n${lagNote(child, 1)}\n`), ctx(r).slice(0, 400));
+  assert.deepEqual(r.spawned, [CURATE, child, '1', 'sonnet']);
+  await waitLog(child, 2);
+  assert.deepEqual(await logTurns(child), ['t1 aborted', 't1 ok']);
+  assert.deepEqual(await readMemory(parent), before, 'the parent is untouched by the child drain');
 });
 
 test('SessionStart clear: a lock held by a process that is not a curator is never signalled', async () => {

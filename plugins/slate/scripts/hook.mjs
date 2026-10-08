@@ -7,7 +7,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   sessionDir, readSession, writeSession, findByPid, moveSession, copySession, setPid, releasePid, claudePid,
-  nextTurn, writeMessage, appendAnswer, appendContinuation,
+  nextTurn, writeMessage, appendAnswer, appendContinuation, pendingTurns,
 } from './lib/session.mjs';
 import { waitFree, lockHolder } from './lib/lock.mjs';
 import { memoryBlock, changeLine } from './lib/inject.mjs';
@@ -106,8 +106,13 @@ async function sessionStart(input, root, dir, env) {
       await releasePid(root, pid, dir);
     }
   }
-  await waitFree(dir, curatorWaitMs(env, START_WAIT_MS));
-  return { output: context('SessionStart', await memoryBlock(dir, { afterCompact: source === 'compact' })) };
+  const free = await waitFree(dir, curatorWaitMs(env, START_WAIT_MS));
+  const output = context('SessionStart', await memoryBlock(dir, { afterCompact: source === 'compact', waiting: !free }));
+  // Turns left uncurated, e.g. by a curator aborted above before the move or copy: drain them now
+  // rather than at the next Stop. Only after the block, so it never reads a curator's unchecked
+  // edit; and only when the lock is free, since a holder rechecks the queue after its release.
+  const pending = free ? await pendingTurns(dir) : null;
+  return pending ? { output, spawned: spawnCurator(dir, pending.to, env) } : { output };
 }
 
 async function userPromptSubmit(input, dir, env) {
