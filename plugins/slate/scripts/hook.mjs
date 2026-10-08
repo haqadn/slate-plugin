@@ -3,28 +3,56 @@
 import fs from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   sessionDir, readSession, writeSession, findByPid, moveSession, copySession, setPid, claudePid,
   nextTurn, writeMessage, appendAnswer, appendContinuation,
 } from './lib/session.mjs';
-import { waitFree } from './lib/lock.mjs';
+import { waitFree, lockHolder } from './lib/lock.mjs';
 import { memoryBlock, changeLine } from './lib/inject.mjs';
 
 const CURATE = fileURLToPath(new URL('./curate.mjs', import.meta.url));
-const START_WAIT_MS = 20000;
+const START_WAIT_MS = 20000; // SessionStart, and clear before aborting a curator
+const FORK_WAIT_MS = 5000; // fork before aborting a curator
+const ABORT_WAIT_MS = 5000; // for an aborted curator to undo its edit and release
 const PROMPT_WAIT_MS = 20000;
 const COMPACT_WAIT_MS = 60000;
+const MAX_WAIT_MS = 25000;
 // A session ID becomes a folder name; anything that could leave .slate/ is not ours.
 const SAFE_ID = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
 
 const exists = (p) => fs.access(p).then(() => true, () => false);
 const hasFolder = (dir) => exists(path.join(dir, 'session.json'));
 
-function promptWaitMs(env) {
+// How long to wait for a running curator: `fallback`, or SLATE_WAIT_MS (for tests), at most 25s.
+export function curatorWaitMs(env, fallback) {
   const n = Number(env.SLATE_WAIT_MS);
-  return env.SLATE_WAIT_MS && Number.isInteger(n) && n >= 0 ? n : PROMPT_WAIT_MS;
+  return env.SLATE_WAIT_MS && Number.isInteger(n) && n >= 0 ? Math.min(n, MAX_WAIT_MS) : fallback;
+}
+
+function isCurator(pid) {
+  try {
+    return execFileSync('ps', ['-o', 'command=', '-p', String(pid)], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).includes('curate.mjs');
+  } catch {
+    return false;
+  }
+}
+
+// Before a folder is moved or copied, its curator must be gone: once the folder moves, the
+// curator's restore and log would target the old path and an unchecked edit would be kept.
+// Wait; then SIGTERM the holder if it is a curator (it undoes its edit and releases); wait again.
+async function settle(dir, waitMs) {
+  if (await waitFree(dir, waitMs)) return;
+  const pid = await lockHolder(dir);
+  if (pid && isCurator(pid)) {
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {}
+  }
+  await waitFree(dir, ABORT_WAIT_MS);
 }
 
 // CLAUDE_PID from the given env, else claudePid()'s own lookup (process env, then the ancestors).
@@ -49,15 +77,19 @@ async function sessionStart(input, root, dir, env) {
     if (!pid) return { output: null };
     const found = await findByPid(root, pid);
     if (!found || found === dir) return { output: null };
-    await waitFree(found, START_WAIT_MS);
-    if (source === 'clear') await moveSession(found, dir);
-    else await copySession(found, dir, pid);
+    if (source === 'clear') {
+      await settle(found, curatorWaitMs(env, START_WAIT_MS));
+      await moveSession(found, dir);
+    } else {
+      await settle(found, curatorWaitMs(env, FORK_WAIT_MS));
+      await copySession(found, dir, pid);
+    }
   } else if (source === 'resume') {
     // A --resume runs in a new process; a later /clear finds the folder by this pid.
     const pid = currentPid(env);
     if (pid) await setPid(dir, pid);
   }
-  await waitFree(dir, START_WAIT_MS);
+  await waitFree(dir, curatorWaitMs(env, START_WAIT_MS));
   return { output: context('SessionStart', await memoryBlock(dir, { afterCompact: source === 'compact' })) };
 }
 
@@ -74,9 +106,8 @@ async function userPromptSubmit(input, dir, env) {
     const waiting = !(await waitFree(dir, 0));
     return { output: context('UserPromptSubmit', await changeLine(dir, { waiting })) };
   }
-  const waiting = !(await waitFree(dir, promptWaitMs(env)));
-  const turn = await nextTurn(dir);
-  await setKind(dir, 'user');
+  const waiting = !(await waitFree(dir, curatorWaitMs(env, PROMPT_WAIT_MS)));
+  const turn = await nextTurn(dir, { lastKind: 'user' });
   await writeMessage(dir, turn, prompt, new Date().toISOString());
   return { output: context('UserPromptSubmit', await changeLine(dir, { waiting })) };
 }

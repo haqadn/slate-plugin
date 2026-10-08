@@ -21,7 +21,7 @@ export function sessionDir(root, sessionId) {
 }
 
 let tmpSeq = 0;
-async function atomicWrite(file, text) {
+export async function atomicWrite(file, text) {
   const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${tmpSeq++}.tmp`);
   try {
     await fs.writeFile(tmp, text);
@@ -141,11 +141,12 @@ export function claudePid() {
   return null;
 }
 
-export async function nextTurn(dir) {
+// `fields` (e.g. lastKind) go into the same session.json write; they can't set the turn.
+export async function nextTurn(dir, fields = {}) {
   const s = await readSession(dir);
-  s.turn += 1;
-  await writeSession(dir, s);
-  return s.turn;
+  const turn = s.turn + 1;
+  await writeSession(dir, { ...s, ...fields, turn });
+  return turn;
 }
 
 // Turn files. A marker is a line that is exactly the marker text. Marker-like lines inside
@@ -181,6 +182,20 @@ export async function appendAnswer(dir, turn, answer) {
 
 // A follow-up answer (e.g. after a background-agent notification) is just another answer section.
 export const appendContinuation = appendAnswer;
+
+// null if the turn file is missing. `size` is in bytes; `answered` means a Stop wrote an answer
+// section (possibly empty). Escaped marker-like lines in the text don't count.
+export async function turnState(dir, turn) {
+  let buf;
+  try {
+    buf = await fs.readFile(turnFile(dir, turn));
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+  const answered = [...buf.toString('utf8').matchAll(MARKER_LINE)].some((m) => m[1] === 'answer');
+  return { size: buf.length, answered };
+}
 
 export async function readTurn(dir, turn) {
   let text;

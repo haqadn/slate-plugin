@@ -1,12 +1,13 @@
 // Curator runner: snapshot the five memory files, let a fresh `claude -p` edit them, then keep the
 // edit only if the safety check passes. One retry with the violations; otherwise restore.
-// CLI: node curate.mjs <dir> <turn> [model]
+// CLI: node curate.mjs <dir> <turn> [model]. It drains every pending turn of the session; <turn> is
+// advisory. SIGTERM aborts: the running edit is undone and that turn stays queued.
 import fs from 'node:fs/promises';
 import { realpathSync, statSync, accessSync, constants } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { writeMemory, readTurn } from './lib/session.mjs';
+import { writeMemory, readTurn, readSession, turnState, atomicWrite } from './lib/session.mjs';
 import { acquire } from './lib/lock.mjs';
 import { checkCuratorEdit } from './lib/check.mjs';
 import { MEMORY_FILES } from './lib/items.mjs';
@@ -18,6 +19,8 @@ const TIMEOUT_MS = 300_000;
 const STDERR_MAX = 300;
 const STDERR_GRACE_MS = 500;
 const MAX_ATTEMPTS = 2;
+const NO_ANSWER = '[no answer: turn was interrupted]';
+const ABORTED = 'aborted';
 
 // Parent-session identity and plumbing that must not leak into the curator's `claude -p`.
 export const CURATOR_ENV_DENY = [
@@ -123,8 +126,8 @@ function killGroup(child) {
   }
 }
 
-// Resolves null on success, else a one-line error detail. Never rejects.
-function runClaude(bin, args, { cwd, env, timeoutMs }) {
+// Resolves null on success, ABORTED once `signal` fires, else a one-line error detail. Never rejects.
+function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
   return new Promise((resolve) => {
     let child;
     let timer;
@@ -132,29 +135,42 @@ function runClaude(bin, args, { cwd, env, timeoutMs }) {
     let exit;
     let settled = false;
     let timedOut = false;
+    let aborted = false;
     let stderr = '';
+    const onAbort = () => {
+      aborted = true;
+      if (child) killGroup(child);
+      if (exit) finish(ABORTED);
+    };
     const finish = (detail) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(grace);
+      signal?.removeEventListener('abort', onAbort);
       // A process outside the group may still hold stderr open; don't let it keep us alive.
       child?.stderr?.destroy();
       child?.unref();
       resolve(detail);
     };
     const outcome = () => {
+      if (aborted) return ABORTED;
       if (timedOut) return 'timeout';
       if (exit.code === 0) return null;
       const tail = oneLine(stderr).slice(-STDERR_MAX);
       return `${exit.signal ? `killed by ${exit.signal}` : `exit ${exit.code}`}${tail ? `: ${tail}` : ''}`;
     };
+    if (signal?.aborted) {
+      finish(ABORTED);
+      return;
+    }
     try {
       child = spawn(bin, args, { cwd, env, stdio: ['ignore', 'ignore', 'pipe'], detached: true });
     } catch (e) {
       finish(`spawn failed: ${e.message}`);
       return;
     }
+    signal?.addEventListener('abort', onAbort, { once: true });
     timer = setTimeout(() => {
       timedOut = true;
       killGroup(child);
@@ -168,7 +184,7 @@ function runClaude(bin, args, { cwd, env, timeoutMs }) {
       exit = { code, signal };
       clearTimeout(timer);
       killGroup(child); // nothing it left behind may edit after the check
-      grace = setTimeout(() => finish(outcome()), timedOut ? 0 : STDERR_GRACE_MS);
+      grace = setTimeout(() => finish(outcome()), timedOut || aborted ? 0 : STDERR_GRACE_MS);
     });
     child.on('close', () => {
       if (exit) finish(outcome());
@@ -218,28 +234,29 @@ function changedFiles(before, after) {
   return files.length ? `changed ${files.join(', ')}` : 'no change';
 }
 
-export async function runCurator({
-  dir, turn, model = 'sonnet', bin = resolveClaudeBin(), timeoutMs = TIMEOUT_MS,
-}) {
-  let release;
-  try {
-    release = await acquire(dir);
-  } catch (e) {
-    return { ok: false, attempts: 0, violations: [`error: ${oneLine(e.message)}`] };
-  }
-  if (!release) return { ok: false, attempts: 0, violations: ['locked'] };
-
+// One turn; the caller holds the lock. On abort the snapshot is restored and `aborted: true` is set.
+async function curateTurn({ dir, turn, model, bin, timeoutMs, signal }) {
   let before;
   let attempts = 0;
+  const aborted = async () => {
+    await restore(dir, before);
+    await log(dir, turn, 'error', ABORTED);
+    return { ok: false, attempts, violations: [`error: ${ABORTED}`], aborted: true };
+  };
   try {
     before = await snapshot(dir);
     const real = realpathSync(dir);
-    const { message, answer } = await readTurn(dir, turn);
-    const base = buildPrompt({ rules: await fs.readFile(RULES_FILE, 'utf8'), turn, real, message, answer });
+    const state = await turnState(dir, turn);
+    const read = await readTurn(dir, turn);
+    const answer = state?.answered ? read.answer : NO_ANSWER;
+    const base = buildPrompt({
+      rules: await fs.readFile(RULES_FILE, 'utf8'), turn, real, message: read.message, answer,
+    });
     const opts = {
       cwd: path.dirname(path.dirname(real)), // the project dir: <project>/.slate/<id>
       env: curatorEnv(process.env),
       timeoutMs,
+      signal,
     };
 
     let prompt = base;
@@ -247,6 +264,7 @@ export async function runCurator({
     while (attempts < MAX_ATTEMPTS) {
       attempts++;
       const err = await runClaude(bin, curatorArgs(prompt, model, real), opts);
+      if (err === ABORTED) return await aborted();
       if (err) {
         await restore(dir, before);
         await log(dir, turn, 'error', err);
@@ -259,6 +277,7 @@ export async function runCurator({
         return { ok: true, attempts, violations: [] };
       }
       await restore(dir, before);
+      if (signal?.aborted) return await aborted();
       if (attempts < MAX_ATTEMPTS) {
         await log(dir, turn, 'retry', violations.join('; '));
         prompt = `${base}\n\nYour previous edit was rejected and undone: ${violations.join('; ')}. Fix and retry.`;
@@ -273,8 +292,85 @@ export async function runCurator({
     } catch {}
     await log(dir, turn, 'error', detail);
     return { ok: false, attempts, violations: [`error: ${detail}`] };
+  }
+}
+
+export async function runCurator({
+  dir, turn, model = 'sonnet', bin = resolveClaudeBin(), timeoutMs = TIMEOUT_MS, signal,
+}) {
+  let release;
+  try {
+    release = await acquire(dir);
+  } catch (e) {
+    return { ok: false, attempts: 0, violations: [`error: ${oneLine(e.message)}`] };
+  }
+  if (!release) return { ok: false, attempts: 0, violations: ['locked'] };
+  try {
+    return await curateTurn({ dir, turn, model, bin, timeoutMs, signal });
   } finally {
     await release();
+  }
+}
+
+// --- queue ---
+// curated.json `{ turn, size }`: the last turn curated and its turn file's size when it was read.
+// Only the lock holder writes it.
+
+const CURATED = 'curated.json';
+
+async function readCurated(dir) {
+  try {
+    const c = JSON.parse(await fs.readFile(path.join(dir, CURATED), 'utf8'));
+    if (Number.isInteger(c?.turn) && c.turn >= 0 && Number.isInteger(c.size) && c.size >= 0) return c;
+  } catch {}
+  return { turn: 0, size: 0 };
+}
+
+const writeCurated = (dir, { turn, size }) =>
+  atomicWrite(path.join(dir, CURATED), `${JSON.stringify({ turn, size })}\n`);
+
+// The next turn to curate, or null. First the last done turn again if its file grew (a
+// continuation), else the turn after it. The newest turn waits for its answer; an older turn
+// without one was interrupted. An older turn with no file is skipped (`missing`).
+async function nextWork(dir) {
+  const done = await readCurated(dir);
+  const last = (await readSession(dir)).turn;
+  if (done.turn >= 1 && done.turn <= last) {
+    const st = await turnState(dir, done.turn);
+    if (st && st.size > done.size) return { turn: done.turn, size: st.size, missing: false };
+  }
+  const turn = done.turn + 1;
+  if (turn > last) return null;
+  const st = await turnState(dir, turn);
+  if (turn === last && !st?.answered) return null;
+  return { turn, size: st?.size ?? 0, missing: !st };
+}
+
+// Curates every pending turn in order. A curator that finds the lock held returns at once: the
+// holder rechecks after its release, so the work isn't lost. `beforeRelease` is a test seam.
+export async function drain({
+  dir, model = 'sonnet', bin = resolveClaudeBin(), timeoutMs = TIMEOUT_MS, signal, beforeRelease,
+} = {}) {
+  const runs = [];
+  const result = (locked) => ({ runs, locked, aborted: Boolean(signal?.aborted) });
+  for (;;) {
+    if (signal?.aborted) return result(false);
+    const release = await acquire(dir);
+    if (!release) return result(true);
+    try {
+      for (let work; !signal?.aborted && (work = await nextWork(dir));) {
+        if (!work.missing) {
+          const r = await curateTurn({ dir, turn: work.turn, model, bin, timeoutMs, signal });
+          runs.push({ turn: work.turn, ...r });
+          if (r.aborted) break; // not marked done: the next drain curates it again
+        }
+        await writeCurated(dir, work);
+      }
+      if (beforeRelease && !signal?.aborted) await beforeRelease();
+    } finally {
+      await release();
+    }
+    if (signal?.aborted || !(await nextWork(dir))) return result(false);
   }
 }
 
@@ -285,8 +381,16 @@ async function main([dir, turnArg, model]) {
     process.exitCode = 1;
     return;
   }
-  const r = await runCurator({ dir: path.resolve(dir), turn, model: model || undefined });
-  process.exitCode = r.ok ? 0 : 1;
+  // SIGTERM (from a SessionStart clear/fork that must move this folder): undo, release, exit.
+  const ac = new AbortController();
+  process.on('SIGTERM', () => ac.abort());
+  try {
+    const r = await drain({ dir: path.resolve(dir), model: model || undefined, signal: ac.signal });
+    process.exitCode = r.aborted || r.runs.some((x) => !x.ok) ? 1 : 0;
+  } catch (e) {
+    process.stderr.write(`slate curator: ${oneLine(e.message)}\n`);
+    process.exitCode = 1;
+  }
 }
 
 function isMain() {

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Fake `claude` for curator tests. Records each call to $FAKE_RECORD (one JSON line) and edits
-// the memory files named in the prompt, per $FAKE_MODE: good | bad | bad-then-good | fail | sleep | orphan.
+// the memory files named in the prompt, per $FAKE_MODE: good | bad | bad-then-good | fail | sleep | orphan | hang.
+// sleep: wait $FAKE_SLEEP_MS (default 3000), then edit. hang: edit, then wait $FAKE_SLEEP_MS (default 20000).
 import fs from 'node:fs';
 
 const args = process.argv.slice(2);
@@ -73,8 +74,12 @@ switch (mode) {
     break;
   }
   case 'sleep':
-    await new Promise((r) => setTimeout(r, 3000));
+    await new Promise((r) => setTimeout(r, Number(process.env.FAKE_SLEEP_MS) || 3000));
     good();
+    break;
+  case 'hang':
+    good();
+    await new Promise((r) => setTimeout(r, Number(process.env.FAKE_SLEEP_MS) || 20000));
     break;
   default:
     process.stderr.write(`fake-claude: unknown FAKE_MODE ${mode}\n`);

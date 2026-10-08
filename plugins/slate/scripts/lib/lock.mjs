@@ -59,6 +59,16 @@ export async function acquire(dir) {
   return null;
 }
 
+// The pid written in the lock file, or null when there is no lock or no readable pid.
+export async function lockHolder(dir) {
+  try {
+    const pid = Number.parseInt((await fs.readFile(lockPath(dir), 'utf8')).trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function waitFree(dir, ms) {
   const file = lockPath(dir);
   const deadline = Date.now() + ms;

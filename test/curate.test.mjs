@@ -4,11 +4,13 @@ import fs from 'node:fs/promises';
 import { realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { runCurator, resolveClaudeBin, CURATOR_ENV_DENY } from '../plugins/slate/scripts/curate.mjs';
-import { initSession, writeMessage, appendAnswer, readMemory, writeMemory } from '../plugins/slate/scripts/lib/session.mjs';
+import { runCurator, drain, resolveClaudeBin, CURATOR_ENV_DENY } from '../plugins/slate/scripts/curate.mjs';
+import {
+  initSession, writeMessage, appendAnswer, appendContinuation, readMemory, writeMemory, readSession, writeSession,
+} from '../plugins/slate/scripts/lib/session.mjs';
 import { acquire } from '../plugins/slate/scripts/lib/lock.mjs';
 import { MEMORY_FILES } from '../plugins/slate/scripts/lib/items.mjs';
 import { checkCuratorEdit } from '../plugins/slate/scripts/lib/check.mjs';
@@ -21,7 +23,7 @@ const RULES = fileURLToPath(new URL('../plugins/slate/curator-rules.md', import.
 delete process.env.SLATE_CLAUDE_BIN;
 delete process.env.CLAUDE_CODE_EXECPATH;
 const ENV_KEYS = [...new Set([
-  'FAKE_MODE', 'FAKE_RECORD', 'SLATE_CLAUDE_BIN', 'SLATE_TEST_INHERITED',
+  'FAKE_MODE', 'FAKE_RECORD', 'FAKE_SLEEP_MS', 'SLATE_CLAUDE_BIN', 'SLATE_TEST_INHERITED',
   'CLAUDECODE', 'CLAUDE_CODE_CHILD_SESSION', 'ANTHROPIC_BASE_URL', ...CURATOR_ENV_DENY,
 ])];
 const SAVED_ENV = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
@@ -400,13 +402,167 @@ test('retiring a plain user bullet by adopting it at t0 passes the safety check'
   assert.deepEqual(checkCuratorEdit(before, afterEdit, 2), []);
 });
 
-test('CLI: node curate.mjs <dir> <turn> [model]', async () => {
+test('CLI: node curate.mjs <dir> <turn> [model] drains the queue', async () => {
   const { dir, record } = await setup('good');
+  await writeSession(dir, { ...(await readSession(dir)), turn: TURN });
   await promisify(execFile)(process.execPath, [CURATE, dir, String(TURN), 'haiku'], {
     env: { ...process.env, SLATE_CLAUDE_BIN: FAKE },
   });
   assert.equal((await readMemory(dir))['instructions.md'], GOOD_INSTRUCTIONS);
-  const [call] = await calls(record);
+  const [call, ...rest] = await calls(record);
+  assert.deepEqual(rest, [], 'turn 1 has no file and is skipped');
   assert.equal(flag(call.args, '--model'), 'haiku');
-  assertLog((await logLines(dir))[0], 'ok');
+  const log = await logLines(dir);
+  assert.equal(log.length, 1);
+  assertLog(log[0], 'ok');
+  assert.equal((await curated(dir)).turn, TURN);
+});
+
+// --- drain ---
+
+const NO_ANSWER = '[no answer: turn was interrupted]';
+
+// A session whose turns 1..n each have a message and (unless `answered(t)` is false) an answer.
+async function queued(mode, n, { answered = () => true } = {}) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'slate-drain-'));
+  temps.push(root);
+  const { dir } = await initSession(root, 'sid', 1);
+  for (let t = 1; t <= n; t++) await addTurn(dir, t, { answered: answered(t) });
+  const record = path.join(root, 'record.jsonl');
+  process.env.FAKE_MODE = mode;
+  process.env.FAKE_RECORD = record;
+  return { root, dir, record, before: await readMemory(dir) };
+}
+async function addTurn(dir, t, { answered = true } = {}) {
+  await writeMessage(dir, t, `message ${t}`);
+  if (answered) await appendAnswer(dir, t, `answer ${t}`);
+  await writeSession(dir, { ...(await readSession(dir)), turn: t });
+}
+async function curated(dir) {
+  try {
+    return JSON.parse(await fs.readFile(path.join(dir, 'curated.json'), 'utf8'));
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+}
+const turnSize = async (dir, t) => (await fs.stat(path.join(dir, 'conversation', `000${t}.md`))).size;
+const promptTurns = async (record) => (await calls(record)).map((c) => Number(/^Current turn: (\d+)$/m.exec(c.prompt)[1]));
+const logTurns = async (dir) => (await logLines(dir)).map((l) => / (t\d+ \w+):/.exec(l)[1]);
+const runTurns = (r) => r.runs.map((x) => [x.turn, x.ok]);
+
+async function until(fn, ms = 10000) {
+  const deadline = Date.now() + ms;
+  while (!(await fn())) {
+    if (Date.now() > deadline) assert.fail('timed out');
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+test('drain: three turns queued while the lock is held are all curated, in order', async () => {
+  const { dir, record } = await queued('good', 3);
+  const release = await acquire(dir);
+  for (let i = 0; i < 3; i++) {
+    assert.deepEqual(await drain({ dir, bin: FAKE }), { runs: [], locked: true, aborted: false });
+  }
+  assert.deepEqual(await calls(record), []);
+  assert.deepEqual(await logLines(dir), []);
+  await release();
+
+  const r = await drain({ dir, bin: FAKE });
+  assert.deepEqual(runTurns(r), [[1, true], [2, true], [3, true]]);
+  assert.equal(r.locked, false);
+  assert.deepEqual(await promptTurns(record), [1, 2, 3]);
+  assert.deepEqual(await logTurns(dir), ['t1 ok', 't2 ok', 't3 ok']);
+  assert.equal((await readMemory(dir))['instructions.md'],
+    '# Instructions\n- [I1 t1] fake item\n- [I2 t2] fake item\n- [I3 t3] fake item\n');
+  assert.deepEqual(await curated(dir), { turn: 3, size: await turnSize(dir, 3) });
+  assert.ok(await lockGone(dir));
+  assert.deepEqual((await drain({ dir, bin: FAKE })).runs, [], 'nothing left');
+});
+
+test('drain: a continuation appended after a turn is done gets that turn re-curated', async () => {
+  const { dir, record } = await queued('good', 1);
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, true]]);
+  await appendContinuation(dir, 1, 'the real answer');
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, true]]);
+  const [first, second] = await calls(record);
+  assert.ok(!first.prompt.includes('the real answer'));
+  assert.ok(second.prompt.includes('answer 1\n\nthe real answer'));
+  assert.deepEqual(await curated(dir), { turn: 1, size: await turnSize(dir, 1) });
+  assert.deepEqual((await drain({ dir, bin: FAKE })).runs, []);
+  assert.equal((await calls(record)).length, 2);
+});
+
+test('drain: an interrupted turn is curated with a placeholder; the newest unanswered turn waits', async () => {
+  const { dir, record } = await queued('good', 2, { answered: (t) => t !== 1 });
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, true], [2, true]]);
+  const [first, second] = await calls(record);
+  assert.ok(first.prompt.includes(`<answer>\n${NO_ANSWER}\n</answer>`));
+  assert.ok(!second.prompt.includes(NO_ANSWER));
+
+  await addTurn(dir, 3, { answered: false }); // still being answered
+  assert.deepEqual((await drain({ dir, bin: FAKE })).runs, []);
+  assert.equal((await curated(dir)).turn, 2);
+  await appendAnswer(dir, 3, 'answer 3');
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[3, true]]);
+  assert.ok(!(await calls(record))[2].prompt.includes(NO_ANSWER));
+});
+
+test('drain: failed turns are logged and marked done, so the queue moves on', async () => {
+  const { dir, record, before } = await queued('fail', 2);
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, false], [2, false]]);
+  assert.deepEqual(await logTurns(dir), ['t1 error', 't2 error']);
+  assert.deepEqual(await readMemory(dir), before);
+  assert.equal((await curated(dir)).turn, 2);
+
+  process.env.FAKE_MODE = 'good';
+  await addTurn(dir, 3);
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[3, true]]);
+  assert.deepEqual(await promptTurns(record), [1, 2, 3]);
+});
+
+test('drain: work added just before the release is picked up by the recheck', async () => {
+  const { dir, record } = await queued('good', 1);
+  let concurrent;
+  const r = await drain({
+    dir,
+    bin: FAKE,
+    beforeRelease: async () => {
+      if (concurrent) return;
+      await addTurn(dir, 2);
+      concurrent = await drain({ dir, bin: FAKE }); // the curator Stop spawned for turn 2
+    },
+  });
+  assert.deepEqual(concurrent, { runs: [], locked: true, aborted: false });
+  assert.deepEqual(runTurns(r), [[1, true], [2, true]]);
+  assert.deepEqual(await promptTurns(record), [1, 2]);
+  assert.equal((await curated(dir)).turn, 2);
+  assert.ok(await lockGone(dir));
+});
+
+test('CLI: SIGTERM aborts mid-edit: kills claude, restores, logs aborted, releases, turn stays queued', async () => {
+  const { dir, record, before } = await queued('hang', 1);
+  const child = spawn(process.execPath, [CURATE, dir, '1', 'sonnet'], {
+    env: { ...process.env, SLATE_CLAUDE_BIN: FAKE }, stdio: 'ignore',
+  });
+  const exited = new Promise((r) => child.on('exit', (code, signal) => r({ code, signal })));
+  await until(async () => (await readMemory(dir))['instructions.md'].includes('fake item'));
+  const t0 = Date.now();
+  child.kill('SIGTERM');
+  const { code, signal } = await exited;
+  assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0}ms`);
+  assert.equal(signal, null, 'trapped, not killed by the signal');
+  assert.equal(code, 1);
+  assert.deepEqual(await readMemory(dir), before);
+  const log = await logLines(dir);
+  assert.equal(log.length, 1);
+  assert.match(log[0], / t1 error: aborted$/);
+  assert.ok(await lockGone(dir));
+  assert.equal(await curated(dir), null, 'the aborted turn is not marked done');
+  const [{ pid }] = await calls(record);
+  assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+
+  process.env.FAKE_MODE = 'good';
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, true]]);
 });

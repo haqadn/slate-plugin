@@ -6,7 +6,7 @@ import path from 'node:path';
 import {
   projectDir, sessionDir, initSession, readSession, writeSession, findByPid, moveSession,
   copySession, claudePid, setPid, nextTurn, writeMessage, appendAnswer, appendContinuation,
-  readTurn, readMemory, writeMemory,
+  readTurn, readMemory, writeMemory, turnState,
 } from '../plugins/slate/scripts/lib/session.mjs';
 import { MEMORY_FILES } from '../plugins/slate/scripts/lib/items.mjs';
 
@@ -113,6 +113,30 @@ test('nextTurn increments', async () => {
   assert.equal(await nextTurn(dir), 1);
   assert.equal(await nextTurn(dir), 2);
   assert.equal((await readSession(dir)).turn, 2);
+});
+
+test('nextTurn sets extra fields in the same write; they cannot override the turn', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  assert.equal(await nextTurn(dir, { lastKind: 'user' }), 1);
+  let s = await readSession(dir);
+  assert.equal(s.turn, 1);
+  assert.equal(s.lastKind, 'user');
+  assert.equal(await nextTurn(dir, { turn: 99, lastKind: 'x' }), 2);
+  s = await readSession(dir);
+  assert.equal(s.turn, 2);
+  assert.equal(s.lastKind, 'x');
+});
+
+test('turnState: null when missing, byte size, answered only by a real answer marker', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  assert.equal(await turnState(dir, 1), null);
+  await writeMessage(dir, 1, 'café\n<!-- slate:answer -->\nnot an answer', 'T');
+  const file = path.join(dir, 'conversation', '0001.md');
+  assert.deepEqual(await turnState(dir, 1), { size: (await fs.stat(file)).size, answered: false });
+  await appendAnswer(dir, 1, '');
+  assert.deepEqual(await turnState(dir, 1), { size: (await fs.stat(file)).size, answered: true });
 });
 
 test('writeSession is atomic: leaves no temp files', async () => {
