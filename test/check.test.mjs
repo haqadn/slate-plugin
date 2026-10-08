@@ -370,3 +370,25 @@ test('FR-3: item text still compares exactly, trailing whitespace included', () 
   assert.deepEqual(checkCuratorEdit(b, b, 5), []);
   has(checkCuratorEdit(b, BASE, 5), 'I1 reworded');
 });
+
+test('M1: a new free-form retired note in an item file is a malformed item line', () => {
+  for (const f of ['instructions.md', 'assumptions.md', 'facts.md']) {
+    const a = withFile(BASE, f, BASE[f] + '- ~~use npm~~ (retired I1)\n');
+    has(checkCuratorEdit(BASE, a, 5), 'malformed item line: "- ~~use npm~~ (retired I1)"');
+  }
+  const loose = withFile(BASE, 'facts.md', BASE['facts.md'] + 'old host, Retired F2 at t4\n');
+  has(checkCuratorEdit(BASE, loose, 5), 'malformed item line: "old host, Retired F2 at t4"');
+  const item = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- [I7 t5] use pnpm (retired I1)\n');
+  has(checkCuratorEdit(BASE, item, 5), 'malformed item line: "- [I7 t5] use pnpm (retired I1)"');
+});
+
+test('M1: an old free-form retired note is left alone; now.md and plain "retired" are fine', () => {
+  const b = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- ~~use yarn~~ (retired I6)\n');
+  assert.deepEqual(checkCuratorEdit(b, b, 5), []);
+  const moved = mem({ ...BASE, 'facts.md': BASE['facts.md'] + '- ~~use yarn~~ (retired I6)\n' });
+  assert.deepEqual(checkCuratorEdit(b, moved, 5), []);
+  const now = withFile(BASE, 'now.md', '# Now\nFocus: retired I1, using pnpm\n');
+  assert.deepEqual(checkCuratorEdit(BASE, now, 5), []);
+  const plain = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- [I7 t5] keep the retired server off\n');
+  assert.deepEqual(checkCuratorEdit(BASE, plain, 5), []);
+});

@@ -2,6 +2,9 @@ export const ITEM_FILES = { I: 'instructions.md', A: 'assumptions.md', F: 'facts
 export const MEMORY_FILES = ['instructions.md', 'assumptions.md', 'facts.md', 'now.md', 'superseded.md'];
 
 const HEADING = /^#{1,6}(\s|$)/;
+// A line that carries retired text: a retired-style tag, however mangled, or a free-form note
+// naming a retired ID ("~~use npm~~ (retired I1)"). Never injected; new ones fail the check.
+export const RETIRED_LIKE = /\[[IAF]\d+\b[^\]]*\bretired\b|\bretired\s+[IAF]\d+\b/i;
 const ITEM = /^- \[([IAF])(\d+) t(\d+)\] (.*)$/;
 const RETIRED = /^- \[([IAF])(\d+) t(\d+) retired t(\d+)\] (.*) \(reason: (.*)\)$/;
 

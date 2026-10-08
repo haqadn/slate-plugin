@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { ITEM_FILES, MEMORY_FILES, parseMemoryFile, formatItem } from './items.mjs';
+import { ITEM_FILES, MEMORY_FILES, RETIRED_LIKE, parseMemoryFile, formatItem } from './items.mjs';
 import { readSession, writeSession, readMemory } from './session.mjs';
 
 // Nothing here ever puts superseded.md text into output. Retired texts are read only to filter lines out.
@@ -14,8 +14,6 @@ const MAX_WARNINGS = 5;
 const WARNING_CHARS = 200; // before the "(see …curator.log)" tail
 // Change-line order: as in the memory block (instructions, facts, assumptions).
 const TYPE_ORDER = ['I', 'F', 'A'];
-// Any line with a retired-style tag, however mangled, carries retired text; keep it out.
-const RETIRED_LIKE = /\[[IAF]\d+\b[^\]]*\bretired\b/i;
 const LOG_LINE = /^\S+ (t\d+) (restored|error)(?::(.*))?$/;
 // Violation kinds from check.mjs messages. A warning echoes only these fixed labels, plus the ID
 // of an `${id} <kind>` message, and only from text outside quotes.

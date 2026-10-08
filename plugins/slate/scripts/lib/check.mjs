@@ -1,4 +1,4 @@
-import { ITEM_FILES, MEMORY_FILES, isHeading, parseMemoryFile, formatItem, formatRetired } from './items.mjs';
+import { ITEM_FILES, MEMORY_FILES, RETIRED_LIKE, isHeading, parseMemoryFile, formatItem, formatRetired } from './items.mjs';
 
 const NOW_MAX_LINES = 10;
 const ITEM_FILE_NAMES = Object.values(ITEM_FILES);
@@ -144,11 +144,20 @@ export function checkCuratorEdit(before, after, turn) {
   }
 
   // New item-looking lines that do not parse would otherwise become protected plain text.
+  // New lines in item files that carry retired text would be hidden from the main thread.
   const beforeLines = new Set(HEADING_FILES.flatMap(f => rawLines(before[f])));
   for (const f of HEADING_FILES) {
+    const itemFile = ITEM_FILE_NAMES.includes(f);
     for (const l of a[f].plain) {
-      if (/^- \[[IAF]/.test(l) && !beforeLines.has(l)) v.push(`malformed item line: "${l}"`);
+      if ((/^- \[[IAF]/.test(l) || (itemFile && RETIRED_LIKE.test(l))) && !beforeLines.has(l)) {
+        v.push(`malformed item line: "${l}"`);
+      }
     }
+  }
+  const beforeItems = new Set(bLive.map(i => i.id + "\0" + i.text));
+  for (const i of aLive) {
+    const l = formatItem(i);
+    if (RETIRED_LIKE.test(l) && !beforeItems.has(i.id + "\0" + i.text)) v.push(`malformed item line: "${l}"`);
   }
 
   // 5. now.md is free text, at most 10 non-blank lines.

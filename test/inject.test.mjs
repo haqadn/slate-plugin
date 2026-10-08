@@ -106,6 +106,10 @@ const RETIRED_SHAPES = [
   '+ `zz-retired-zz use npm`',
   '_ZZ-Retired-ZZ use npm_',
   '2) [x] *ZZ-RETIRED-ZZ use npm*',
+  // free-form retired notes that name an ID
+  '- ~~ZZ-RETIRED-ZZ use yarn~~ (retired I1)',
+  'ZZ-RETIRED-ZZ old deploy rule, RETIRED F12 at t4',
+  '- ZZ-RETIRED-ZZ tabs (retired  a3)',
 ];
 
 test('core: retired-looking lines and copies of retired text stay out of the block', async () => {
@@ -132,12 +136,22 @@ test('live lines that merely mention a retired text stay in the block', async ()
   assert.ok(!b.split('\n').includes('- a'), 'exact copy of a one-letter retired item dropped');
 });
 
+test('lines that say "retired" without naming an ID stay in the block', async () => {
+  const dir = await session();
+  const keep = ['- the retired server stays off', '- retired I2C bus driver', '- retire I3 next week'];
+  await write(dir, 'instructions.md', `# Instructions\n${keep.join('\n')}\n`);
+  await write(dir, 'now.md', 'Focus: retired hosts list\n');
+  const b = await memoryBlock(dir, { afterCompact: false });
+  for (const s of [...keep, 'Focus: retired hosts list']) assert.ok(b.includes(s), s);
+});
+
 test('core: an item whose text carries a retired tag is shown by ID only', async () => {
   const dir = await session();
-  await write(dir, 'instructions.md', '# Instructions\n- [I1 t1] fine\n- [I5 t2] [I3 t1 retired t2] ZZ-RETIRED-ZZ x\n');
+  await write(dir, 'instructions.md',
+    '# Instructions\n- [I1 t1] fine\n- [I5 t2] [I3 t1 retired t2] ZZ-RETIRED-ZZ x\n- [I6 t2] ZZ-RETIRED-ZZ yarn (retired I2)\n');
   const line = await changeLine(dir, { waiting: false });
   assert.ok(!line.includes('ZZ-RETIRED-ZZ'), line);
-  assert.ok(line.includes('+I1 fine') && line.includes(`+1 more (see ${path.join(dir, 'instructions.md')})`), line);
+  assert.ok(line.includes('+I1 fine') && line.includes(`+2 more (see ${path.join(dir, 'instructions.md')})`), line);
   assert.ok(!(await memoryBlock(dir, { afterCompact: false })).includes('ZZ-RETIRED-ZZ'));
 });
 
