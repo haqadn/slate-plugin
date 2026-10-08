@@ -52,7 +52,9 @@ export async function initSession(root, sessionId, pid) {
 
 export async function readSession(dir) {
   const s = JSON.parse(await fs.readFile(path.join(dir, 'session.json'), 'utf8'));
+  // Unknown fields (e.g. inject's logSeen) pass through, so read-modify-write callers keep them.
   return {
+    ...s,
     pid: s.pid ?? null,
     created: s.created ?? null,
     from: s.from ?? null,

@@ -212,3 +212,11 @@ test('claudePid uses CLAUDE_PID when valid, otherwise falls back', () => {
     else process.env.CLAUDE_PID = saved;
   }
 });
+
+test('readSession passes unknown fields through, so nextTurn keeps them', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await writeSession(dir, { ...(await readSession(dir)), logSeen: 42 });
+  await nextTurn(dir);
+  assert.equal((await readSession(dir)).logSeen, 42);
+});
