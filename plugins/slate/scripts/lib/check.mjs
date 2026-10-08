@@ -154,10 +154,13 @@ export function checkCuratorEdit(before, after, turn) {
       }
     }
   }
+  // The same for new items; adopting a user's own bullet as it stands is always allowed.
   const beforeItems = new Set(bLive.map(i => i.id + "\0" + i.text));
   for (const i of aLive) {
     const l = formatItem(i);
-    if (RETIRED_LIKE.test(l) && !beforeItems.has(i.id + "\0" + i.text)) v.push(`malformed item line: "${l}"`);
+    if (!RETIRED_LIKE.test(l) || beforeItems.has(i.id + "\0" + i.text)) continue;
+    if (i.turn === 0 && beforePlain.has(i.text.trimEnd())) continue;
+    v.push(`malformed item line: "${l}"`);
   }
 
   // 5. now.md is free text, at most 10 non-blank lines.

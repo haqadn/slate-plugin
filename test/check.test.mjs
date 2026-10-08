@@ -392,3 +392,9 @@ test('M1: an old free-form retired note is left alone; now.md and plain "retired
   const plain = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- [I7 t5] keep the retired server off\n');
   assert.deepEqual(checkCuratorEdit(BASE, plain, 5), []);
 });
+
+test('M1: a hand-written retired note can still be adopted, so it never freezes memory', () => {
+  const b = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- ~~use yarn~~ (retired I6)\n');
+  const a = withFile(BASE, 'instructions.md', BASE['instructions.md'] + '- [I7 t0] ~~use yarn~~ (retired I6)\n');
+  assert.deepEqual(checkCuratorEdit(b, a, 5), []);
+});
