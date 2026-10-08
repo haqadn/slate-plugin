@@ -250,6 +250,42 @@ The value was set with `--settings '{"pluginConfigs":{"slate@inline":{"options":
 
 **Chosen mechanism.** Use `hooks/hooks.json` as planned. Name the agent `slate:offload` in rules and briefs.
 
+## 9. How a subagent's return reaches the hooks (SubagentStop, hand-back)
+
+**Probe.** Claude Code 2.1.293 ran one `-p` offload under the user's real settings, with `--plugin-dir plugins/slate` and a recorder plugin added through a second `--plugin-dir`. The recorder had PreToolUse with no matcher, and SubagentStop. It saved each input's field names, `tool_name`, the `tool_input` keys, `agent_type`, `agent_id` and the message length. It printed nothing, so it couldn't affect any decision. The isolated runs of `test/live/acceptance.mjs` used the same recorder.
+
+**Observed: SubagentStop, when the agent ends with a text answer (isolated runs)**
+- Input keys:
+
+  ```
+  agent_id, agent_transcript_path, agent_type, background_tasks, cwd, effort, hook_event_name,
+  last_assistant_message, permission_mode, prompt_id, session_crons, session_id, stop_hook_active, transcript_path
+  ```
+
+- `session_id` is the main session's ID. `agent_type` is `slate:offload`.
+- The binary matches a SubagentStop matcher against `agent_type`.
+- A `{"decision":"block","reason":…}` output makes the agent continue.
+  - The reason is saved in the agent's transcript as a `Stop hook feedback:` message and one `hook_blocking_error` attachment.
+  - The next stop has `stop_hook_active: true`.
+
+**Observed: the hand-back tool (real settings)**
+- Inside the subagent, PreToolUse fired for `tool_name: "SubagentHandback"`, with these keys:
+
+  ```
+  agent_id, agent_type, cwd, effort, hook_event_name, permission_mode, prompt_id, session_id,
+  tool_input, tool_name, tool_use_id, transcript_path
+  ```
+
+  `agent_type` was `"slate:offload"`. `tool_input` has one key, `message`, which in that run was 507 chars.
+- The SubagentStop that followed had **no `last_assistant_message`**. The agent's return was the hand-back message.
+- In the main thread, that message arrives as a user message starting `<agent-message from="<agent_id>">`. The hook prompt and `conversation/` see it starting `<agent-message`. The transcript adds the intro line `Another Claude session sent a message:`.
+- Under `--setting-sources project,local`, agents never used the hand-back. They ended with a text answer, which arrived as a `<task-notification>`.
+
+**Chosen mechanism.** The return cap is best-effort, on two channels:
+- **SubagentStop** with matcher `slate:offload` checks the final text.
+- **PreToolUse** with matcher `SubagentHandback` checks `tool_input.message`. It denies the first message over the limit and lets the second through. A marker file `<dir>/handbacks/<agent_id>` records that the agent was already denied once.
+- Any other return channel relies on the instruction in `offload.md`.
+
 ## Other findings for later tasks
 
 - **Background subagents.** In `-p` mode the Agent tool ran `slate:offload` in the background. Three hooks fired in sequence:

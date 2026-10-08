@@ -320,25 +320,35 @@ export function subagentTools(transcriptFile, sessionId) {
 
 // --- SubagentStop probe ---------------------------------------------------------------------
 
-// A throwaway second plugin (loaded with its own --plugin-dir) that records what every SubagentStop
-// hook receives: the field names, agent type, stop_hook_active, session_id and the return's length.
+// A throwaway second plugin (loaded with its own --plugin-dir) that records what hooks receive:
+// every SubagentStop (field names, agent type, stop_hook_active, session_id, the return's length)
+// and every PreToolUse, unmatched (tool name, tool_input keys, agent type and id, message length).
+// It never prints anything, so it never affects a decision.
 export function buildProbe(root) {
   fs.mkdirSync(path.join(root, '.claude-plugin'), { recursive: true });
   fs.mkdirSync(path.join(root, 'hooks'), { recursive: true });
   fs.writeFileSync(path.join(root, '.claude-plugin', 'plugin.json'), `${JSON.stringify({ name: 'slate-probe', version: '0.0.0', description: 'live-test probe' })}\n`);
-  fs.writeFileSync(path.join(root, 'hooks', 'hooks.json'), `${JSON.stringify({ hooks: { SubagentStop: [{ hooks: [{ type: 'command', command: 'node "${CLAUDE_PLUGIN_ROOT}/record.mjs"', timeout: 10 }] }] } })}\n`);
+  const hook = [{ hooks: [{ type: 'command', command: 'node "${CLAUDE_PLUGIN_ROOT}/record.mjs"', timeout: 10 }] }];
+  fs.writeFileSync(path.join(root, 'hooks', 'hooks.json'), `${JSON.stringify({ hooks: { SubagentStop: hook, PreToolUse: hook } })}\n`);
   fs.writeFileSync(path.join(root, 'record.mjs'), `import fs from 'node:fs';
 let t = '';
 process.stdin.setEncoding('utf8');
 for await (const c of process.stdin) t += c;
 const i = JSON.parse(t);
-const m = i.last_assistant_message;
-fs.appendFileSync(new URL('./subagent-stop.jsonl', import.meta.url), JSON.stringify({
-  at: new Date().toISOString(), keys: Object.keys(i).sort(), agent_type: i.agent_type, agent_id: i.agent_id,
-  stop_hook_active: i.stop_hook_active, session_id: i.session_id, chars: typeof m === 'string' ? [...m].length : null,
-}) + '\\n');
+const len = (m) => (typeof m === 'string' ? [...m].length : null);
+const base = { at: new Date().toISOString(), keys: Object.keys(i).sort(), agent_type: i.agent_type, agent_id: i.agent_id, session_id: i.session_id };
+if (i.hook_event_name === 'PreToolUse') {
+  const ti = i.tool_input && typeof i.tool_input === 'object' ? i.tool_input : {};
+  fs.appendFileSync(new URL('./pre-tool-use.jsonl', import.meta.url), JSON.stringify({
+    ...base, tool_name: i.tool_name, input_keys: Object.keys(ti).sort(), chars: len(ti.message),
+  }) + '\\n');
+} else {
+  fs.appendFileSync(new URL('./subagent-stop.jsonl', import.meta.url), JSON.stringify({
+    ...base, stop_hook_active: i.stop_hook_active, chars: len(i.last_assistant_message),
+  }) + '\\n');
+}
 `);
-  return path.join(root, 'subagent-stop.jsonl');
+  return { stops: path.join(root, 'subagent-stop.jsonl'), preToolUse: path.join(root, 'pre-tool-use.jsonl') };
 }
 
 // Each slate:offload stop the probe saw, whether it was over the limit and whether it was sent back,
@@ -378,7 +388,7 @@ async function main() {
   const transcript = () => transcriptPath(project, sessionId);
   const out = outArg >= 0 ? path.resolve(argv[outArg + 1]) : path.join(os.tmpdir(), `slate-acc-results-${sessionId}.json`);
   const probeDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'slate-probe-')));
-  const probeLog = buildProbe(probeDir);
+  const probeLogs = buildProbe(probeDir);
   console.log(`project ${project} (${fileCount} files)\nsession ${sessionId}\nclaude ${bin} (${version}), main model ${MODEL}, ${REAL ? 'real settings' : 'isolated settings'}`);
 
   const sampler = curatorSampler(sessionId);
@@ -461,7 +471,8 @@ async function main() {
   const npmAgents = lateAgents.filter((c) => NPM_CMD.test(JSON.stringify(c.input)));
   const npmRules = ['instructions.md', 'assumptions.md', 'now.md'].filter((f) => NPM.test(mem[f] ?? ''));
   const contributing = readText(path.join(project, 'CONTRIBUTING.md'));
-  const probes = (readText(probeLog) ?? '').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const probes = (readText(probeLogs.stops) ?? '').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const preToolUses = (readText(probeLogs.preToolUse) ?? '').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   const offloadStops = probes.filter((p) => p.agent_type === 'slate:offload');
   const SHAPE = ['agent_type', 'last_assistant_message', 'stop_hook_active', 'session_id', 'agent_id'];
   const { blocks, blockCounts } = offloadBlocks(offloadStops, path.join(path.dirname(tp), sessionId, 'subagents'));
