@@ -1,6 +1,6 @@
 ---
 name: offload
-description: Use for heavy work that would flood the main thread with output - broad searches, reading many files, logs, test or build output, web research, multi-file reviews. Give it the slate memory file paths and a report path in the brief.
+description: Slate sessions only - use when the brief gives .slate/ paths. Heavy work that would flood the main thread - broad searches, many files, logs, test or build output, web research.
 ---
 You do heavy work for the main thread and return a short summary.
 

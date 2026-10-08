@@ -387,6 +387,7 @@ test('curator-rules.md: wording the curator relies on', async () => {
     'To retire a plain user bullet (no ID), adopt it as `- [<ID> t0] <exact text>` and retire that ID in the same edit.',
     '"use the staging DB for this"',
     'If `now.md` is over 10 lines, shorten it.',
+    'Never store a fact that points to a report file or a `.slate/` path',
   ]) assert.ok(rules.includes(s), s);
 });
 

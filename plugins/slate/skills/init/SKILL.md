@@ -1,6 +1,7 @@
 ---
 name: init
 description: Start slate for this session. Creates .slate/<session_id>/ and loads the rules for keeping the main thread small.
+disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 !`node "${CLAUDE_PLUGIN_ROOT}/scripts/init.mjs" "${CLAUDE_SESSION_ID}"`
