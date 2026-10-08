@@ -13,7 +13,7 @@ claude plugin install slate@slate-plugin
 
 - Run `/slate:init` in a session to turn slate on for that session only.
 - Run `/autocompact 100000` so compaction becomes the automatic reset. Memory reloads after it.
-- Set the curator model with `/plugin configure slate` (`curatorModel`, default `sonnet`).
+- Set the curator model with `/plugin configure slate` (`curatorModel`, default `sonnet`), or in user settings: `"pluginConfigs": {"slate@slate-plugin": {"options": {"curatorModel": "haiku"}}}`.
 
 ## Layout
 
@@ -28,13 +28,15 @@ claude plugin install slate@slate-plugin
 | `superseded.md` | retired items, append-only; never injected |
 | `conversation/` | `NNNN.md` per turn: your message and the answer |
 | `reports/` | details written by offload agents |
+| `handbacks/` | one marker per offload agent whose hand-back was sent back for a rewrite |
 | `session.json` | process ID, turn counter, IDs last shown |
-| `curated.json` | last curated turn and its file size (curator queue mark) |
-| `curator.log` | `restored`, `error` and `aborted` lines |
+| `curated.json` | last curated turn and its file size, plus a turn to retry after an error (curator queue mark) |
+| `curator.log` | curator results: `ok`, `retry` (edit rejected, trying again), `restored`, `error`, `aborted`; `restored` and `error` also show as a warning |
 
 ## Notes
 
-- Hand edits to the memory files are safe once the change line has shown. A plain bullet without an ID is adopted with the next ID, text unchanged.
+- Edit memory files when no `curator.lock` exists — an edit during a curator run can be undone. A plain bullet without an ID is adopted with the next ID, text unchanged.
 - Turn files escape exact marker lines with a leading backslash.
 - The curator finds `claude` through `CLAUDE_CODE_EXECPATH`.
+- The curator runs with `--setting-sources ""`, so it skips your settings files. OAuth login works; `apiKeyHelper`-based auth can't reach it.
 - To turn slate off, delete the session folder.
