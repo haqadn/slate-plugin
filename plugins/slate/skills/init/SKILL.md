@@ -5,4 +5,4 @@ allowed-tools: Bash(node:*)
 ---
 !`node "${CLAUDE_PLUGIN_ROOT}/scripts/init.mjs" "${CLAUDE_SESSION_ID}"`
 
-Follow the slate rules printed above for the rest of this session.
+Reply with one line confirming slate is on (or already active) for this session. Follow the slate rules printed above for the rest of this session.
