@@ -37,7 +37,8 @@ Long brainstorming and coding sessions without context rot:
     superseded.md     retired items, append-only
     conversation/     NNNN.md per turn: message (written on send) + answer (written on stop)
     reports/          <slug>.md written by offload agents
-    curator.log       warnings and rejected curator edits
+    curated.json      last curated turn and its file size (curator queue mark)
+    curator.log       warnings and rejected curator edits: restored, error, aborted (aborted = requeued, not shown)
     curator.lock      present while a curator runs (holds its pid)
 ```
 

@@ -240,8 +240,8 @@ async function curateTurn({ dir, turn, model, bin, timeoutMs, signal }) {
   let attempts = 0;
   const aborted = async () => {
     await restore(dir, before);
-    await log(dir, turn, 'error', ABORTED);
-    return { ok: false, attempts, violations: [`error: ${ABORTED}`], aborted: true };
+    await log(dir, turn, 'aborted', 'requeued');
+    return { ok: false, attempts, violations: ['aborted: requeued'], aborted: true };
   };
   try {
     before = await snapshot(dir);

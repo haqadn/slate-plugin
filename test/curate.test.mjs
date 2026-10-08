@@ -557,7 +557,7 @@ test('CLI: SIGTERM aborts mid-edit: kills claude, restores, logs aborted, releas
   assert.deepEqual(await readMemory(dir), before);
   const log = await logLines(dir);
   assert.equal(log.length, 1);
-  assert.match(log[0], / t1 error: aborted$/);
+  assert.match(log[0], / t1 aborted: requeued$/);
   assert.ok(await lockGone(dir));
   assert.equal(await curated(dir), null, 'the aborted turn is not marked done');
   const [{ pid }] = await calls(record);

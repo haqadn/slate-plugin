@@ -33,7 +33,7 @@ export function curatorWaitMs(env, fallback) {
 
 function isCurator(pid) {
   try {
-    return execFileSync('ps', ['-o', 'command=', '-p', String(pid)], {
+    return execFileSync('ps', ['-ww', '-o', 'command=', '-p', String(pid)], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     }).includes('curate.mjs');
   } catch {

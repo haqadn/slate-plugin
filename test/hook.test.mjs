@@ -372,8 +372,8 @@ async function curatorMidEdit(id) {
 
 async function assertAborted(dir, before, record) {
   assert.deepEqual(await readMemory(dir), before, 'no unchecked edit');
-  assert.deepEqual(await logTurns(dir), ['t1 error']);
-  assert.match((await logLines(dir))[0], / t1 error: aborted$/);
+  assert.deepEqual(await logTurns(dir), ['t1 aborted']);
+  assert.match((await logLines(dir))[0], / t1 aborted: requeued$/);
   assert.equal(await exists(lockOf(dir)), false);
   assert.equal(await exists(path.join(dir, 'curated.json')), false, 'the aborted turn stays queued');
   const [{ pid }] = await fakeCalls(record);
@@ -395,7 +395,7 @@ test('SessionStart clear with a curator mid-edit: aborts it, then moves; the tur
   await handle('UserPromptSubmit', prompt('new', root, 'next'), env);
   await handle('Stop', stop('new', root, 'done'), env);
   await waitLog(dir, 3);
-  assert.deepEqual(await logTurns(dir), ['t1 error', 't1 ok', 't2 ok']);
+  assert.deepEqual(await logTurns(dir), ['t1 aborted', 't1 ok', 't2 ok']);
   assert.equal(await exists(old), false, 'nothing recreated the old folder');
 });
 
