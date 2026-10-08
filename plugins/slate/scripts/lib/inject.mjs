@@ -17,25 +17,29 @@ const TYPE_ORDER = ['I', 'F', 'A'];
 // Any line with a retired-style tag, however mangled, carries retired text; keep it out.
 const RETIRED_LIKE = /\[[IAF]\d+\b[^\]]*\bretired\b/i;
 const LOG_LINE = /^\S+ (t\d+) (restored|error)(?::(.*))?$/;
-const ID_TOKEN = /\b[IAF]\d+\b/g;
-// Violation kinds (from check.mjs messages) a warning may name. Only these labels are echoed.
-const KINDS = [
-  [/retired line outside superseded\.md/, 'retired line misplaced'],
-  [/live item in superseded\.md/, 'live item in superseded.md'],
-  [/superseded\.md lost line/, 'superseded line lost'],
-  [/plain line lost/, 'plain line lost'],
-  [/heading lost/, 'heading lost'],
-  [/\breworded\b/, 'reworded'],
-  [/\bdeleted\b/, 'deleted'],
-  [/\bretired at t\d+/, 'wrong retire turn'],
-  [/retired without reason/, 'no retire reason'],
-  [/\bduplicated\b/, 'duplicated'],
-  [/not above previous max/, 'ID not above max'],
-  [/\btagged t\d+/, 'wrong turn tag'],
-  [/malformed item line/, 'malformed line'],
-  [/\.md missing\b/, 'file missing'],
-  [/now\.md has \d+ lines/, 'now.md too long'],
+// Violation kinds from check.mjs messages. A warning echoes only these fixed labels, plus the ID
+// of an `${id} <kind>` message, and only from text outside quotes.
+const ID_KINDS = [
+  ['reworded', 'reworded'],
+  ['deleted', 'deleted'],
+  ['retired at t\\d+', 'wrong retire turn'],
+  ['retired without reason', 'no retire reason'],
+  ['retired line outside superseded\\.md', 'retired line misplaced'],
+  ['live item in superseded\\.md', 'live item in superseded.md'],
+  ['duplicated', 'duplicated'],
+  ['not above previous max', 'ID not above max'],
+  ['tagged t\\d+', 'wrong turn tag'],
+].map(([p, label]) => [new RegExp(`(?<![\\w-])([IAF]\\d+) ${p}(?!\\w)`, 'g'), (m) => `${m[1]} ${label}`]);
+const FIXED_KINDS = [
+  [/superseded\.md lost line/g, () => 'superseded line lost'],
+  [/plain line lost/g, () => 'plain line lost'],
+  [/heading lost/g, () => 'heading lost'],
+  [/malformed item line/g, () => 'malformed line'],
+  [/\b(instructions|assumptions|facts|now|superseded)\.md missing\b/g, (m) => `${m[1]}.md missing`],
+  [/\bnow\.md has \d+ lines/g, () => 'now.md too long'],
 ];
+const QUOTES = new Map([['"', '"'], ["'", "'"], ['`', '`'], ['\u201c', '\u201d'], ['\u201d', '\u201d'],
+  ['\u2018', '\u2019'], ['\u2019', '\u2019']]);
 
 const clip = (s, n) => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
 
@@ -56,17 +60,36 @@ function seenOf(items) {
   return seen;
 }
 
-// Full texts of every retired item, wherever its line sits.
+// Comparable form of a free line: no quote marker, bullet, checkbox, trailing reason or wrapping
+// emphasis/code; whitespace collapsed; lowercase.
+function norm(line) {
+  let t = String(line).trim()
+    .replace(/^(>\s*)+/, '')
+    .replace(/^([-*+]|\d+[.)])\s+/, '')
+    .replace(/^\[[ xX]?\]\s*/, '');
+  for (let prev; prev !== t;) {
+    prev = t;
+    t = t.replace(/\s*\(reason:.*\)$/, '').trim();
+    const m = /^(~~|\*\*|\*|_|`+)([\s\S]*)\1$/.exec(t);
+    if (m && m[2].trim()) t = m[2].trim();
+  }
+  return t.replace(/\s+/g, ' ').toLowerCase();
+}
+
+// Normalised texts of every retired item, wherever its line sits.
 function retiredTexts(memory) {
   const out = new Set();
   for (const f of MEMORY_FILES) {
-    for (const r of parseMemoryFile(memory[f]).retired) if (r.text.trim()) out.add(r.text.trim());
+    for (const r of parseMemoryFile(memory[f]).retired) {
+      const t = norm(r.text);
+      if (t) out.add(t);
+    }
   }
-  return [...out];
+  return out;
 }
 
-// A non-item line is safe if it has no retired-style tag and holds no retired item's text.
-const safeText = (retired) => (l) => !RETIRED_LIKE.test(l) && !retired.some((t) => l.includes(t));
+// A non-item line is safe unless it has a retired-style tag or is a copy of a retired item.
+const safeText = (retired) => (l) => !RETIRED_LIKE.test(l) && !retired.has(norm(l));
 
 // Live lines of an item file: items with their IDs, then plain (hand-written) lines.
 function liveLines(text, retired) {
@@ -127,15 +150,32 @@ export async function memoryBlock(dir, { afterCompact = false } = {}) {
   return out;
 }
 
-// One warning line from known-safe tokens only: turn, status, ID tokens, violation kinds.
+// Text with every quoted span blanked; an unclosed quote blanks the rest.
+function outsideQuotes(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const close = QUOTES.get(s[i]);
+    if (close === undefined) {
+      out += s[i];
+      continue;
+    }
+    const j = s.indexOf(close, i + 1);
+    out += ' ';
+    if (j < 0) break;
+    i = j;
+  }
+  return out;
+}
+
+// One warning line from known-safe tokens only: turn, status, violation kinds (with their IDs).
 // Free text from the log is never echoed; it can quote superseded.md in any form.
 function warningLine(turn, status, detail, log) {
-  const ids = [...new Set(detail.match(ID_TOKEN) ?? [])].slice(0, 10);
-  const kinds = KINDS.map(([re, label]) => [detail.search(re), label])
-    .filter(([at]) => at >= 0)
-    .sort((a, b) => a[0] - b[0])
-    .map(([, label]) => label);
-  const what = [ids.join(' '), [...new Set(kinds)].join(', ')].filter(Boolean).join('; ');
+  const text = outsideQuotes(detail);
+  const found = [];
+  for (const [re, label] of [...ID_KINDS, ...FIXED_KINDS]) {
+    for (const m of text.matchAll(re)) found.push([m.index, label(m)]);
+  }
+  const what = [...new Set(found.sort((a, b) => a[0] - b[0]).map(([, l]) => l))].join(', ');
   return `slate warning: ${clip(`${turn} ${status}${what ? `: ${what}` : ''}`, WARNING_CHARS)} (see ${log})`;
 }
 

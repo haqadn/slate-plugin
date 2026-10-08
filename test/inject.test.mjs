@@ -78,7 +78,7 @@ test('core: no superseded text reaches either builder', async () => {
   const line = await changeLine(dir, { waiting: false });
   assert.ok(!line.includes('ZZ-RETIRED-ZZ'), line);
   assert.ok(line.includes('retired I3'), line);
-  assert.ok(line.includes(`slate warning: t2 restored: I3 I9; superseded line lost, deleted (see ${path.join(dir, 'curator.log')})`), line);
+  assert.ok(line.includes(`slate warning: t2 restored: superseded line lost, I9 deleted (see ${path.join(dir, 'curator.log')})`), line);
 
   for (const afterCompact of [false, true]) {
     const block = await memoryBlock(dir, { afterCompact });
@@ -99,7 +99,13 @@ const RETIRED_SHAPES = [
   '- [I6 retired t2] ZZ-RETIRED-ZZ no turn',
   '- [I9 t1 Retired t2] ZZ-RETIRED-ZZ capitalised (reason: r)',
   'note [A2 t1 RETIRED t3] ZZ-RETIRED-ZZ mid-line',
-  '- remember: ZZ-RETIRED-ZZ use npm, as before', // holds a retired item's full text
+  // exact copies of retired I3 "ZZ-RETIRED-ZZ use npm" under bullets, quotes, checkboxes, emphasis, case
+  '- ZZ-RETIRED-ZZ use npm',
+  '> * [ ] ~~ZZ-RETIRED-ZZ   use NPM~~ (reason: old)',
+  '1. **ZZ-RETIRED-ZZ use npm**',
+  '+ `zz-retired-zz use npm`',
+  '_ZZ-Retired-ZZ use npm_',
+  '2) [x] *ZZ-RETIRED-ZZ use npm*',
 ];
 
 test('core: retired-looking lines and copies of retired text stay out of the block', async () => {
@@ -108,8 +114,22 @@ test('core: retired-looking lines and copies of retired text stay out of the blo
   await write(dir, 'instructions.md', `# Instructions\n- [I4 t2] use pnpm\n- live hand edit\n${RETIRED_SHAPES.join('\n')}\n`);
   await write(dir, 'now.md', `Goal: ship\n${RETIRED_SHAPES.join('\n')}\nNext: tests\n`);
   const b = await memoryBlock(dir, { afterCompact: false });
-  assert.ok(!b.includes('ZZ-RETIRED-ZZ'), b);
+  assert.ok(!/zz-retired-zz/i.test(b), b);
   for (const s of ['- [I4 t2] use pnpm', '- live hand edit', 'Goal: ship', 'Next: tests']) assert.ok(b.includes(s), s);
+});
+
+test('live lines that merely mention a retired text stay in the block', async () => {
+  const dir = await session();
+  await write(dir, 'superseded.md',
+    '# Superseded\n- [I3 t1 retired t2] use npm (reason: pnpm now)\n- [A1 t1 retired t2] a (reason: one letter)\n');
+  await write(dir, 'instructions.md', '# Instructions\n- never use npm in CI\n- use npm\n');
+  await write(dir, 'now.md', 'Goal: ship v2\nNext: replace every use npm call in scripts/\n- a\n');
+  const b = await memoryBlock(dir, { afterCompact: false });
+  for (const s of ['- never use npm in CI', 'Next: replace every use npm call in scripts/', 'Goal: ship v2']) {
+    assert.ok(b.includes(s), s);
+  }
+  assert.ok(!b.split('\n').includes('- use npm'), 'exact copy dropped');
+  assert.ok(!b.split('\n').includes('- a'), 'exact copy of a one-letter retired item dropped');
 });
 
 test('core: an item whose text carries a retired tag is shown by ID only', async () => {
@@ -134,12 +154,18 @@ test('core: warnings echo only status, IDs and violation kinds, never log text',
   const out = await changeLine(dir, { waiting: false });
   assert.ok(!out.includes('ZZ-RETIRED-ZZ'), out);
   for (const w of [
-    't1 restored: I3; superseded line lost',
-    't2 restored: I4; reworded',
+    't1 restored: superseded line lost',
+    't2 restored: I4 reworded',
     't3 restored: plain line lost',
-    't4 restored: F2; heading lost, duplicated',
+    't4 restored: heading lost, F2 duplicated',
     't5 error',
-  ]) assert.ok(out.includes(`slate warning: ${w} (see ${log})`), `${w}\n${out}`);
+  ]) assert.ok(out.split('\n').includes(`slate warning: ${w} (see ${log})`), `${w}\n${out}`);
+
+  // IDs and kinds inside quotes are never picked up
+  await append(dir, 'curator.log', '2026-10-07T10:00:00.000Z t6 restored: plain line lost: "print on A4 paper, F1 style"; ' +
+    'heading lost: "deleted and I7 reworded"; I2 duplicated\n');
+  assert.equal(await changeLine(dir, { waiting: false }),
+    `${REMINDER}\nslate warning: t6 restored: plain line lost, heading lost, I2 duplicated (see ${log})`);
 });
 
 // --- memoryBlock ---
@@ -310,13 +336,13 @@ test('changeLine: curator.log restored/error lines show once, other statuses nev
   const dir = await session();
   await write(dir, 'curator.log',
     '2026-10-07T10:00:00.000Z t1 ok: kept\n' +
-    '2026-10-07T10:01:00.000Z t2 restored: I3 removed without retiring\n' +
+    '2026-10-07T10:01:00.000Z t2 restored: I3 deleted\n' +
     '2026-10-07T10:02:00.000Z t3 error: claude exited 1\n');
   const first = await changeLine(dir, { waiting: false });
   const log = path.join(dir, 'curator.log');
-  assert.ok(first.includes(`slate warning: t2 restored: I3 (see ${log})`), first);
+  assert.ok(first.includes(`slate warning: t2 restored: I3 deleted (see ${log})`), first);
   assert.ok(first.includes(`slate warning: t3 error (see ${log})`), first);
-  assert.ok(!first.includes('kept') && !first.includes('removed') && !first.includes('exited'), first);
+  assert.ok(!first.includes('kept') && !first.includes('exited'), first);
   assert.ok(!first.includes('2026-10-07T'), 'timestamps dropped');
   assert.equal(await changeLine(dir, { waiting: false }), REMINDER);
 
@@ -327,9 +353,9 @@ test('changeLine: curator.log restored/error lines show once, other statuses nev
   // a partial line waits until it is complete
   await append(dir, 'curator.log', '2026-10-07T10:03:00.000Z t4 rest');
   assert.equal(await changeLine(dir, { waiting: true }), `${REMINDER}\nslate: memory still updating`);
-  await append(dir, 'curator.log', 'ored: F1 text changed\n');
+  await append(dir, 'curator.log', 'ored: F1 reworded\n');
   const later = await changeLine(dir, { waiting: false });
-  assert.ok(later.includes(`slate warning: t4 restored: F1 (see ${log})`), later);
+  assert.ok(later.includes(`slate warning: t4 restored: F1 reworded (see ${log})`), later);
   assert.ok(!later.includes('t2 restored'), later);
   assert.equal(await changeLine(dir, { waiting: false }), REMINDER);
 });
