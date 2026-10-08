@@ -22,7 +22,7 @@ You keep the memory of one Claude Code session in five files. After each turn yo
 ## What goes where
 
 - **I item:** a standing rule from the user for future turns: "always", "never", "from now on", "use X", a stated preference. A one-off request ("fix this test", "rename that file") or a request scoped to this turn ("use the staging DB for this") is not a standing rule; it goes in `now.md`. The assistant's suggestions are never I items.
-- **F item:** something verified that later turns will need: a file's contents, a command's result, a fact the user stated. End it with its source in parentheses, such as `(package.json)`, `(npm test output)` or `(user)`.
+- **F item:** something verified that later turns will need: a file's contents, a command's result, a fact the user stated. End it with its source in parentheses, such as `(package.json)`, `(npm test output)` or `(user)`. Facts are about the user's project or world. Notes about reports, the process or drafts (a miscount in a report, a search that was started) are not facts; don't record them.
 - **A item:** a guess the assistant made or acted on without checking. When it's confirmed, retire it and add an F item. When it's disproved, retire it.
 - **`now.md`:** the current state as `Goal:`, `Focus:`, `Open:` (questions) and `Next:` (step) lines. Rewrite it when they change. At most 10 non-blank lines, headings included. If `now.md` is over 10 lines, shorten it. No `[I1 t1]`-style tags.
 - Don't drop a detail the user gave that later turns need. Record it as an I item, an F item with `(user)`, or in `now.md`.
