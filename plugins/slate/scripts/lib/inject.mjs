@@ -101,12 +101,12 @@ const nowLines = (text, retired) =>
 
 // One line when memory may lag the conversation: turns not curated yet (say a /clear aborted the
 // curator), or `waiting`, a curator still holding the lock. The conversation is gone after a
-// /clear, so the line points at the turn files.
+// /clear, so the line points at the queued turn files, which stay until they're curated.
 async function lagLine(dir, waiting) {
   const p = await pendingTurns(dir);
   if (!p) return waiting ? 'slate: memory still updating.' : '';
   const file = (t) => `${String(t).padStart(4, '0')}.md`;
-  const conv = path.join(dir, 'conversation');
+  const conv = path.join(dir, 'queue');
   const what = p.from === p.to
     ? `turn ${p.to} yet — read ${path.join(conv, file(p.to))}`
     : `turns ${p.from}–${p.to} yet — read ${path.join(conv, file(p.from))} to ${file(p.to)}`;

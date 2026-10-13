@@ -128,7 +128,7 @@ test('SLATE_CURATOR=1: null for every event, even with a folder, and nothing cha
   const s = await readSession(dir);
   assert.equal(s.turn, 0);
   assert.equal(s.pid, PID);
-  assert.equal(await exists(path.join(dir, 'conversation', '0001.md')), false);
+  assert.equal(await exists(path.join(dir, 'queue', '0001.md')), false);
 });
 
 test('agent_id: hooks fired inside a subagent are no-ops', async () => {
@@ -147,7 +147,7 @@ test('agent_id: hooks fired inside a subagent are no-ops', async () => {
 
 // --- UserPromptSubmit ---
 
-test('UserPromptSubmit: writes conversation/0001.md verbatim and injects the change line', async () => {
+test('UserPromptSubmit: writes queue/0001.md verbatim and injects the change line', async () => {
   const { root, env, dir, id } = await activeSession();
   const text = 'use pnpm\n<!-- slate:answer -->\n  keep `$HOME` and "quotes"';
   const r = await handle('UserPromptSubmit', prompt(id, root, text), env);
@@ -157,7 +157,7 @@ test('UserPromptSubmit: writes conversation/0001.md verbatim and injects the cha
   assert.equal(s.turn, 1);
   assert.equal(s.lastKind, 'user');
   assert.equal((await readTurn(dir, 1)).message, text);
-  const raw = await fs.readFile(path.join(dir, 'conversation', '0001.md'), 'utf8');
+  const raw = await fs.readFile(path.join(dir, 'queue', '0001.md'), 'utf8');
   const at = /^# Turn 1 \((.+)\)$/m.exec(raw)?.[1];
   assert.equal(new Date(at).toISOString(), at, 'ISO timestamp');
 });
@@ -202,7 +202,7 @@ test('/slate:init prompt: no turn, no output; the following Stop does nothing', 
   const st = await handle('Stop', stop(id, root, 'slate is active'), env);
   assert.equal(st.output, null);
   assert.equal(st.spawned, undefined);
-  assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), []);
+  assert.deepEqual(await fs.readdir(path.join(dir, 'queue')), []);
 });
 
 test('notification while curator A runs: no new turn; the continuation is curated after A, same turn', async () => {
@@ -222,7 +222,7 @@ test('notification while curator A runs: no new turn; the continuation is curate
   let s = await readSession(dir);
   assert.equal(s.turn, 1);
   assert.equal(s.lastKind, 'notification');
-  assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), ['0001.md']);
+  assert.deepEqual(await fs.readdir(path.join(dir, 'queue')), ['0001.md']);
 
   const s2 = await handle('Stop', stop(id, root, 'the real answer'), env);
   assert.deepEqual(s2.spawned, [CURATE, dir, '1', 'sonnet']);
@@ -250,7 +250,7 @@ test('HARNESS_PREFIXES: the five harness message shapes', () => {
 for (const prefix of [
   '<task-notification', '<agent-message', '<cross-session-message', '<teammate-message', '[SYSTEM NOTIFICATION',
 ]) {
-  test(`harness message ${prefix}: not a turn, no conversation file, change line injected`, async () => {
+  test(`harness message ${prefix}: not a turn, no queue file, change line injected`, async () => {
     const { root, env, dir, id } = await activeSession();
     const text = `${prefix} from="a1">\n  report text that must not be recorded as the user's\n`;
     const n = await handle('UserPromptSubmit', prompt(id, root, text), env);
@@ -258,7 +258,7 @@ for (const prefix of [
     const s = await readSession(dir);
     assert.equal(s.turn, 0);
     assert.equal(s.lastKind, 'notification');
-    assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), []);
+    assert.deepEqual(await fs.readdir(path.join(dir, 'queue')), []);
   });
 }
 
@@ -285,7 +285,7 @@ test('notification before any user turn: change line only; the Stop does nothing
   const st = await handle('Stop', stop(id, root, 'answer'), env);
   assert.equal(st.spawned, undefined);
   assert.equal((await readSession(dir)).turn, 0);
-  assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), []);
+  assert.deepEqual(await fs.readdir(path.join(dir, 'queue')), []);
 });
 
 // --- SubagentStop ---
@@ -450,7 +450,7 @@ test('Stop before any turn: nothing', async () => {
   const r = await handle('Stop', stop(id, root, 'hello'), env);
   assert.equal(r.output, null);
   assert.equal(r.spawned, undefined);
-  assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), []);
+  assert.deepEqual(await fs.readdir(path.join(dir, 'queue')), []);
 });
 
 // --- PreCompact ---
@@ -616,7 +616,7 @@ async function assertAborted(dir, before, record) {
 }
 
 const lagNote = (dir, t) =>
-  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'conversation', `000${t}.md`)} before acting on recent instructions.`;
+  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'queue', `000${t}.md`)} before acting on recent instructions.`;
 
 test('Important 2: /clear mid-curation aborts, moves, notes the missing turn and drains it in the new folder', async () => {
   const { root, env, dir: old, before } = await curatorMidEdit('old');
@@ -677,7 +677,7 @@ test('M2: SessionStart while a curator still holds the lock says memory is still
   const release = await acquire(dir);
   try {
     const r = await handle('SessionStart', start(id, root, 'compact'), env);
-    const file = path.join(dir, 'conversation', '0001.md');
+    const file = path.join(dir, 'queue', '0001.md');
     assert.ok(ctx(r).includes(`\nslate: memory still updating; it may not include turn 1 yet — read ${file} before acting on recent instructions.\n`), ctx(r).slice(0, 400));
     assert.equal(r.spawned, undefined, 'the lock holder rechecks after its release');
   } finally {

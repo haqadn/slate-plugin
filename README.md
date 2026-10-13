@@ -26,7 +26,7 @@ claude plugin install slate@slate-plugin
 | `facts.md` | F items: verified, each with a source |
 | `now.md` | goal, focus, open questions, next step (10 lines max) |
 | `superseded.md` | retired items, append-only; never injected |
-| `conversation/` | `NNNN.md` per turn: your message and the answer |
+| `queue/` | `NNNN.md` per turn: your message and the answer, until curated (the newest stays until the next turn) |
 | `reports/` | details written by offload agents |
 | `handbacks/` | one marker per offload agent whose hand-back was sent back for a rewrite |
 | `session.json` | process ID, turn counter, IDs last shown |

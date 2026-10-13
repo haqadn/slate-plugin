@@ -7,7 +7,9 @@ import { realpathSync, statSync, accessSync, constants } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { writeMemory, readTurn, readSession, readCurated, turnState, atomicWrite } from './lib/session.mjs';
+import {
+  writeMemory, readTurn, readSession, readCurated, turnState, atomicWrite, queueFile, sweepQueue,
+} from './lib/session.mjs';
 import { acquire } from './lib/lock.mjs';
 import { checkCuratorEdit } from './lib/check.mjs';
 import { MEMORY_FILES } from './lib/items.mjs';
@@ -69,7 +71,7 @@ function cap(text, max, note) {
 }
 
 function buildPrompt({ rules, turn, real, message, answer }) {
-  const turnFile = path.join(real, 'conversation', `${String(turn).padStart(4, '0')}.md`);
+  const turnFile = queueFile(real, turn);
   return [
     rules.trim(),
     '',
@@ -375,6 +377,8 @@ export async function drain({
           }
         }
         await writeCurated(dir, work);
+        // A late follow-up can still append to the newest turn, so its file stays until a newer one.
+        await sweepQueue(dir, Math.min(work.turn, (await readSession(dir)).turn - 1));
       }
       if (beforeRelease && !signal?.aborted) await beforeRelease();
     } finally {

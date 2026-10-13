@@ -32,11 +32,12 @@ const lines = (prefix, n, size) =>
 test('rules.md carries the main-thread rules', async () => {
   const raw = await fs.readFile(new URL('../plugins/slate/rules.md', import.meta.url), 'utf8');
   for (const s of ['lead with the answer', 'offload', 'slate:offload', 'read-only', 'CLAUDE.md', 'AGENTS.md',
-    '{{dir}}/instructions.md', '{{dir}}/reports/<slug>.md', 'superseded.md', 'conversation/NNNN.md',
+    '{{dir}}/instructions.md', '{{dir}}/reports/<slug>.md', 'superseded.md',
     'Return ≤10 lines', 'instead of doing it yourself', 'when unsure, offload', 'memory still updating',
     'slate warning', 'Task line', 'replaces']) {
     assert.ok(raw.includes(s), `rules.md lacks ${JSON.stringify(s)}`);
   }
+  assert.ok(!raw.includes('conversation/'), 'turn files are a curator queue, not for the main thread');
   // the folder once near the top, then only the brief template's two full paths
   assert.equal(raw.split('{{dir}}').length - 1, 3);
   assert.ok(raw.indexOf('{{dir}}') < 200);
@@ -406,9 +407,9 @@ async function turns(n, done) {
   if (done) await write(dir, 'curated.json', `${JSON.stringify(done)}\n`);
   return dir;
 }
-const size = async (dir, t) => (await fs.stat(path.join(dir, 'conversation', `000${t}.md`))).size;
+const size = async (dir, t) => (await fs.stat(path.join(dir, 'queue', `000${t}.md`))).size;
 const lag = (dir, t) =>
-  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'conversation', `000${t}.md`)} before acting on recent instructions.`;
+  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'queue', `000${t}.md`)} before acting on recent instructions.`;
 
 test('Important 2: memoryBlock notes the turn curation has not reached, right under the heading', async () => {
   const dir = await turns(3, null);
@@ -421,7 +422,7 @@ test('Important 2: memoryBlock notes the turn curation has not reached, right un
 test('Important 2: several turns behind names the range; no curated.json counts as none curated', async () => {
   const dir = await turns(3, null);
   const b = await memoryBlock(dir, { afterCompact: false });
-  const conv = path.join(dir, 'conversation');
+  const conv = path.join(dir, 'queue');
   assert.ok(b.includes(`slate: memory may not include turns 1–3 yet — read ${conv}/0001.md to 0003.md before acting on recent instructions.`), b.slice(0, 400));
 });
 
@@ -444,7 +445,7 @@ test('Important 2: caught up, or no turns yet: no note', async () => {
 test('M2: waiting says memory is still updating, with the turn it may lack', async () => {
   const dir = await turns(1, { turn: 0, size: 0 });
   const b = await memoryBlock(dir, { waiting: true });
-  const file = path.join(dir, 'conversation', '0001.md');
+  const file = path.join(dir, 'queue', '0001.md');
   assert.ok(b.startsWith(`# slate memory\nslate: memory still updating; it may not include turn 1 yet — read ${file} before acting on recent instructions.\n`), b.slice(0, 400));
   const fresh = await session();
   assert.ok((await memoryBlock(fresh, { waiting: true })).startsWith('# slate memory\nslate: memory still updating.\n'));
