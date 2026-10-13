@@ -51,4 +51,5 @@ test('skill and agent frontmatter', async () => {
   assert.doesNotMatch(description, /: /, 'a plain YAML scalar');
   assert.doesNotMatch(agent.split('\n---')[0], /^tools:/m);
   assert.match(agent, /hand-back tool.*600|600.*hand-back tool/i, 'the return limit also covers a hand-back message');
+  assert.match(agent, /\.jsonl.*transcript|transcript.*\.jsonl/i, 'a past run is reachable through its transcript path');
 });

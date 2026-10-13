@@ -40,7 +40,9 @@ Long brainstorming and coding sessions without context rot:
     queue/            NNNN.md per turn: message (written on send) + answer (written on stop);
                       deleted once curated and a newer turn exists
     reports/          <slug>.md written by offload agents
-    handbacks/        <agent_id> markers: offload hand-backs already sent back once (return cap)
+    handbacks/        <agent_id> markers: offload hand-backs already sent back once (return cap);
+                      <agent_id>.return: the last hand-back message let through
+    offloads.md       one entry per offload run: turn, time, agent ID, transcript path, return
     curated.json      curator queue mark: last curated turn, its file size, and a turn to retry after an error
     curator.log       one line per curator result: ok, retry, restored, error, aborted
                       (restored and error show as warnings; aborted = requeued, not shown)
@@ -63,6 +65,7 @@ Long brainstorming and coding sessions without context rot:
 | Stop hook | Appends `last_assistant_message` to `queue/NNNN.md`. Starts a curator drain detached, then returns immediately. |
 | PreCompact hook | Waits up to 60s for a running curator. Never blocks compaction. |
 | Return cap (best-effort) | Sends an offload return over 800 chars back once, for a rewrite in ≤600 chars. Enforced on the final text by the SubagentStop hook (matcher `slate:offload`), and on `SubagentHandback.message` by the PreToolUse hook (matcher `SubagentHandback`; denies once per agent, marker `handbacks/<agent_id>`). Other return channels rely on the instruction in `offload.md`. |
+| Offload index | Each `slate:offload` stop that passes the cap appends an entry to `offloads.md`: turn, time, agent ID, `agent_transcript_path`, and the return (the final text, else the saved hand-back message). Return lines are quoted with `>`. |
 | Curator (`scripts/curate.mjs`) | Snapshot, then a `claude -p` edit pass, then the safety check, then keep or restore |
 | Agent `offload` | For slate sessions only; its description says to use it when the brief gives `.slate/` paths. Reads the memory files named in its brief and does the heavy task. Writes details to `reports/<slug>.md`, returns ≤10 lines, and never edits memory files. |
 | `rules.md` | One source for the main-thread rules. Used by the init skill and by the SessionStart block. |
@@ -93,7 +96,7 @@ After injecting the block, SessionStart starts a curator drain if turns are left
 | Each message | One-line reminder, plus changes since the last injection (`+I14 Use pnpm · retired I3`), or `memory still updating` while a curator holds the lock, plus any curator warnings | ~100–300 chars |
 | Each offload | The agent's summary | ≤10 lines |
 
-Retired items appear only as IDs in the change line, never as text. `superseded.md` and `reports/` are opened only on demand.
+Retired items appear only as IDs in the change line, never as text. `superseded.md`, `reports/` and `offloads.md` are opened only on demand.
 
 **Main-thread rules (`rules.md`):**
 - Reply like a colleague: short and plain. Lead with the answer, no essay. An explicit request for detail wins.

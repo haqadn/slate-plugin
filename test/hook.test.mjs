@@ -344,6 +344,85 @@ test('CLI: SubagentStop prints the block JSON', async () => {
   assert.deepEqual(JSON.parse(r.stdout), BLOCK_801);
 });
 
+// --- SubagentStop (offload index) ---
+
+const offloadsOf = (dir) => fs.readFile(path.join(dir, 'offloads.md'), 'utf8').catch((e) => (e.code === 'ENOENT' ? null : Promise.reject(e)));
+const ENTRY_HEAD = /^## t(\d+) (\S+) (\S+)\ntranscript: (.*)\n\n/gm;
+const entries = async (dir) => [...((await offloadsOf(dir)) ?? '').matchAll(ENTRY_HEAD)]
+  .map((m) => ({ turn: Number(m[1]), at: m[2], agent: m[3], transcript: m[4] }));
+
+test('SubagentStop: a short slate:offload return is recorded with turn, agent, transcript and text', async () => {
+  const { root, env, dir, id } = await activeSession();
+  await handle('UserPromptSubmit', prompt(id, root, 'find the callers'), env);
+  const r = await handle('SubagentStop', subStop(id, root, {
+    agent_id: 'a9f', agent_transcript_path: '/home/u/.claude/projects/p/s/subagents/agent-a9f.jsonl',
+    last_assistant_message: 'Found 3 callers.\nReport: reports/callers.md',
+  }), env);
+  assert.equal(r.output, null);
+  const [e, ...rest] = await entries(dir);
+  assert.deepEqual(rest, []);
+  assert.deepEqual({ ...e, at: undefined }, {
+    turn: 1, at: undefined, agent: 'a9f', transcript: '/home/u/.claude/projects/p/s/subagents/agent-a9f.jsonl',
+  });
+  assert.ok(!Number.isNaN(Date.parse(e.at)), e.at);
+  assert.ok((await offloadsOf(dir)).includes('\n> Found 3 callers.\n> Report: reports/callers.md\n'));
+});
+
+test('SubagentStop: a blocked return writes no entry; the rewrite that passes does', async () => {
+  const { root, env, dir, id } = await activeSession();
+  const blocked = await handle('SubagentStop', subStop(id, root), env);
+  assert.deepEqual(blocked.output, BLOCK_801);
+  assert.equal(await offloadsOf(dir), null);
+  await handle('SubagentStop', subStop(id, root, { stop_hook_active: true, last_assistant_message: 'short now' }), env);
+  assert.equal((await entries(dir)).length, 1);
+  assert.ok((await offloadsOf(dir)).includes('> short now\n'));
+});
+
+test('SubagentStop: other agents, no folder and unsafe agent IDs write no entry', async () => {
+  const { root, env, dir, id } = await activeSession();
+  for (const f of [{ agent_type: 'Explore' }, { agent_type: '' }, { agent_type: undefined }, { agent_id: '../x' },
+    { agent_id: undefined }, { agent_id: 42 }]) {
+    await handle('SubagentStop', subStop(id, root, { last_assistant_message: 'ok', ...f }), env);
+  }
+  assert.equal(await offloadsOf(dir), null);
+  const bare = await project();
+  await handle('SubagentStop', subStop('sid', bare.root, { last_assistant_message: 'ok' }), bare.env);
+  assert.equal(await exists(path.join(bare.root, '.slate')), false);
+});
+
+test('SubagentStop: no agent_transcript_path is written as none', async () => {
+  const { root, env, dir, id } = await activeSession();
+  await handle('SubagentStop', subStop(id, root, { last_assistant_message: 'ok' }), env);
+  assert.equal((await entries(dir))[0].transcript, 'none');
+});
+
+test('hand-back: the message PreToolUse lets through is the entry text', async () => {
+  const { root, env, dir, id } = await activeSession();
+  const agent = 'a435d85d2980fd4d2';
+  assert.equal((await handle('PreToolUse', handback(id, root, { tool_input: { message: 'Handed back: 2 bugs.' } }), env)).output, null);
+  await handle('SubagentStop', subStop(id, root, { agent_id: agent, last_assistant_message: undefined }), env);
+  const [e] = await entries(dir);
+  assert.equal(e.agent, agent);
+  assert.ok((await offloadsOf(dir)).includes('\n> Handed back: 2 bugs.\n'));
+});
+
+test('hand-back: denied once, then allowed: the entry holds the allowed message', async () => {
+  const { root, env, dir, id } = await activeSession();
+  const agent = 'a435d85d2980fd4d2';
+  assert.deepEqual((await handle('PreToolUse', handback(id, root), env)).output, DENY_801);
+  await handle('PreToolUse', handback(id, root, { tool_input: { message: 'second try' } }), env);
+  await handle('SubagentStop', subStop(id, root, { agent_id: agent, last_assistant_message: undefined }), env);
+  const text = await offloadsOf(dir);
+  assert.ok(text.includes('> second try\n'), text);
+  assert.ok(!text.includes('xxxx'));
+});
+
+test('hand-back: no saved message and no final text: entry says so', async () => {
+  const { root, env, dir, id } = await activeSession();
+  await handle('SubagentStop', subStop(id, root, { last_assistant_message: undefined }), env);
+  assert.ok((await offloadsOf(dir)).includes('> (no return text)\n'));
+});
+
 // --- PreToolUse (hand-back cap) ---
 
 const handback = (id, root, fields = {}) => ({

@@ -7,7 +7,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   sessionDir, readSession, writeSession, findByPid, moveSession, copySession, setPid, releasePid, claudePid,
-  nextTurn, writeMessage, appendAnswer, appendContinuation, pendingTurns,
+  nextTurn, writeMessage, appendAnswer, appendContinuation, pendingTurns, appendOffload, atomicWrite,
 } from './lib/session.mjs';
 import { waitFree, lockHolder } from './lib/lock.mjs';
 import { memoryBlock, changeLine } from './lib/inject.mjs';
@@ -153,49 +153,70 @@ async function stop(input, dir, env) {
   return { output: null, spawned: spawnCurator(dir, s.turn, env) };
 }
 
+const returnFile = (dir, agent) => path.join(dir, 'handbacks', `${agent}.return`);
+
 // An offload agent's return goes into the main thread. Over the limit, send it back once for a
-// shorter rewrite; the second stop carries stop_hook_active and always passes.
-function subagentStop(input) {
+// shorter rewrite; the second stop carries stop_hook_active and always passes. A stop that passes
+// is recorded in offloads.md, with the hand-back message PreToolUse saved when there's no final text.
+async function subagentStop(input, dir) {
   const text = input.last_assistant_message;
-  if (input.agent_type !== OFFLOAD_AGENT || input.stop_hook_active === true || typeof text !== 'string') {
-    return { output: null };
+  if (input.agent_type !== OFFLOAD_AGENT) return { output: null };
+  if (input.stop_hook_active !== true && typeof text === 'string') {
+    const chars = [...text].length;
+    if (chars > RETURN_LIMIT) {
+      return {
+        output: {
+          decision: 'block',
+          reason: `Return is ${chars} chars. Rewrite it in ≤600 chars, ≤10 lines; details belong in the report.`,
+        },
+      };
+    }
   }
-  const chars = [...text].length;
-  if (chars <= RETURN_LIMIT) return { output: null };
-  return {
-    output: {
-      decision: 'block',
-      reason: `Return is ${chars} chars. Rewrite it in ≤600 chars, ≤10 lines; details belong in the report.`,
-    },
-  };
+  const agent = input.agent_id;
+  if (typeof agent !== 'string' || !SAFE_ID.test(agent)) return { output: null };
+  const handedBack = typeof text === 'string' ? null : await fs.readFile(returnFile(dir, agent), 'utf8').catch(() => '');
+  await appendOffload(dir, {
+    turn: (await readSession(dir)).turn,
+    at: new Date().toISOString(),
+    agentId: agent,
+    transcript: input.agent_transcript_path,
+    text: handedBack ?? text,
+  });
+  return { output: null };
 }
 
 // The same cap for an offload agent that returns through a hand-back tool (its SubagentStop then
 // has no last_assistant_message). The first message over the limit is denied; the marker
-// handbacks/<agent_id> makes the agent's next hand-back go through, whatever its length.
+// handbacks/<agent_id> makes the agent's next hand-back go through, whatever its length. A message
+// let through is saved as handbacks/<agent_id>.return for the offloads.md entry.
 async function preToolUse(input, dir) {
   const text = input.tool_input?.message;
   const agent = input.agent_id;
   if (input.agent_type !== OFFLOAD_AGENT || !HANDBACK_TOOLS.includes(input.tool_name) || typeof text !== 'string') {
     return { output: null };
   }
+  if (typeof agent !== 'string' || !SAFE_ID.test(agent)) return { output: null };
   const chars = [...text].length;
-  if (chars <= RETURN_LIMIT || typeof agent !== 'string' || !SAFE_ID.test(agent)) return { output: null };
+  if (chars > RETURN_LIMIT) {
+    try {
+      await fs.mkdir(path.join(dir, 'handbacks'), { recursive: true });
+      await fs.writeFile(path.join(dir, 'handbacks', agent), '', { flag: 'wx' });
+      return {
+        output: {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: `Hand-back is ${chars} chars. Call ${input.tool_name} again with ≤600 chars, ≤10 lines; details belong in the report.`,
+          },
+        },
+      };
+    } catch {} // already denied once (EEXIST), or the marker can't be written: allow
+  }
   try {
     await fs.mkdir(path.join(dir, 'handbacks'), { recursive: true });
-    await fs.writeFile(path.join(dir, 'handbacks', agent), '', { flag: 'wx' });
-  } catch {
-    return { output: null }; // already denied once (EEXIST), or the marker can't be written: allow
-  }
-  return {
-    output: {
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason: `Hand-back is ${chars} chars. Call ${input.tool_name} again with ≤600 chars, ≤10 lines; details belong in the report.`,
-      },
-    },
-  };
+    await atomicWrite(returnFile(dir, agent), text);
+  } catch {} // the entry then lacks the text; never block the hand-back over it
+  return { output: null };
 }
 
 export async function handle(event, input, env = process.env) {
@@ -209,7 +230,7 @@ export async function handle(event, input, env = process.env) {
   if (!root || typeof id !== 'string' || !SAFE_ID.test(id)) return { output: null };
   const dir = sessionDir(root, id);
 
-  if (event === 'SubagentStop') return (await hasFolder(dir)) ? subagentStop(input) : { output: null };
+  if (event === 'SubagentStop') return (await hasFolder(dir)) ? subagentStop(input, dir) : { output: null };
   if (event === 'PreToolUse') return (await hasFolder(dir)) ? preToolUse(input, dir) : { output: null };
   if (event === 'SessionStart') return sessionStart(input, root, dir, env);
   if (!(await hasFolder(dir))) return { output: null };

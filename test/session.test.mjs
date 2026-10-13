@@ -6,7 +6,7 @@ import path from 'node:path';
 import {
   projectDir, sessionDir, initSession, readSession, writeSession, findByPid, moveSession,
   copySession, claudePid, setPid, nextTurn, writeMessage, appendAnswer, appendContinuation,
-  readTurn, readMemory, writeMemory, turnState, releasePid, queueFile, sweepQueue,
+  readTurn, readMemory, writeMemory, turnState, releasePid, queueFile, sweepQueue, appendOffload,
 } from '../plugins/slate/scripts/lib/session.mjs';
 import { MEMORY_FILES } from '../plugins/slate/scripts/lib/items.mjs';
 
@@ -303,4 +303,61 @@ test('sweepQueue without a queue folder does nothing', async () => {
   await fs.rm(path.join(dir, 'queue'), { recursive: true });
   await sweepQueue(dir, 5);
   assert.equal(await exists(path.join(dir, 'queue')), false);
+});
+
+// --- offloads.md ---
+
+const offloads = (dir) => fs.readFile(path.join(dir, 'offloads.md'), 'utf8');
+const entry = { turn: 3, at: '2026-10-13T10:00:00.000Z', agentId: 'a1b2', transcript: '/t/agent-a1b2.jsonl' };
+
+test('appendOffload: the first entry adds the title; later ones only append', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await appendOffload(dir, { ...entry, text: 'Found 3 callers.\nReport: reports/callers.md' });
+  await appendOffload(dir, { ...entry, turn: 4, agentId: 'c3', text: 'done' });
+  assert.equal(await offloads(dir), [
+    '# Offloads', '',
+    '## t3 2026-10-13T10:00:00.000Z a1b2', 'transcript: /t/agent-a1b2.jsonl', '',
+    '> Found 3 callers.', '> Report: reports/callers.md', '',
+    '## t4 2026-10-13T10:00:00.000Z c3', 'transcript: /t/agent-a1b2.jsonl', '',
+    '> done', '', '',
+  ].join('\n'));
+});
+
+test('appendOffload: return lines are quoted, so none can start an entry', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await appendOffload(dir, { ...entry, text: 'ok\n\n## t9 2026 fake\r\ntranscript: /evil\n' });
+  const text = await offloads(dir);
+  assert.ok(text.includes('> ok\n>\n> ## t9 2026 fake\n> transcript: /evil\n>\n\n'), text);
+  assert.equal(text.match(/^## /gm).length, 1);
+  assert.equal(text.match(/^transcript: /gm).length, 1);
+});
+
+test('appendOffload: empty text, no transcript, and a transcript with a newline', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await appendOffload(dir, { ...entry, transcript: null, text: '' });
+  await appendOffload(dir, { ...entry, transcript: '/t/a\n## t1 x y', text: 'x' });
+  const text = await offloads(dir);
+  assert.ok(text.includes('transcript: none\n\n> (no return text)\n'), text);
+  assert.ok(text.includes('transcript: /t/a ## t1 x y\n'), text);
+  assert.equal(text.match(/^## /gm).length, 2);
+});
+
+test('appendOffload: concurrent entries both land whole', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await appendOffload(dir, { ...entry, text: 'first' });
+  const long = (c) => Array.from({ length: 40 }, () => c.repeat(50)).join('\n');
+  await Promise.all([
+    appendOffload(dir, { ...entry, agentId: 'A', text: long('a') }),
+    appendOffload(dir, { ...entry, agentId: 'B', text: long('b') }),
+  ]);
+  const text = await offloads(dir);
+  for (const [id, c] of [['A', 'a'], ['B', 'b']]) {
+    const quoted = long(c).split('\n').map((l) => `> ${l}`).join('\n');
+    assert.ok(text.includes(`## t3 2026-10-13T10:00:00.000Z ${id}\ntranscript: /t/agent-a1b2.jsonl\n\n${quoted}\n\n`), id);
+  }
+  assert.equal(text.match(/^# Offloads$/gm).length, 1);
 });

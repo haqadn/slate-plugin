@@ -34,7 +34,7 @@ test('rules.md carries the main-thread rules', async () => {
   for (const s of ['lead with the answer', 'offload', 'slate:offload', 'read-only', 'CLAUDE.md', 'AGENTS.md',
     '{{dir}}/instructions.md', '{{dir}}/reports/<slug>.md', 'superseded.md',
     'Return ≤10 lines', 'instead of doing it yourself', 'when unsure, offload', 'memory still updating',
-    'slate warning', 'Task line', 'replaces']) {
+    'slate warning', 'Task line', 'replaces', 'offloads.md', 'transcript path']) {
     assert.ok(raw.includes(s), `rules.md lacks ${JSON.stringify(s)}`);
   }
   assert.ok(!raw.includes('conversation/'), 'turn files are a curator queue, not for the main thread');
@@ -43,7 +43,7 @@ test('rules.md carries the main-thread rules', async () => {
   assert.ok(raw.indexOf('{{dir}}') < 200);
 });
 
-test('rulesText fills every {{dir}} and stays ≤1,500 chars with a 120-char path', async () => {
+test('rulesText fills every {{dir}} and stays ≤1,550 chars with a 120-char path', async () => {
   const id = '0b7e8f5c-1234-4abc-9def-0123456789ab';
   const dir = `/Users/someone/${'p'.repeat(120 - '/Users/someone//.slate/'.length - id.length)}/.slate/${id}`;
   assert.equal(dir.length, 120);
@@ -51,7 +51,7 @@ test('rulesText fills every {{dir}} and stays ≤1,500 chars with a 120-char pat
   assert.ok(!t.includes('{{dir}}'));
   assert.ok(t.includes(`${dir}/instructions.md`));
   assert.ok(t.includes(`${dir}/reports/<slug>.md`));
-  assert.ok(t.length <= 1500, `rules are ${t.length} chars`);
+  assert.ok(t.length <= 1550, `rules are ${t.length} chars`);
 });
 
 test('rulesText inserts the dir literally, even with $ patterns', async () => {

@@ -290,6 +290,19 @@ export async function readTurn(dir, turn) {
   return { message, answer: answers.join('\n\n') };
 }
 
+// offloads.md: one entry per offload run, appended in a single write. Every return line is quoted
+// with `>`, so return text can never start an entry of its own.
+export async function appendOffload(dir, { turn, at, agentId, transcript, text }) {
+  const file = path.join(dir, 'offloads.md');
+  const isNew = await fs.access(file).then(() => false, () => true);
+  const where = typeof transcript === 'string' && transcript.trim()
+    ? transcript.replace(/\s*[\r\n]+\s*/g, ' ').trim()
+    : 'none';
+  const body = text ? text.split(/\r?\n/).map((l) => (l ? `> ${l}` : '>')).join('\n') : '> (no return text)';
+  const head = isNew ? '# Offloads\n\n' : '';
+  await fs.appendFile(file, `${head}## t${turn} ${at} ${agentId}\ntranscript: ${where}\n\n${body}\n\n`);
+}
+
 export async function readMemory(dir) {
   const out = {};
   for (const f of MEMORY_FILES) {

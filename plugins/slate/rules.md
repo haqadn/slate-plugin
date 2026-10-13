@@ -8,4 +8,5 @@ slate folder: {{dir}}; files below are in it. A background curator updates it; r
 - A `slate:` line lists changes: `+I14 text` adds or replaces I14; `retired I3` drops I3.
 - After `memory still updating` or a `slate warning` (tell the user), memory may miss the latest exchange; the exchange wins. Put its newest unsaved instruction in the brief's Task line (the only retelling allowed).
 - Read superseded.md only for why things changed.
+- offloads.md lists past offloads; to dig into one, give slate:offload its transcript path.
 - No notes in CLAUDE.md, AGENTS.md or other memory files.
