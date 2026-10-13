@@ -311,6 +311,22 @@ A Python `pty` script ran at 120×40 in a fresh temp dir with `--plugin-dir <rep
 2026-10-08T03:10:53.982Z t3 ok: attempt 1, no change
 ```
 
+## Offload index and turn queue (2026-10-13)
+
+`node test/live/acceptance.mjs --live`, then `--live --real-settings`, on branch `feat/offload-index`.
+
+| Run | Checks | Cost | Offload entries | `queue/` after the run |
+|---|---|---|---|---|
+| Isolated, 6 turns | 21 PASS | $1.09 | 2 agents, 1 entry each; both transcripts exist and hold tool calls | `0005.md` (newest turn 5) |
+| Real settings, 3 turns | 15 PASS | $0.65 | 1 agent, 1 entry; transcript exists, holds tool calls | `0002.md` (newest turn 2) |
+
+- The real-settings agent returned through the hand-back. Its 822-char message was denied, and the 481-char resend was let through and recorded.
+- Every SubagentStop carried `agent_transcript_path`: 4 stops in the isolated run, 1 in the real-settings run.
+- **Probe:** a follow-up `-p` turn in the isolated session had `slate:offload` dig into the first entry's transcript ($0.57).
+  - Reading the whole transcript failed: 50,134 tokens, over Read's 25,000 limit. Read with offset and limit worked.
+  - Bash `grep` was denied under `acceptEdits`, and the agent didn't try the Grep tool.
+  - It answered correctly and wrote its report.
+
 ## Earlier rounds
 
 **Round 0:** 5 turns and 8 checks, all passed. The review then found two gaps:
@@ -346,6 +362,12 @@ Removed after recording these results:
 - **Earlier rounds:** `<tmp>/slate-acc-GxsSoL`, `<tmp>/slate-pty-0jrcenc0`, `<tmp>/slate-acc-z66xm2`, `<tmp>/slate-acc-39j7qc`
 - The matching `~/.claude/projects/-private-var-folders-…-T-slate-acc-*`, `…-slate-r3probe-*` and `…-slate-pty-*` folders, one per temp project dir
 - The matching `/private/tmp/claude-<uid>/-private-var-folders-…-T-slate-*` task-output dirs
+
+**Offload index run (2026-10-13): left in place.** A safety hook in this setup blocks recursive deletes. Remove by hand:
+
+- `<tmp>/slate-acc-s48f4J`, `<tmp>/slate-acc-oFCWny`, `<tmp>/slate-probe-Aai8Ot`, `<tmp>/slate-probe-YTY6Qx`
+- `~/.claude/projects/-private-var-folders-…-T-slate-acc-s48f4J` and `…-slate-acc-oFCWny`
+- `/private/tmp/claude-<uid>/-private-var-folders-…-T-slate-acc-s48f4J` and `…-slate-acc-oFCWny`
 
 Not removed, because they fall outside the cleanup ruling. All are harmless.
 
