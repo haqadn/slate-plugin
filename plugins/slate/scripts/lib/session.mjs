@@ -43,7 +43,7 @@ export async function initSession(root, sessionId, pid) {
     if (e.code === 'EEXIST') return { created: false, dir };
     throw e;
   }
-  await fs.mkdir(path.join(dir, 'conversation'));
+  await fs.mkdir(path.join(dir, 'queue'));
   await fs.mkdir(path.join(dir, 'reports'));
   for (const f of MEMORY_FILES) await fs.writeFile(path.join(dir, f), TITLES[f]);
   await writeSession(dir, { pid, created: new Date().toISOString(), from: null, turn: 0, seen: {} });
@@ -182,17 +182,23 @@ const MARKER_LINE = /^<!-- slate:(message|answer) -->$/gm;
 const escapeText = (t) => String(t).replace(ESCAPE_LINE, '\\$1$2');
 const unescapeText = (t) => t.replace(UNESCAPE_LINE, '$1');
 
-function turnFile(dir, turn) {
-  return path.join(dir, 'conversation', `${String(turn).padStart(4, '0')}.md`);
+// Turn files are the curator's queue: drain deletes each once it's curated and a newer turn exists.
+export function queueFile(dir, turn) {
+  return path.join(dir, 'queue', `${String(turn).padStart(4, '0')}.md`);
 }
+
+// A folder from before queue/ existed has none.
+const ensureQueue = (dir) => fs.mkdir(path.join(dir, 'queue'), { recursive: true });
 
 export async function writeMessage(dir, turn, message, at = new Date().toISOString()) {
   const text = `# Turn ${turn} (${at})\n\n${MARKER_MESSAGE}\n${escapeText(message)}\n`;
-  await atomicWrite(turnFile(dir, turn), text);
+  await ensureQueue(dir);
+  await atomicWrite(queueFile(dir, turn), text);
 }
 
 export async function appendAnswer(dir, turn, answer) {
-  const file = turnFile(dir, turn);
+  const file = queueFile(dir, turn);
+  await ensureQueue(dir);
   let existing = '';
   try {
     existing = await fs.readFile(file, 'utf8');
@@ -205,12 +211,27 @@ export async function appendAnswer(dir, turn, answer) {
 // A follow-up answer (e.g. after a background-agent notification) is just another answer section.
 export const appendContinuation = appendAnswer;
 
+// Deletes the queue files of turns 1..upTo.
+export async function sweepQueue(dir, upTo) {
+  let names;
+  try {
+    names = await fs.readdir(path.join(dir, 'queue'));
+  } catch (e) {
+    if (e.code === 'ENOENT') return;
+    throw e;
+  }
+  for (const name of names) {
+    const m = /^(\d+)\.md$/.exec(name);
+    if (m && Number(m[1]) <= upTo) await fs.rm(path.join(dir, 'queue', name), { force: true });
+  }
+}
+
 // null if the turn file is missing. `size` is in bytes; `answered` means a Stop wrote an answer
 // section (possibly empty). Escaped marker-like lines in the text don't count.
 export async function turnState(dir, turn) {
   let buf;
   try {
-    buf = await fs.readFile(turnFile(dir, turn));
+    buf = await fs.readFile(queueFile(dir, turn));
   } catch (e) {
     if (e.code === 'ENOENT') return null;
     throw e;
@@ -248,7 +269,7 @@ export async function pendingTurns(dir) {
 export async function readTurn(dir, turn) {
   let text;
   try {
-    text = await fs.readFile(turnFile(dir, turn), 'utf8');
+    text = await fs.readFile(queueFile(dir, turn), 'utf8');
   } catch (e) {
     if (e.code === 'ENOENT') return { message: '', answer: '' };
     throw e;
@@ -267,6 +288,19 @@ export async function readTurn(dir, turn) {
     else if (mk.kind === 'answer') answers.push(body);
   });
   return { message, answer: answers.join('\n\n') };
+}
+
+// offloads.md: one entry per offload run, appended in a single write. Every return line is quoted
+// with `>`, so return text can never start an entry of its own.
+export async function appendOffload(dir, { turn, at, agentId, transcript, text }) {
+  const file = path.join(dir, 'offloads.md');
+  const isNew = await fs.access(file).then(() => false, () => true);
+  const where = typeof transcript === 'string' && transcript.trim()
+    ? transcript.replace(/\s*[\r\n]+\s*/g, ' ').trim()
+    : 'none';
+  const body = text ? text.split(/\r?\n/).map((l) => (l ? `> ${l}` : '>')).join('\n') : '> (no return text)';
+  const head = isNew ? '# Offloads\n\n' : '';
+  await fs.appendFile(file, `${head}## t${turn} ${at} ${agentId}\ntranscript: ${where}\n\n${body}\n\n`);
 }
 
 export async function readMemory(dir) {

@@ -183,7 +183,7 @@ test('prompt: a message over 100,000 chars is capped, pointing at the turn file'
   const [{ prompt }] = await calls(record);
   assert.ok(prompt.includes('m'.repeat(100000)));
   assert.ok(!prompt.includes('MESSAGE_TAIL'));
-  const turnFile = path.join(realpathSync(dir), 'conversation', '0002.md');
+  const turnFile = path.join(realpathSync(dir), 'queue', '0002.md');
   assert.ok(prompt.includes(`[message truncated; full text in ${turnFile}]`));
 });
 
@@ -448,7 +448,8 @@ async function curated(dir) {
     throw e;
   }
 }
-const turnSize = async (dir, t) => (await fs.stat(path.join(dir, 'conversation', `000${t}.md`))).size;
+const turnSize = async (dir, t) => (await fs.stat(path.join(dir, 'queue', `000${t}.md`))).size;
+const queueFiles = async (dir) => (await fs.readdir(path.join(dir, 'queue'))).sort();
 const promptTurns = async (record) => (await calls(record)).map((c) => Number(/^Current turn: (\d+)$/m.exec(c.prompt)[1]));
 const logTurns = async (dir) => (await logLines(dir)).map((l) => / (t\d+ \w+):/.exec(l)[1]);
 const runTurns = (r) => r.runs.map((x) => [x.turn, x.ok]);
@@ -479,6 +480,7 @@ test('drain: three turns queued while the lock is held are all curated, in order
   assert.equal((await readMemory(dir))['instructions.md'],
     '# Instructions\n- [I1 t1] fake item\n- [I2 t2] fake item\n- [I3 t3] fake item\n');
   assert.deepEqual(await curated(dir), { turn: 3, size: await turnSize(dir, 3) });
+  assert.deepEqual(await queueFiles(dir), ['0003.md'], 'curated turns are swept; the newest stays');
   assert.ok(await lockGone(dir));
   assert.deepEqual((await drain({ dir, bin: FAKE })).runs, [], 'nothing left');
 });
@@ -486,6 +488,7 @@ test('drain: three turns queued while the lock is held are all curated, in order
 test('drain: a continuation appended after a turn is done gets that turn re-curated', async () => {
   const { dir, record } = await queued('good', 1);
   assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, true]]);
+  assert.deepEqual(await queueFiles(dir), ['0001.md'], 'the newest turn stays after curation');
   await appendContinuation(dir, 1, 'the real answer');
   assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, true]]);
   const [first, second] = await calls(record);
@@ -513,10 +516,13 @@ test('drain: an interrupted turn is curated with a placeholder; the newest unans
 
 test('M6: a turn that ends in error is retried once on the next drain, then marked done', async () => {
   const { dir, record, before } = await queued('fail', 2);
+  const size1 = await turnSize(dir, 1);
   assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, false]], 'the first error parks turn 1');
   assert.deepEqual(await curated(dir), { turn: 0, size: 0, retry: 1 });
+  assert.deepEqual(await queueFiles(dir), ['0001.md', '0002.md'], 'a parked turn keeps its file');
   assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, false], [2, false]], 'turn 1 done; turn 2 parked');
-  assert.deepEqual(await curated(dir), { turn: 1, size: await turnSize(dir, 1), retry: 2 });
+  assert.deepEqual(await curated(dir), { turn: 1, size: size1, retry: 2 });
+  assert.deepEqual(await queueFiles(dir), ['0002.md'], 'turn 1 swept after its second error');
   assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[2, false]]);
   assert.deepEqual(await curated(dir), { turn: 2, size: await turnSize(dir, 2) });
   assert.deepEqual(await logTurns(dir), ['t1 error', 't1 error', 't2 error', 't2 error']);
@@ -606,4 +612,66 @@ test('CLI: SIGTERM aborts mid-edit: kills claude, restores, logs aborted, releas
 
   process.env.FAKE_MODE = 'good';
   assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, true]]);
+});
+
+// --- queue sweep ---
+
+test('queue: a parked turn keeps its file; the retry curates it and sweeps it', async () => {
+  const { dir } = await queued('fail', 2);
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, false]]);
+  assert.deepEqual(await queueFiles(dir), ['0001.md', '0002.md']);
+  process.env.FAKE_MODE = 'good';
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, true], [2, true]]);
+  assert.deepEqual(await queueFiles(dir), ['0002.md']);
+});
+
+test('queue: a restored turn is swept once a newer turn exists', async () => {
+  const { dir } = await queued('bad', 2);
+  await writeMemory(dir, { 'instructions.md': '# Instructions\n- [I1 t0] keep me\n' });
+  assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, false], [2, false]]);
+  assert.deepEqual(await logTurns(dir), ['t1 retry', 't1 restored', 't2 retry', 't2 restored']);
+  assert.deepEqual(await queueFiles(dir), ['0002.md']);
+});
+
+test('queue: an aborted turn keeps its file', async () => {
+  const { dir } = await queued('hang', 2);
+  const ac = new AbortController();
+  const running = drain({ dir, bin: FAKE, signal: ac.signal });
+  await until(async () => (await readMemory(dir))['instructions.md'].includes('fake item'));
+  ac.abort();
+  const r = await running;
+  assert.equal(r.aborted, true);
+  assert.deepEqual(await queueFiles(dir), ['0001.md', '0002.md']);
+  assert.equal(await curated(dir), null);
+});
+
+test('queue: a continuation appended while the newest turn is curated is kept and re-curated', async () => {
+  const { dir, record } = await queued('good', 1);
+  let appended = false;
+  const r = await drain({
+    dir,
+    bin: FAKE,
+    beforeRelease: async () => {
+      if (appended) return;
+      appended = true;
+      await appendContinuation(dir, 1, 'late follow-up');
+    },
+  });
+  assert.deepEqual(runTurns(r), [[1, true], [1, true]]);
+  assert.ok((await calls(record))[1].prompt.includes('answer 1\n\nlate follow-up'));
+  assert.deepEqual(await queueFiles(dir), ['0001.md']);
+  assert.deepEqual(await curated(dir), { turn: 1, size: await turnSize(dir, 1) });
+});
+
+test('queue: a follow-up appended mid-curation, then a new turn, is curated before its file is swept', async () => {
+  const { dir, record } = await queued('sleep', 1);
+  process.env.FAKE_SLEEP_MS = '500';
+  const running = drain({ dir, bin: FAKE });
+  await until(async () => (await calls(record)).length === 1);
+  await appendContinuation(dir, 1, 'late follow-up'); // a background agent finishes
+  await addTurn(dir, 2, { answered: false }); // then the user sends turn 2
+  const r = await running;
+  assert.deepEqual(runTurns(r), [[1, true], [1, true]]);
+  assert.ok((await calls(record))[1].prompt.includes('answer 1\n\nlate follow-up'));
+  assert.deepEqual(await queueFiles(dir), ['0002.md']);
 });

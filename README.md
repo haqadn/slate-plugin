@@ -26,9 +26,10 @@ claude plugin install slate@slate-plugin
 | `facts.md` | F items: verified, each with a source |
 | `now.md` | goal, focus, open questions, next step (10 lines max) |
 | `superseded.md` | retired items, append-only; never injected |
-| `conversation/` | `NNNN.md` per turn: your message and the answer |
+| `queue/` | `NNNN.md` per turn: your message and the answer, until curated (the newest stays until the next turn) |
 | `reports/` | details written by offload agents |
-| `handbacks/` | one marker per offload agent whose hand-back was sent back for a rewrite |
+| `offloads.md` | one entry per offload run: its return and the path to Claude Code's transcript of it |
+| `handbacks/` | one marker per offload agent whose hand-back was sent back for a rewrite, plus the last hand-back message let through |
 | `session.json` | process ID, turn counter, IDs last shown |
 | `curated.json` | last curated turn and its file size, plus a turn to retry after an error (curator queue mark) |
 | `curator.log` | curator results: `ok`, `retry` (edit rejected, trying again), `restored`, `error`, `aborted`; `restored` and `error` also show as a warning |

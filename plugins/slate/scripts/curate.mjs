@@ -7,7 +7,9 @@ import { realpathSync, statSync, accessSync, constants } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { writeMemory, readTurn, readSession, readCurated, turnState, atomicWrite } from './lib/session.mjs';
+import {
+  writeMemory, readTurn, readSession, readCurated, turnState, atomicWrite, queueFile, sweepQueue,
+} from './lib/session.mjs';
 import { acquire } from './lib/lock.mjs';
 import { checkCuratorEdit } from './lib/check.mjs';
 import { MEMORY_FILES } from './lib/items.mjs';
@@ -69,7 +71,7 @@ function cap(text, max, note) {
 }
 
 function buildPrompt({ rules, turn, real, message, answer }) {
-  const turnFile = path.join(real, 'conversation', `${String(turn).padStart(4, '0')}.md`);
+  const turnFile = queueFile(real, turn);
   return [
     rules.trim(),
     '',
@@ -331,19 +333,20 @@ async function queueMark(dir) {
 
 // The next turn to curate, or null. First the last done turn again if its file grew (a
 // continuation), else the turn after it. The newest turn waits for its answer; an older turn
-// without one was interrupted. An older turn with no file is skipped (`missing`).
+// without one was interrupted. An older turn with no file is skipped (`missing`). `last` is the
+// newest turn when the work was picked: only that turn's file can still grow.
 async function nextWork(dir) {
   const done = await readCurated(dir);
   const last = (await readSession(dir)).turn;
   if (done.turn >= 1 && done.turn <= last) {
     const st = await turnState(dir, done.turn);
-    if (st && st.size > done.size) return { turn: done.turn, size: st.size, missing: false };
+    if (st && st.size > done.size) return { turn: done.turn, size: st.size, missing: false, last };
   }
   const turn = done.turn + 1;
   if (turn > last) return null;
   const st = await turnState(dir, turn);
   if (turn === last && !st?.answered) return null;
-  return { turn, size: st?.size ?? 0, missing: !st };
+  return { turn, size: st?.size ?? 0, missing: !st, last };
 }
 
 // Curates every pending turn in order. A curator that finds the lock held returns at once: the
@@ -375,6 +378,10 @@ export async function drain({
           }
         }
         await writeCurated(dir, work);
+        // A late follow-up can still append to the newest turn, so its file stays until a newer one.
+        // `work.last`, not the current newest: a turn that was newest while it was curated may have
+        // grown since, and must be curated again before its file goes.
+        await sweepQueue(dir, Math.min(work.turn, work.last - 1));
       }
       if (beforeRelease && !signal?.aborted) await beforeRelease();
     } finally {

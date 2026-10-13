@@ -286,6 +286,17 @@ The value was set with `--settings '{"pluginConfigs":{"slate@inline":{"options":
 - **PreToolUse** with matcher `SubagentHandback` checks `tool_input.message`. It denies the first message over the limit and lets the second through. A marker file `<dir>/handbacks/<agent_id>` records that the agent was already denied once.
 - Any other return channel relies on the instruction in `offload.md`.
 
+## 10. Offload transcripts (Claude Code 2.1.293)
+
+**Probe.** The live acceptance runs of 2026-10-13 (`docs/acceptance.md`), plus one follow-up turn asking `slate:offload` to read a past run's transcript.
+
+**Observed**
+- SubagentStop carries `agent_transcript_path` for background agents and after a hand-back. It points to `~/.claude/projects/<slug>/<session>/subagents/agent-<agent_id>.jsonl`, and the file exists after the run.
+- An offload agent can Read that path, even though it sits outside the project. A whole transcript can exceed Read's 25,000-token limit, so the agent needs offset and limit, or Grep.
+- Bash is not auto-approved under `acceptEdits`, so a `grep` through Bash is denied.
+
+**Chosen mechanism.** `offloads.md` stores the pointer. `offload.md` tells the agent to search a transcript with Grep, or Read with offset and limit, rather than read it whole.
+
 ## Other findings for later tasks
 
 - **Background subagents.** In `-p` mode the Agent tool ran `slate:offload` in the background. Three hooks fired in sequence:

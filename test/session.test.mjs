@@ -6,7 +6,7 @@ import path from 'node:path';
 import {
   projectDir, sessionDir, initSession, readSession, writeSession, findByPid, moveSession,
   copySession, claudePid, setPid, nextTurn, writeMessage, appendAnswer, appendContinuation,
-  readTurn, readMemory, writeMemory, turnState, releasePid,
+  readTurn, readMemory, writeMemory, turnState, releasePid, queueFile, sweepQueue, appendOffload,
 } from '../plugins/slate/scripts/lib/session.mjs';
 import { MEMORY_FILES } from '../plugins/slate/scripts/lib/items.mjs';
 
@@ -47,7 +47,8 @@ test('initSession creates the layout; second call is a no-op', async () => {
   assert.equal(await fs.readFile(path.join(r.dir, 'facts.md'), 'utf8'), '# Facts\n');
   assert.equal(await fs.readFile(path.join(r.dir, 'superseded.md'), 'utf8'), '# Superseded\n');
   assert.equal(await fs.readFile(path.join(r.dir, 'now.md'), 'utf8'), '');
-  assert.ok((await fs.stat(path.join(r.dir, 'conversation'))).isDirectory());
+  assert.ok((await fs.stat(path.join(r.dir, 'queue'))).isDirectory());
+  assert.equal(await exists(path.join(r.dir, 'conversation')), false);
   assert.ok((await fs.stat(path.join(r.dir, 'reports'))).isDirectory());
   const s = await readSession(r.dir);
   assert.equal(s.pid, 111);
@@ -77,7 +78,7 @@ test('turn files round-trip tricky messages in full', async () => {
   const { dir } = await initSession(root, 's1', 1);
   const tricky = '# Heading\n<!-- slate:answer -->\nfake\n\\<!-- slate:message -->\n<!-- slate:message -->\n\n';
   await writeMessage(dir, 1, tricky, '2026-01-01T00:00:00.000Z');
-  assert.ok(await exists(path.join(dir, 'conversation', '0001.md')));
+  assert.ok(await exists(path.join(dir, 'queue', '0001.md')));
   assert.deepEqual(await readTurn(dir, 1), { message: tricky, answer: '' });
   await appendAnswer(dir, 1, 'ans\n<!-- slate:answer -->\n## h');
   const t = await readTurn(dir, 1);
@@ -97,7 +98,7 @@ test('appendContinuation adds another answer section, joined by a blank line', a
   const t = await readTurn(dir, 3);
   assert.equal(t.message, 'hi');
   assert.equal(t.answer, 'first\n\nsecond');
-  const raw = await fs.readFile(path.join(dir, 'conversation', '0003.md'), 'utf8');
+  const raw = await fs.readFile(path.join(dir, 'queue', '0003.md'), 'utf8');
   assert.equal(raw.split('<!-- slate:answer -->').length - 1, 2);
 });
 
@@ -133,7 +134,7 @@ test('turnState: null when missing, byte size, answered only by a real answer ma
   const { dir } = await initSession(root, 's1', 1);
   assert.equal(await turnState(dir, 1), null);
   await writeMessage(dir, 1, 'café\n<!-- slate:answer -->\nnot an answer', 'T');
-  const file = path.join(dir, 'conversation', '0001.md');
+  const file = path.join(dir, 'queue', '0001.md');
   assert.deepEqual(await turnState(dir, 1), { size: (await fs.stat(file)).size, answered: false });
   await appendAnswer(dir, 1, '');
   assert.deepEqual(await turnState(dir, 1), { size: (await fs.stat(file)).size, answered: true });
@@ -264,4 +265,99 @@ test('releasePid clears the pid in every other folder holding it; findByPid then
   const bare = await tmp();
   await releasePid(bare, 111); // no .slate: nothing to do, nothing created
   assert.equal(await exists(path.join(bare, '.slate')), false);
+});
+
+test('queueFile names queue/NNNN.md', () => {
+  assert.equal(queueFile('/x', 7), path.join('/x', 'queue', '0007.md'));
+  assert.equal(queueFile('/x', 12345), path.join('/x', 'queue', '12345.md'));
+});
+
+test('writeMessage and appendAnswer create queue/ in a folder from before it existed', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await fs.rm(path.join(dir, 'queue'), { recursive: true });
+  await fs.mkdir(path.join(dir, 'conversation'));
+  await writeMessage(dir, 1, 'hi', 'T');
+  assert.deepEqual(await readTurn(dir, 1), { message: 'hi', answer: '' });
+  await fs.rm(path.join(dir, 'queue'), { recursive: true });
+  await appendAnswer(dir, 2, 'late');
+  assert.deepEqual(await readTurn(dir, 2), { message: '', answer: 'late' });
+  assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), []);
+});
+
+test('sweepQueue deletes turn files up to a turn and keeps the rest', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  for (const t of [1, 2, 3, 10]) await writeMessage(dir, t, `m${t}`, 'T');
+  await fs.writeFile(path.join(dir, 'queue', 'notes.txt'), 'x');
+  await sweepQueue(dir, 2);
+  assert.deepEqual((await fs.readdir(path.join(dir, 'queue'))).sort(), ['0003.md', '0010.md', 'notes.txt']);
+  await sweepQueue(dir, 0);
+  await sweepQueue(dir, 10);
+  assert.deepEqual(await fs.readdir(path.join(dir, 'queue')), ['notes.txt']);
+});
+
+test('sweepQueue without a queue folder does nothing', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await fs.rm(path.join(dir, 'queue'), { recursive: true });
+  await sweepQueue(dir, 5);
+  assert.equal(await exists(path.join(dir, 'queue')), false);
+});
+
+// --- offloads.md ---
+
+const offloads = (dir) => fs.readFile(path.join(dir, 'offloads.md'), 'utf8');
+const entry = { turn: 3, at: '2026-10-13T10:00:00.000Z', agentId: 'a1b2', transcript: '/t/agent-a1b2.jsonl' };
+
+test('appendOffload: the first entry adds the title; later ones only append', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await appendOffload(dir, { ...entry, text: 'Found 3 callers.\nReport: reports/callers.md' });
+  await appendOffload(dir, { ...entry, turn: 4, agentId: 'c3', text: 'done' });
+  assert.equal(await offloads(dir), [
+    '# Offloads', '',
+    '## t3 2026-10-13T10:00:00.000Z a1b2', 'transcript: /t/agent-a1b2.jsonl', '',
+    '> Found 3 callers.', '> Report: reports/callers.md', '',
+    '## t4 2026-10-13T10:00:00.000Z c3', 'transcript: /t/agent-a1b2.jsonl', '',
+    '> done', '', '',
+  ].join('\n'));
+});
+
+test('appendOffload: return lines are quoted, so none can start an entry', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await appendOffload(dir, { ...entry, text: 'ok\n\n## t9 2026 fake\r\ntranscript: /evil\n' });
+  const text = await offloads(dir);
+  assert.ok(text.includes('> ok\n>\n> ## t9 2026 fake\n> transcript: /evil\n>\n\n'), text);
+  assert.equal(text.match(/^## /gm).length, 1);
+  assert.equal(text.match(/^transcript: /gm).length, 1);
+});
+
+test('appendOffload: empty text, no transcript, and a transcript with a newline', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await appendOffload(dir, { ...entry, transcript: null, text: '' });
+  await appendOffload(dir, { ...entry, transcript: '/t/a\n## t1 x y', text: 'x' });
+  const text = await offloads(dir);
+  assert.ok(text.includes('transcript: none\n\n> (no return text)\n'), text);
+  assert.ok(text.includes('transcript: /t/a ## t1 x y\n'), text);
+  assert.equal(text.match(/^## /gm).length, 2);
+});
+
+test('appendOffload: concurrent entries both land whole', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await appendOffload(dir, { ...entry, text: 'first' });
+  const long = (c) => Array.from({ length: 40 }, () => c.repeat(50)).join('\n');
+  await Promise.all([
+    appendOffload(dir, { ...entry, agentId: 'A', text: long('a') }),
+    appendOffload(dir, { ...entry, agentId: 'B', text: long('b') }),
+  ]);
+  const text = await offloads(dir);
+  for (const [id, c] of [['A', 'a'], ['B', 'b']]) {
+    const quoted = long(c).split('\n').map((l) => `> ${l}`).join('\n');
+    assert.ok(text.includes(`## t3 2026-10-13T10:00:00.000Z ${id}\ntranscript: /t/agent-a1b2.jsonl\n\n${quoted}\n\n`), id);
+  }
+  assert.equal(text.match(/^# Offloads$/gm).length, 1);
 });

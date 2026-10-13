@@ -398,6 +398,12 @@ export function handbackDenials(handbacks, offloadIds) {
 
 // --- main ------------------------------------------------------------------------------------
 
+// offloads.md entries: `## t<turn> <at> <agentId>` then `transcript: <path|none>`.
+export function offloadEntries(text) {
+  return [...String(text ?? '').matchAll(/^## t(\d+) (\S+) (\S+)\ntranscript: (.*)$/gm)]
+    .map((m) => ({ turn: Number(m[1]), agentId: m[3], transcript: m[4] }));
+}
+
 async function main() {
   const bin = claudeBin();
   const env = cleanEnv();
@@ -506,6 +512,16 @@ async function main() {
   const noChangeLine = userTurns.filter((n) => !a.hookContext.some((h) => h.turn === n && h.event === 'UserPromptSubmit' && h.text.includes(REMINDER)));
   const reports = exists(path.join(dir, 'reports')) ? fs.readdirSync(path.join(dir, 'reports')) : [];
   const initReply = turns[0]?.result ?? '';
+  const offloadsText = readText(path.join(dir, 'offloads.md'));
+  const offloads = offloadEntries(offloadsText);
+  const entryChecks = [...offloadIds].map((id) => {
+    const mine = offloads.filter((e) => e.agentId === id);
+    const file = mine[0]?.transcript;
+    const body = file && file !== 'none' ? readText(file) : null;
+    return { id, entries: mine.length, transcript: file ?? null, exists: body !== null, toolCall: /"type":"tool_use"/.test(body ?? '') };
+  });
+  const queued = exists(path.join(dir, 'queue')) ? fs.readdirSync(path.join(dir, 'queue')).sort() : [];
+  const newest = `${String(slateTurns).padStart(4, '0')}.md`;
   const BOTH = ['full', 'real'];
   const FULL = ['full'];
   const checks = [
@@ -527,6 +543,8 @@ async function main() {
     [BOTH, 'offload report written, no subagent Write/Edit failed', reports.length > 0 && writes.every((w) => !w.error), `reports: ${reports.join(', ') || 'none'}; writes: ${writes.map((w) => `${w.tool} ${path.basename(w.file ?? '?')} ${w.error ? `ERROR ${w.result}` : 'ok'}`).join('; ') || 'none'}; denied (any tool): ${denials.map((d) => `${d.tool} ${d.command ?? d.file ?? ''}`).join('; ') || 'none'}`],
     [BOTH, 'SubagentStop input carries agent_type, stop_hook_active, agent_id, the main session_id, and last_assistant_message unless the agent handed back', offloadStops.length > 0 && offloadStops.every((p) => SHAPE.every((k) => p.keys.includes(k) || (k === 'last_assistant_message' && handedBack.has(p.agent_id))) && p.session_id === sessionId), `${probes.length} SubagentStop(s), ${offloadStops.length} slate:offload; keys: ${[...new Set(probes.flatMap((p) => p.keys))].join(',')}`],
     [BOTH, 'every slate:offload return over 800 chars was sent back, at most once per agent', blocks.every((b) => !b.over || b.blocked) && blockCounts.every((n) => n <= 1), blocks.map((b) => `${String(b.agent_id ?? "?").slice(0, 6)} ${b.chars === null ? 'no last_assistant_message' : `${b.chars} chars`}${b.stop_hook_active ? ' (stop_hook_active)' : ''}${b.over ? (b.blocked ? ' blocked' : ' NOT blocked') : ''}`).join('; ') || 'no offload stops'],
+    [BOTH, 'every slate:offload agent that stopped has one offloads.md entry whose transcript exists and has a tool call', entryChecks.length > 0 && entryChecks.every((e) => e.entries === 1 && e.exists && e.toolCall), `${offloads.length} entr(ies); ${entryChecks.map((e) => `${e.id.slice(0, 6)}: ${e.entries} entr(ies), transcript ${e.transcript ? (e.exists ? 'exists' : 'MISSING') : 'none'}${e.toolCall ? ', tool call' : ''}`).join('; ') || 'no offload stops'}${handedBack.size ? `; handed back: ${[...handedBack].map((x) => x.slice(0, 6)).join(', ')}` : ''}`, ['real']],
+    [BOTH, 'queue/ holds at most the newest turn\'s file', queued.every((f) => f === newest), `queue: ${queued.join(', ') || 'empty'}; newest turn ${slateTurns}`],
     [BOTH, 'every slate:offload hand-back over 800 chars was denied exactly once', hb.every((h) => h.ok), `${hb.map((h) => `${h.id.slice(0, 6)}: ${h.calls.map((c) => `${c.chars ?? '?'} chars ${c.denied ? 'denied' : c.error ? 'error' : 'ok'}`).join(' → ')}`).join('; ') || 'no hand-backs'}; probe saw ${probeHandbacks.length} hand-back PreToolUse(s)${probeHandbacks.length ? ` (agent_type ${[...new Set(probeHandbacks.map((x) => x.agent_type))].join(',')}; tool_input ${[...new Set(probeHandbacks.map((x) => x.input_keys.join('+')))].join(',')})` : ''}`],
   ].filter(([profiles]) => profiles.includes(REAL ? 'real' : 'full'))
     .map(([, name, pass, detail, softIn]) => ({ name, pass, detail, soft: Boolean(softIn?.includes(REAL ? 'real' : 'full')) }));
@@ -540,7 +558,9 @@ async function main() {
     curatorLog: log,
     session: readText(path.join(dir, 'session.json')),
     curated: readText(path.join(dir, 'curated.json')),
-    conversation: fs.existsSync(path.join(dir, 'conversation')) ? fs.readdirSync(path.join(dir, 'conversation')) : [],
+    queue: queued,
+    offloads: offloadsText,
+    offloadEntries: entryChecks,
     reports: Object.fromEntries(reports.map((f) => [f, readText(path.join(dir, 'reports', f))])),
   };
   fs.writeFileSync(out, `${JSON.stringify(results, null, 2)}\n`);

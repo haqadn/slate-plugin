@@ -128,7 +128,7 @@ test('SLATE_CURATOR=1: null for every event, even with a folder, and nothing cha
   const s = await readSession(dir);
   assert.equal(s.turn, 0);
   assert.equal(s.pid, PID);
-  assert.equal(await exists(path.join(dir, 'conversation', '0001.md')), false);
+  assert.equal(await exists(path.join(dir, 'queue', '0001.md')), false);
 });
 
 test('agent_id: hooks fired inside a subagent are no-ops', async () => {
@@ -147,7 +147,7 @@ test('agent_id: hooks fired inside a subagent are no-ops', async () => {
 
 // --- UserPromptSubmit ---
 
-test('UserPromptSubmit: writes conversation/0001.md verbatim and injects the change line', async () => {
+test('UserPromptSubmit: writes queue/0001.md verbatim and injects the change line', async () => {
   const { root, env, dir, id } = await activeSession();
   const text = 'use pnpm\n<!-- slate:answer -->\n  keep `$HOME` and "quotes"';
   const r = await handle('UserPromptSubmit', prompt(id, root, text), env);
@@ -157,7 +157,7 @@ test('UserPromptSubmit: writes conversation/0001.md verbatim and injects the cha
   assert.equal(s.turn, 1);
   assert.equal(s.lastKind, 'user');
   assert.equal((await readTurn(dir, 1)).message, text);
-  const raw = await fs.readFile(path.join(dir, 'conversation', '0001.md'), 'utf8');
+  const raw = await fs.readFile(path.join(dir, 'queue', '0001.md'), 'utf8');
   const at = /^# Turn 1 \((.+)\)$/m.exec(raw)?.[1];
   assert.equal(new Date(at).toISOString(), at, 'ISO timestamp');
 });
@@ -202,7 +202,7 @@ test('/slate:init prompt: no turn, no output; the following Stop does nothing', 
   const st = await handle('Stop', stop(id, root, 'slate is active'), env);
   assert.equal(st.output, null);
   assert.equal(st.spawned, undefined);
-  assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), []);
+  assert.deepEqual(await fs.readdir(path.join(dir, 'queue')), []);
 });
 
 test('notification while curator A runs: no new turn; the continuation is curated after A, same turn', async () => {
@@ -222,7 +222,7 @@ test('notification while curator A runs: no new turn; the continuation is curate
   let s = await readSession(dir);
   assert.equal(s.turn, 1);
   assert.equal(s.lastKind, 'notification');
-  assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), ['0001.md']);
+  assert.deepEqual(await fs.readdir(path.join(dir, 'queue')), ['0001.md']);
 
   const s2 = await handle('Stop', stop(id, root, 'the real answer'), env);
   assert.deepEqual(s2.spawned, [CURATE, dir, '1', 'sonnet']);
@@ -250,7 +250,7 @@ test('HARNESS_PREFIXES: the five harness message shapes', () => {
 for (const prefix of [
   '<task-notification', '<agent-message', '<cross-session-message', '<teammate-message', '[SYSTEM NOTIFICATION',
 ]) {
-  test(`harness message ${prefix}: not a turn, no conversation file, change line injected`, async () => {
+  test(`harness message ${prefix}: not a turn, no queue file, change line injected`, async () => {
     const { root, env, dir, id } = await activeSession();
     const text = `${prefix} from="a1">\n  report text that must not be recorded as the user's\n`;
     const n = await handle('UserPromptSubmit', prompt(id, root, text), env);
@@ -258,7 +258,7 @@ for (const prefix of [
     const s = await readSession(dir);
     assert.equal(s.turn, 0);
     assert.equal(s.lastKind, 'notification');
-    assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), []);
+    assert.deepEqual(await fs.readdir(path.join(dir, 'queue')), []);
   });
 }
 
@@ -285,7 +285,7 @@ test('notification before any user turn: change line only; the Stop does nothing
   const st = await handle('Stop', stop(id, root, 'answer'), env);
   assert.equal(st.spawned, undefined);
   assert.equal((await readSession(dir)).turn, 0);
-  assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), []);
+  assert.deepEqual(await fs.readdir(path.join(dir, 'queue')), []);
 });
 
 // --- SubagentStop ---
@@ -342,6 +342,85 @@ test('CLI: SubagentStop prints the block JSON', async () => {
   assert.equal(r.code, 0);
   assert.equal(r.stderr, '');
   assert.deepEqual(JSON.parse(r.stdout), BLOCK_801);
+});
+
+// --- SubagentStop (offload index) ---
+
+const offloadsOf = (dir) => fs.readFile(path.join(dir, 'offloads.md'), 'utf8').catch((e) => (e.code === 'ENOENT' ? null : Promise.reject(e)));
+const ENTRY_HEAD = /^## t(\d+) (\S+) (\S+)\ntranscript: (.*)\n\n/gm;
+const entries = async (dir) => [...((await offloadsOf(dir)) ?? '').matchAll(ENTRY_HEAD)]
+  .map((m) => ({ turn: Number(m[1]), at: m[2], agent: m[3], transcript: m[4] }));
+
+test('SubagentStop: a short slate:offload return is recorded with turn, agent, transcript and text', async () => {
+  const { root, env, dir, id } = await activeSession();
+  await handle('UserPromptSubmit', prompt(id, root, 'find the callers'), env);
+  const r = await handle('SubagentStop', subStop(id, root, {
+    agent_id: 'a9f', agent_transcript_path: '/home/u/.claude/projects/p/s/subagents/agent-a9f.jsonl',
+    last_assistant_message: 'Found 3 callers.\nReport: reports/callers.md',
+  }), env);
+  assert.equal(r.output, null);
+  const [e, ...rest] = await entries(dir);
+  assert.deepEqual(rest, []);
+  assert.deepEqual({ ...e, at: undefined }, {
+    turn: 1, at: undefined, agent: 'a9f', transcript: '/home/u/.claude/projects/p/s/subagents/agent-a9f.jsonl',
+  });
+  assert.ok(!Number.isNaN(Date.parse(e.at)), e.at);
+  assert.ok((await offloadsOf(dir)).includes('\n> Found 3 callers.\n> Report: reports/callers.md\n'));
+});
+
+test('SubagentStop: a blocked return writes no entry; the rewrite that passes does', async () => {
+  const { root, env, dir, id } = await activeSession();
+  const blocked = await handle('SubagentStop', subStop(id, root), env);
+  assert.deepEqual(blocked.output, BLOCK_801);
+  assert.equal(await offloadsOf(dir), null);
+  await handle('SubagentStop', subStop(id, root, { stop_hook_active: true, last_assistant_message: 'short now' }), env);
+  assert.equal((await entries(dir)).length, 1);
+  assert.ok((await offloadsOf(dir)).includes('> short now\n'));
+});
+
+test('SubagentStop: other agents, no folder and unsafe agent IDs write no entry', async () => {
+  const { root, env, dir, id } = await activeSession();
+  for (const f of [{ agent_type: 'Explore' }, { agent_type: '' }, { agent_type: undefined }, { agent_id: '../x' },
+    { agent_id: undefined }, { agent_id: 42 }]) {
+    await handle('SubagentStop', subStop(id, root, { last_assistant_message: 'ok', ...f }), env);
+  }
+  assert.equal(await offloadsOf(dir), null);
+  const bare = await project();
+  await handle('SubagentStop', subStop('sid', bare.root, { last_assistant_message: 'ok' }), bare.env);
+  assert.equal(await exists(path.join(bare.root, '.slate')), false);
+});
+
+test('SubagentStop: no agent_transcript_path is written as none', async () => {
+  const { root, env, dir, id } = await activeSession();
+  await handle('SubagentStop', subStop(id, root, { last_assistant_message: 'ok' }), env);
+  assert.equal((await entries(dir))[0].transcript, 'none');
+});
+
+test('hand-back: the message PreToolUse lets through is the entry text', async () => {
+  const { root, env, dir, id } = await activeSession();
+  const agent = 'a435d85d2980fd4d2';
+  assert.equal((await handle('PreToolUse', handback(id, root, { tool_input: { message: 'Handed back: 2 bugs.' } }), env)).output, null);
+  await handle('SubagentStop', subStop(id, root, { agent_id: agent, last_assistant_message: undefined }), env);
+  const [e] = await entries(dir);
+  assert.equal(e.agent, agent);
+  assert.ok((await offloadsOf(dir)).includes('\n> Handed back: 2 bugs.\n'));
+});
+
+test('hand-back: denied once, then allowed: the entry holds the allowed message', async () => {
+  const { root, env, dir, id } = await activeSession();
+  const agent = 'a435d85d2980fd4d2';
+  assert.deepEqual((await handle('PreToolUse', handback(id, root), env)).output, DENY_801);
+  await handle('PreToolUse', handback(id, root, { tool_input: { message: 'second try' } }), env);
+  await handle('SubagentStop', subStop(id, root, { agent_id: agent, last_assistant_message: undefined }), env);
+  const text = await offloadsOf(dir);
+  assert.ok(text.includes('> second try\n'), text);
+  assert.ok(!text.includes('xxxx'));
+});
+
+test('hand-back: no saved message and no final text: entry says so', async () => {
+  const { root, env, dir, id } = await activeSession();
+  await handle('SubagentStop', subStop(id, root, { last_assistant_message: undefined }), env);
+  assert.ok((await offloadsOf(dir)).includes('> (no return text)\n'));
 });
 
 // --- PreToolUse (hand-back cap) ---
@@ -450,7 +529,7 @@ test('Stop before any turn: nothing', async () => {
   const r = await handle('Stop', stop(id, root, 'hello'), env);
   assert.equal(r.output, null);
   assert.equal(r.spawned, undefined);
-  assert.deepEqual(await fs.readdir(path.join(dir, 'conversation')), []);
+  assert.deepEqual(await fs.readdir(path.join(dir, 'queue')), []);
 });
 
 // --- PreCompact ---
@@ -616,7 +695,7 @@ async function assertAborted(dir, before, record) {
 }
 
 const lagNote = (dir, t) =>
-  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'conversation', `000${t}.md`)} before acting on recent instructions.`;
+  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'queue', `000${t}.md`)} before acting on recent instructions; a file that's gone was curated since, so reread the memory files.`;
 
 test('Important 2: /clear mid-curation aborts, moves, notes the missing turn and drains it in the new folder', async () => {
   const { root, env, dir: old, before } = await curatorMidEdit('old');
@@ -677,8 +756,8 @@ test('M2: SessionStart while a curator still holds the lock says memory is still
   const release = await acquire(dir);
   try {
     const r = await handle('SessionStart', start(id, root, 'compact'), env);
-    const file = path.join(dir, 'conversation', '0001.md');
-    assert.ok(ctx(r).includes(`\nslate: memory still updating; it may not include turn 1 yet — read ${file} before acting on recent instructions.\n`), ctx(r).slice(0, 400));
+    const file = path.join(dir, 'queue', '0001.md');
+    assert.ok(ctx(r).includes(`\nslate: memory still updating; it may not include turn 1 yet — read ${file} before acting on recent instructions; a file that's gone was curated since, so reread the memory files.\n`), ctx(r).slice(0, 400));
     assert.equal(r.spawned, undefined, 'the lock holder rechecks after its release');
   } finally {
     await release();
