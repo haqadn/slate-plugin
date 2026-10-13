@@ -38,8 +38,8 @@ Return text is written escaped so it can't fake an entry boundary.
 ## 2. Turn queue
 
 - `conversation/` is renamed `queue/`. Recording is unchanged: message on send, answer on Stop, continuation after a harness message.
-- A turn's file is deleted once it's curated, whatever the result: kept, restored, or errored twice. An aborted run leaves it queued.
-- A continuation that arrives after its turn was curated is queued on its own. The curator gets the answer only, marked as continuing that turn, and is told the message was already curated.
+- A turn's file is deleted once it's curated (kept, restored, or errored twice) and a newer turn exists. An aborted run, or a first error, leaves it queued.
+- The newest turn's file stays until the next turn, because a late follow-up (a background agent finishing) still appends to it. If it grows after curation, the whole turn is curated again, as today. Deleting it at once would race with that append.
 - The memory-lag line keeps pointing at queue files. They exist exactly while a turn is uncurated.
 - `rules.md` drops "read `conversation/NNNN.md` for exact wording".
 - Existing session folders: an old `conversation/` folder is left in place and ignored. Not migrated.
@@ -48,20 +48,24 @@ Return text is written escaped so it can't fake an entry boundary.
 
 Curator rules and safety check, memory files, injection budgets, lifecycle (`/clear` moves the folder with `offloads.md` and `queue/` inside), the return cap.
 
-## To verify first
+## Hand-back returns
 
-- `agent_transcript_path` is set, and the file exists, at SubagentStop for a foreground agent, a background agent, and a hand-back return.
-- Where the hand-back message can be read at SubagentStop time (the PreToolUse hook sees it; SubagentStop has no `last_assistant_message`).
+SubagentStop has no `last_assistant_message` after a hand-back. The PreToolUse hook already sees `SubagentHandback.message`; when it lets one through, it saves it as `handbacks/<agent_id>.return`, and SubagentStop reads that.
+
+## To verify (live run)
+
+- `agent_transcript_path` is set at SubagentStop for a background agent and for a hand-back return, and the file exists afterwards. Only the pointer is stored, so the file needn't exist yet when the hook runs.
+- An offload agent can read a transcript path from a brief (it sits outside the project).
 
 ## Testing
 
 - **Hook:** an entry is written for `slate:offload` only; not on a blocked stop; on the stop after it; with the hand-back message when there's no final text; return text can't break the entry format.
-- **Queue:** a turn file is deleted after `ok`, `restored` and a second `error`; kept after `aborted` and a first `error`; a late continuation is curated alone; the lag line names existing files.
+- **Queue:** a curated turn's file is deleted once a newer turn exists, after `ok`, `restored` and a second `error`; kept after `aborted` and a first `error`; the newest turn's file stays and a late continuation re-curates it; the lag line names existing files.
 - **Live acceptance:** one offload run leaves an entry whose transcript path exists and contains the run's tool calls. Existing checks still pass.
 
 ## Definition of done
 
 - Every `slate:offload` run in a slate session leaves one `offloads.md` entry with a working transcript path.
-- No user ↔ main turn file outlives its curation.
+- No user ↔ main turn file outlives its curation, except the newest turn's, until the next turn.
 - `rules.md`, `offload.md`, README layout table and the main spec reflect the change.
 - `npm test` passes; the live acceptance run passes, including the new check.
