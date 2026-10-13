@@ -409,7 +409,7 @@ async function turns(n, done) {
 }
 const size = async (dir, t) => (await fs.stat(path.join(dir, 'queue', `000${t}.md`))).size;
 const lag = (dir, t) =>
-  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'queue', `000${t}.md`)} before acting on recent instructions.`;
+  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'queue', `000${t}.md`)} before acting on recent instructions; a file that's gone was curated since, so reread the memory files.`;
 
 test('Important 2: memoryBlock notes the turn curation has not reached, right under the heading', async () => {
   const dir = await turns(3, null);
@@ -423,7 +423,7 @@ test('Important 2: several turns behind names the range; no curated.json counts 
   const dir = await turns(3, null);
   const b = await memoryBlock(dir, { afterCompact: false });
   const conv = path.join(dir, 'queue');
-  assert.ok(b.includes(`slate: memory may not include turns 1–3 yet — read ${conv}/0001.md to 0003.md before acting on recent instructions.`), b.slice(0, 400));
+  assert.ok(b.includes(`slate: memory may not include turns 1–3 yet — read ${conv}/0001.md to 0003.md before acting on recent instructions; a file that's gone was curated since, so reread the memory files.`), b.slice(0, 400));
 });
 
 test('Important 2: a continuation not yet curated reopens its turn', async () => {
@@ -446,7 +446,7 @@ test('M2: waiting says memory is still updating, with the turn it may lack', asy
   const dir = await turns(1, { turn: 0, size: 0 });
   const b = await memoryBlock(dir, { waiting: true });
   const file = path.join(dir, 'queue', '0001.md');
-  assert.ok(b.startsWith(`# slate memory\nslate: memory still updating; it may not include turn 1 yet — read ${file} before acting on recent instructions.\n`), b.slice(0, 400));
+  assert.ok(b.startsWith(`# slate memory\nslate: memory still updating; it may not include turn 1 yet — read ${file} before acting on recent instructions; a file that's gone was curated since, so reread the memory files.\n`), b.slice(0, 400));
   const fresh = await session();
   assert.ok((await memoryBlock(fresh, { waiting: true })).startsWith('# slate memory\nslate: memory still updating.\n'));
 });

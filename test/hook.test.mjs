@@ -695,7 +695,7 @@ async function assertAborted(dir, before, record) {
 }
 
 const lagNote = (dir, t) =>
-  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'queue', `000${t}.md`)} before acting on recent instructions.`;
+  `slate: memory may not include turn ${t} yet — read ${path.join(dir, 'queue', `000${t}.md`)} before acting on recent instructions; a file that's gone was curated since, so reread the memory files.`;
 
 test('Important 2: /clear mid-curation aborts, moves, notes the missing turn and drains it in the new folder', async () => {
   const { root, env, dir: old, before } = await curatorMidEdit('old');
@@ -757,7 +757,7 @@ test('M2: SessionStart while a curator still holds the lock says memory is still
   try {
     const r = await handle('SessionStart', start(id, root, 'compact'), env);
     const file = path.join(dir, 'queue', '0001.md');
-    assert.ok(ctx(r).includes(`\nslate: memory still updating; it may not include turn 1 yet — read ${file} before acting on recent instructions.\n`), ctx(r).slice(0, 400));
+    assert.ok(ctx(r).includes(`\nslate: memory still updating; it may not include turn 1 yet — read ${file} before acting on recent instructions; a file that's gone was curated since, so reread the memory files.\n`), ctx(r).slice(0, 400));
     assert.equal(r.spawned, undefined, 'the lock holder rechecks after its release');
   } finally {
     await release();

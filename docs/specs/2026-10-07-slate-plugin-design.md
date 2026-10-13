@@ -67,7 +67,7 @@ Long brainstorming and coding sessions without context rot:
 | Return cap (best-effort) | Sends an offload return over 800 chars back once, for a rewrite in ≤600 chars. Enforced on the final text by the SubagentStop hook (matcher `slate:offload`), and on `SubagentHandback.message` by the PreToolUse hook (matcher `SubagentHandback`; denies once per agent, marker `handbacks/<agent_id>`). Other return channels rely on the instruction in `offload.md`. |
 | Offload index | Each `slate:offload` stop that passes the cap appends an entry to `offloads.md`: turn, time, agent ID, `agent_transcript_path`, and the return (the final text, else the saved hand-back message). Return lines are quoted with `>`. |
 | Curator (`scripts/curate.mjs`) | Snapshot, then a `claude -p` edit pass, then the safety check, then keep or restore |
-| Agent `offload` | For slate sessions only; its description says to use it when the brief gives `.slate/` paths. Reads the memory files named in its brief and does the heavy task. Writes details to `reports/<slug>.md`, returns ≤10 lines, and never edits memory files. |
+| Agent `offload` | For slate sessions only; its description says to use it when the brief gives `.slate/` paths. Reads the memory files named in its brief and does the heavy task. Writes details to `reports/<slug>.md`, returns ≤10 lines, and never edits memory files. Given a past run's `.jsonl` transcript path, searches it with Grep, or Read with offset and limit. |
 | `rules.md` | One source for the main-thread rules. Used by the init skill and by the SessionStart block. |
 
 Every hook exits 0 immediately with no output if the session has no folder, or if `SLATE_CURATOR=1` is set (that is, it runs inside the curator). The one exception is SessionStart without a folder: it may first release the process ID (see Lifecycle), or move or copy a folder on `clear` and `fork`. Hooks never exit 2.
@@ -92,7 +92,7 @@ After injecting the block, SessionStart starts a curator drain if turns are left
 |---|---|---|
 | `/slate:init` | Rules plus the session folder path. Memory starts empty. | ~1–2k chars, once |
 | SessionStart (`resume`, `clear`, `compact`, `fork`) | Rules, then instructions, now, facts, assumptions | ≤10,000 chars (the hook cap). If over: instructions and now in full, facts and assumptions as file paths. |
-| SessionStart, when memory lags | One line under the heading: `slate: memory may not include turn N yet — read <dir>/queue/NNNN.md before acting on recent instructions.` (a range for several turns), prefixed `memory still updating;` when a curator still holds the lock after the wait | one line |
+| SessionStart, when memory lags | One line under the heading: `slate: memory may not include turn N yet — read <dir>/queue/NNNN.md before acting on recent instructions; a file that's gone was curated since, so reread the memory files.` (a range for several turns), prefixed `memory still updating;` when a curator still holds the lock after the wait | one line |
 | Each message | One-line reminder, plus changes since the last injection (`+I14 Use pnpm · retired I3`), or `memory still updating` while a curator holds the lock, plus any curator warnings | ~100–300 chars |
 | Each offload | The agent's summary | ≤10 lines |
 
@@ -106,13 +106,14 @@ Retired items appear only as IDs in the change line, never as text. `superseded.
 - Memory files are read-only for you and for subagents. The curator maintains them.
 - Memory files override earlier conversation where they differ.
 - Open `superseded.md` only to learn why something changed.
+- `offloads.md` lists past offloads. To dig into one, give `slate:offload` its transcript path.
 - Don't save notes to CLAUDE.md, AGENTS.md or any other memory file; slate keeps memory.
 
 ## Curator
 
 **Command:** `claude -p <prompt> --model <curatorModel> --setting-sources "" --settings '{"disableAllHooks":true}' --strict-mcp-config --disable-slash-commands --no-session-persistence --permission-mode dontAsk --tools Read,Edit,Write --allowedTools <rules>`. The rules are `Read(/<abs>)` and `Edit(/<abs>)` for each of the five memory files (realpath; an `Edit` rule also covers Write), so edit rights stop at those files. `--setting-sources ""` keeps allow rules from the user's settings out, and with them any `apiKeyHelper` auth. Env: `SLATE_CURATOR=1`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, without the parent session's identity variables. Stdin is ignored. It is spawned detached so it survives the hook returning. `curatorModel` is a plugin setting, default `sonnet`.
 
-**Queue (drain):** each Stop starts `curate.mjs`, which takes `curator.lock` and curates every pending turn in order. `curated.json` records the last turn done and its file size; a turn file that grew (a continuation) is curated again. The newest turn waits for its answer; an older one without an answer is curated with a placeholder. A drain that finds the lock held exits at once, and the holder rechecks the queue after releasing it. SIGTERM (from a `clear` or `fork` SessionStart) aborts the run: the edit is undone, `aborted` is logged and the turn stays queued.
+**Queue (drain):** each Stop starts `curate.mjs`, which takes `curator.lock` and curates every pending turn in order. `curated.json` records the last turn done and its file size; a turn file that grew (a continuation) is curated again. Once a turn is done, its file is deleted if a newer turn already existed when the turn was picked; only the newest turn's file can still grow. The newest turn waits for its answer; an older one without an answer is curated with a placeholder. A drain that finds the lock held exits at once, and the holder rechecks the queue after releasing it. SIGTERM (from a `clear` or `fork` SessionStart) aborts the run: the edit is undone, `aborted` is logged and the turn stays queued.
 
 **Input:** the curator rules, the turn number, the message verbatim, the final answer, and the paths of the memory files (it reads them itself).
 

@@ -101,7 +101,8 @@ const nowLines = (text, retired) =>
 
 // One line when memory may lag the conversation: turns not curated yet (say a /clear aborted the
 // curator), or `waiting`, a curator still holding the lock. The conversation is gone after a
-// /clear, so the line points at the queued turn files, which stay until they're curated.
+// /clear, so the line points at the queued turn files. The drain may delete them once curated,
+// hence the line's tail.
 async function lagLine(dir, waiting) {
   const p = await pendingTurns(dir);
   if (!p) return waiting ? 'slate: memory still updating.' : '';
@@ -110,7 +111,7 @@ async function lagLine(dir, waiting) {
   const what = p.from === p.to
     ? `turn ${p.to} yet — read ${path.join(conv, file(p.to))}`
     : `turns ${p.from}–${p.to} yet — read ${path.join(conv, file(p.from))} to ${file(p.to)}`;
-  return `slate: ${waiting ? 'memory still updating; it' : 'memory'} may not include ${what} before acting on recent instructions.`;
+  return `slate: ${waiting ? 'memory still updating; it' : 'memory'} may not include ${what} before acting on recent instructions; a file that's gone was curated since, so reread the memory files.`;
 }
 
 export async function memoryBlock(dir, { afterCompact = false, waiting = false } = {}) {

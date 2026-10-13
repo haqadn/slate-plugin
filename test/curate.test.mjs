@@ -662,3 +662,16 @@ test('queue: a continuation appended while the newest turn is curated is kept an
   assert.deepEqual(await queueFiles(dir), ['0001.md']);
   assert.deepEqual(await curated(dir), { turn: 1, size: await turnSize(dir, 1) });
 });
+
+test('queue: a follow-up appended mid-curation, then a new turn, is curated before its file is swept', async () => {
+  const { dir, record } = await queued('sleep', 1);
+  process.env.FAKE_SLEEP_MS = '500';
+  const running = drain({ dir, bin: FAKE });
+  await until(async () => (await calls(record)).length === 1);
+  await appendContinuation(dir, 1, 'late follow-up'); // a background agent finishes
+  await addTurn(dir, 2, { answered: false }); // then the user sends turn 2
+  const r = await running;
+  assert.deepEqual(runTurns(r), [[1, true], [1, true]]);
+  assert.ok((await calls(record))[1].prompt.includes('answer 1\n\nlate follow-up'));
+  assert.deepEqual(await queueFiles(dir), ['0002.md']);
+});
