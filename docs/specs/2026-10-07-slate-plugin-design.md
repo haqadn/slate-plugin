@@ -37,7 +37,10 @@ Long brainstorming and coding sessions without context rot:
     superseded.md     retired items, append-only
     conversation/     NNNN.md per turn: message (written on send) + answer (written on stop)
     reports/          <slug>.md written by offload agents
-    curator.log       warnings and rejected curator edits
+    handbacks/        <agent_id> markers: offload hand-backs already sent back once (return cap)
+    curated.json      curator queue mark: last curated turn, its file size, and a turn to retry after an error
+    curator.log       one line per curator result: ok, retry, restored, error, aborted
+                      (restored and error show as warnings; aborted = requeued, not shown)
     curator.lock      present while a curator runs (holds its pid)
 ```
 
@@ -51,26 +54,31 @@ Long brainstorming and coding sessions without context rot:
 
 | Part | Job |
 |---|---|
-| Skill `init` (`/slate:init`) | Runs the init script for this session. Creates the folder and `session.json`, plus `.slate/.gitignore` if `.slate/` is new. Loads the rules into context. If the folder already exists, says slate is already active. |
+| Skill `init` (`/slate:init`) | Only the user can run it (`disable-model-invocation`). Runs the init script for this session. Creates the folder and `session.json`, plus `.slate/.gitignore` if `.slate/` is new. Loads the rules into context. If the folder already exists, says slate is already active. |
 | SessionStart hook (`startup\|resume\|clear\|compact\|fork`) | Handles the folder (see Lifecycle). If this session has a folder, injects the memory block. |
-| UserPromptSubmit hook | Waits up to 20s for a running curator. Increments the turn and writes the message verbatim to `conversation/NNNN.md`. Injects the change line. |
-| Stop hook | Appends `last_assistant_message` to `conversation/NNNN.md`. Starts the curator detached, then returns immediately. |
+| UserPromptSubmit hook | Waits up to 20s for a running curator. Increments the turn and writes the message verbatim to `conversation/NNNN.md`. Injects the change line. Two kinds of prompt are not turns: `/slate:` commands (nothing recorded, no output), and harness messages (`<task-notification`, `<agent-message`, `<cross-session-message`, `<teammate-message`, `[SYSTEM NOTIFICATION`), whose following answer is appended to the current turn as a continuation. |
+| Stop hook | Appends `last_assistant_message` to `conversation/NNNN.md`. Starts a curator drain detached, then returns immediately. |
 | PreCompact hook | Waits up to 60s for a running curator. Never blocks compaction. |
+| Return cap (best-effort) | Sends an offload return over 800 chars back once, for a rewrite in ≤600 chars. Enforced on the final text by the SubagentStop hook (matcher `slate:offload`), and on `SubagentHandback.message` by the PreToolUse hook (matcher `SubagentHandback`; denies once per agent, marker `handbacks/<agent_id>`). Other return channels rely on the instruction in `offload.md`. |
 | Curator (`scripts/curate.mjs`) | Snapshot, then a `claude -p` edit pass, then the safety check, then keep or restore |
-| Agent `offload` | Reads the memory files named in its brief and does the heavy task. Writes details to `reports/<slug>.md`, returns ≤10 lines, and never edits memory files. |
+| Agent `offload` | For slate sessions only; its description says to use it when the brief gives `.slate/` paths. Reads the memory files named in its brief and does the heavy task. Writes details to `reports/<slug>.md`, returns ≤10 lines, and never edits memory files. |
 | `rules.md` | One source for the main-thread rules. Used by the init skill and by the SessionStart block. |
 
-Every hook exits 0 immediately if the session has no folder, or if `SLATE_CURATOR=1` is set (that is, it runs inside the curator). Hooks never exit 2.
+Every hook exits 0 immediately with no output if the session has no folder, or if `SLATE_CURATOR=1` is set (that is, it runs inside the curator). The one exception is SessionStart without a folder: it may first release the process ID (see Lifecycle), or move or copy a folder on `clear` and `fork`. Hooks never exit 2.
 
 ## Lifecycle
 
 | Event | Action |
 |---|---|
-| `startup` | New session ID, no folder, nothing to do |
-| `resume` | Same ID, so the folder already exists. Inject the block. |
-| `clear` | New session ID. Find the folder whose `session.json` holds the current Claude Code process ID, rename it to the new ID, record `from`, inject the block. If none matches, do nothing. |
+| `startup` | New session ID, no folder. Release the current Claude Code process ID: set `pid` to null in any folder holding it. |
+| `resume` | Same ID. With a folder: write the current process ID into `session.json` (a `--resume` runs in a new process), release it from every other folder, inject the block. Without a folder (an in-process `/resume` to a session without slate): release the process ID, as for `startup`. |
+| `clear` | New session ID. Find the folder whose `session.json` holds the current process ID, abort its running curator if it doesn't finish within 20s, rename the folder to the new ID, record `from`, inject the block. If none matches, do nothing. |
 | `compact` | Same ID. Inject the block, headed "Memory below wins where it differs from the summary." |
-| `fork` | New ID. Copy the parent's folder if the parent can be identified (see To verify). Otherwise do nothing; the user can run `/slate:init`. |
+| `fork` | New ID. Find the parent's folder by process ID as for `clear` (an in-process `/branch` keeps the process). Abort its running curator if it doesn't finish within 5s, copy the folder, inject the block. No match (`--fork-session`, a new process): do nothing; the user can run `/slate:init`. |
+
+A folder without a pid is never matched. Releasing the pid keeps `/clear` and `/branch` from moving or copying a folder into a session that switched away from it.
+
+After injecting the block, SessionStart starts a curator drain if turns are left uncurated and no curator holds the lock (for example, the turn a `/clear` aborted). The drain starts after the block is built, so the block never reads an unchecked edit.
 
 ## What enters the main thread
 
@@ -78,7 +86,8 @@ Every hook exits 0 immediately if the session has no folder, or if `SLATE_CURATO
 |---|---|---|
 | `/slate:init` | Rules plus the session folder path. Memory starts empty. | ~1–2k chars, once |
 | SessionStart (`resume`, `clear`, `compact`, `fork`) | Rules, then instructions, now, facts, assumptions | ≤10,000 chars (the hook cap). If over: instructions and now in full, facts and assumptions as file paths. |
-| Each message | One-line reminder, plus changes since the last injection (`+I14 Use pnpm · retired I3`), plus any curator warnings | ~100–300 chars |
+| SessionStart, when memory lags | One line under the heading: `slate: memory may not include turn N yet — read <dir>/conversation/NNNN.md before acting on recent instructions.` (a range for several turns), prefixed `memory still updating;` when a curator still holds the lock after the wait | one line |
+| Each message | One-line reminder, plus changes since the last injection (`+I14 Use pnpm · retired I3`), or `memory still updating` while a curator holds the lock, plus any curator warnings | ~100–300 chars |
 | Each offload | The agent's summary | ≤10 lines |
 
 Retired items appear only as IDs in the change line, never as text. `superseded.md`, `conversation/` and `reports/` are opened only on demand.
@@ -95,7 +104,9 @@ Retired items appear only as IDs in the change line, never as text. `superseded.
 
 ## Curator
 
-**Command:** `claude -p --model <curatorModel> --settings '{"disableAllHooks":true}' --strict-mcp-config --disable-slash-commands --no-session-persistence --tools Read,Edit,Write`, with edit rights limited to the five memory files. Env: `SLATE_CURATOR=1`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. It is spawned detached so it survives the hook returning. `curatorModel` is a plugin setting, default `sonnet`.
+**Command:** `claude -p <prompt> --model <curatorModel> --setting-sources "" --settings '{"disableAllHooks":true}' --strict-mcp-config --disable-slash-commands --no-session-persistence --permission-mode dontAsk --tools Read,Edit,Write --allowedTools <rules>`. The rules are `Read(/<abs>)` and `Edit(/<abs>)` for each of the five memory files (realpath; an `Edit` rule also covers Write), so edit rights stop at those files. `--setting-sources ""` keeps allow rules from the user's settings out, and with them any `apiKeyHelper` auth. Env: `SLATE_CURATOR=1`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, without the parent session's identity variables. Stdin is ignored. It is spawned detached so it survives the hook returning. `curatorModel` is a plugin setting, default `sonnet`.
+
+**Queue (drain):** each Stop starts `curate.mjs`, which takes `curator.lock` and curates every pending turn in order. `curated.json` records the last turn done and its file size; a turn file that grew (a continuation) is curated again. The newest turn waits for its answer; an older one without an answer is curated with a placeholder. A drain that finds the lock held exits at once, and the holder rechecks the queue after releasing it. SIGTERM (from a `clear` or `fork` SessionStart) aborts the run: the edit is undone, `aborted` is logged and the turn stays queued.
 
 **Input:** the curator rules, the turn number, the message verbatim, the final answer, and the paths of the memory files (it reads them itself).
 
@@ -104,7 +115,7 @@ Retired items appear only as IDs in the change line, never as text. `superseded.
 - An I item is a standing rule for future turns ("always", "from now on", "never", preferences). A one-off request goes in `now`.
 - Never reword an existing item. To change one, move its line to `superseded.md` as `retired t<N>` with a reason, then add a new item.
 - A new item states only the current rule, without naming what it replaced, unless the user's instruction is itself a prohibition.
-- New IDs take the next number for their type. Facts need a source.
+- New IDs take the next number for their type. Facts need a source, and never point to a report file or a `.slate/` path (the folder is renamed on `/clear`).
 - Adopt plain user bullets with `t0`, text unchanged.
 - `now.md` stays at 10 lines or fewer. If nothing changed, change nothing.
 
@@ -112,12 +123,12 @@ Retired items appear only as IDs in the change line, never as text. `superseded.
 1. Every ID live before is live after with identical text, or is in `superseded.md` with identical text, `retired t<N>` and a non-empty reason.
 2. `superseded.md` only gained lines.
 3. New IDs are unique, above the previous maximum for their type, and tagged `t<N>`.
-4. Every plain user bullet from before still exists word for word, adopted or not.
-5. All memory files parse, and `now.md` has 10 lines or fewer.
+4. Every plain user bullet from before still exists word for word, adopted or not. Trailing whitespace doesn't count, for plain lines only; item text compares exactly.
+5. All memory files parse, and `now.md` has 10 lines or fewer. A new line in an item file that carries retired text (a retired-style tag, or a note like `(retired I1)`) fails as a malformed item line; injection never shows such lines.
 
 Hooks may write `conversation/` and `session.json` while a curator runs, so the check covers only the five memory files. The curator's permissions keep it out of everything else, and a restore rewrites only those five files.
 
-On failure, retry once with the failures listed. If it fails again, restore the snapshot, log to `curator.log`, and show a warning in the next change line. A lock held by a dead pid is taken over.
+On failure, retry once with the failures listed. If it fails again, restore the snapshot, log `restored` to `curator.log`, and show a warning in the next change line; the turn is done. A run that errors (crash, timeout, missing binary) is logged as `error`, shown as a warning, and stays queued once: the next drain, or the same drain if a Stop came in meanwhile, retries it, and a second error marks it done. A lock held by a dead pid is taken over.
 
 ## Install
 
@@ -160,6 +171,8 @@ The repo is `~/Projects/slate-plugin`, laid out as a local marketplace: `.claude
 - **Session IDs:** `/clear` starts a new session ID; compaction keeps it.
 
 ## To verify during implementation
+
+All answered in `docs/verified.md`.
 
 - How `/slate:init` gets its session ID: does skill content support `${CLAUDE_SESSION_ID}`? Otherwise, the UserPromptSubmit hook can catch the `/slate:init` prompt.
 - How to find the Claude Code process ID from a hook: the ancestor process chain.

@@ -1,0 +1,16 @@
+{
+  "name": "slate",
+  "version": "0.1.0",
+  "description": "Keeps the main thread small: offloads heavy work to subagents and keeps instructions, facts and focus in curated per-session files that survive /clear and compaction.",
+  "author": {
+    "name": "Adnan"
+  },
+  "userConfig": {
+    "curatorModel": {
+      "type": "string",
+      "title": "Curator model",
+      "description": "Model the background curator runs on",
+      "default": "sonnet"
+    }
+  }
+}
