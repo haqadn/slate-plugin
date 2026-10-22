@@ -2,6 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ITEM_FILES, MEMORY_FILES, RETIRED_LIKE, parseMemoryFile, formatItem } from './items.mjs';
 import { readSession, writeSession, readMemory, pendingTurns } from './session.mjs';
+import { memoryPath, slateOf, readTopics, topicPath } from './slate.mjs';
+import { ERROR_KINDS } from './apply.mjs';
 
 // Nothing here ever puts superseded.md text into output. Retired texts are read only to filter lines out.
 
@@ -10,31 +12,17 @@ const RULES_FILE = new URL('../../rules.md', import.meta.url);
 const COMPACT_LINE = 'Memory below wins where it differs from the summary.';
 const REMINDER = 'slate: offload heavy reads to slate:offload; reply briefly.';
 const MAX_ADDS = 5;
+const MAX_TOPICS = 3; // topics named in a change line
 const MAX_WARNINGS = 5;
 const WARNING_CHARS = 200; // before the "(see …curator.log)" tail
 // Change-line order: as in the memory block (instructions, facts, assumptions).
 const TYPE_ORDER = ['I', 'F', 'A'];
-const LOG_LINE = /^\S+ (t\d+) (restored|error)(?::(.*))?$/;
-// Violation kinds from check.mjs messages. A warning echoes only these fixed labels, plus the ID
-// of an `${id} <kind>` message, and only from text outside quotes.
-const ID_KINDS = [
-  ['reworded', 'reworded'],
-  ['deleted', 'deleted'],
-  ['retired at t\\d+', 'wrong retire turn'],
-  ['retired without reason', 'no retire reason'],
-  ['retired line outside superseded\\.md', 'retired line misplaced'],
-  ['live item in superseded\\.md', 'live item in superseded.md'],
-  ['duplicated', 'duplicated'],
-  ['not above previous max', 'ID not above max'],
-  ['tagged t\\d+', 'wrong turn tag'],
-].map(([p, label]) => [new RegExp(`(?<![\\w-])([IAF]\\d+) ${p}(?!\\w)`, 'g'), (m) => `${m[1]} ${label}`]);
-const FIXED_KINDS = [
-  [/superseded\.md lost line/g, () => 'superseded line lost'],
-  [/plain line lost/g, () => 'plain line lost'],
-  [/heading lost/g, () => 'heading lost'],
-  [/malformed item line/g, () => 'malformed line'],
-  [/\b(instructions|assumptions|facts|now|superseded)\.md missing\b/g, (m) => `${m[1]}.md missing`],
-  [/\bnow\.md has \d+ lines/g, () => 'now.md too long'],
+const LOG_LINE = /^\S+ (t\d+) (partial|error)(?::(.*))?$/;
+// Error kinds of apply.mjs tokens (`<op index>:<kind>[ <ID>]`). A warning echoes only these fixed
+// labels, plus a stale token's ID, and only from text outside quotes.
+const KINDS = [
+  [/(?<![\w-])\d+:stale ([IAF]\d+)(?!\w)/g, (m) => `stale ${m[1]}`],
+  ...ERROR_KINDS.map((k) => [new RegExp(`(?<![\\w-])\\d+:${k}(?![\\w-])`, 'g'), () => k]),
 ];
 const QUOTES = new Map([['"', '"'], ["'", "'"], ['`', '`'], ['\u201c', '\u201d'], ['\u201d', '\u201d'],
   ['\u2018', '\u2019'], ['\u2019', '\u2019']]);
@@ -43,7 +31,8 @@ const clip = (s, n) => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
 
 export async function rulesText(dir) {
   const text = await fs.readFile(RULES_FILE, 'utf8');
-  return dir === undefined ? text : text.replaceAll('{{dir}}', () => dir);
+  if (dir === undefined) return text;
+  return text.replaceAll('{{slate}}', () => slateOf(dir)).replaceAll('{{session}}', () => dir);
 }
 
 function liveItems(memory) {
@@ -52,8 +41,11 @@ function liveItems(memory) {
   return out;
 }
 
-function seenOf(items) {
+// What a session has been shown: each key item's text, and each topic item's ID (null: a topic
+// item's text is never shown).
+function seenOf(items, topics) {
   const seen = {};
+  for (const t of topics) for (const it of t.items) seen[it.id] = null;
   for (const type of TYPE_ORDER) for (const it of items[type]) seen[it.id] = it.text;
   return seen;
 }
@@ -95,6 +87,16 @@ function liveLines(text, retired) {
   return [...p.items.map(formatItem).filter((l) => !RETIRED_LIKE.test(l)), ...p.plain.filter(safeText(retired))];
 }
 
+// One topic index line, `- <slug>.md — <title>: <summary> (<count>)`, the file named within the
+// topics folder the index names once. `summary` false leaves the summary out. A title or summary
+// carrying retired text is left out, and the line is just the file and count.
+const indexLine = (safe, summary) => (t) => {
+  const label = [t.title, t.summary].filter(Boolean).every(safe)
+    ? ` — ${t.title}${summary && t.summary ? `: ${t.summary}` : ''}`
+    : '';
+  return `- ${t.slug}.md${label} (${t.items.length})`;
+};
+
 // now.md is free text: every non-blank line, in order, headings included.
 const nowLines = (text, retired) =>
   String(text).split(/\r?\n/).filter((l) => l.trim() !== '').filter(safeText(retired));
@@ -116,6 +118,7 @@ async function lagLine(dir, waiting) {
 
 export async function memoryBlock(dir, { afterCompact = false, waiting = false } = {}) {
   const memory = await readMemory(dir);
+  const topics = await readTopics(slateOf(dir));
   const lag = await lagLine(dir, waiting);
   const head = ['# slate memory', afterCompact && COMPACT_LINE, lag].filter(Boolean).join('\n');
   const rules = (await rulesText(dir)).trim();
@@ -129,11 +132,24 @@ export async function memoryBlock(dir, { afterCompact = false, waiting = false }
     const lines = file === 'now.md' ? nowLines(memory[file], retired) : liveLines(memory[file], retired);
     return { title, file, lines, body: lines.join('\n') };
   });
+  // The topics folder once, then a line per topic file.
+  const topicIndex = (summary) => (topics.length
+    ? [`Topic files, in ${path.join(slateOf(dir), 'topics')}/:`, ...topics.map(indexLine(safeText(retired), summary))].join('\n')
+    : '');
+  sections.push({ title: 'Topics', file: 'topics', body: topicIndex(true) });
   const byFile = Object.fromEntries(sections.map((s) => [s.file, s]));
   const render = () =>
     [head, rules, ...sections.filter((s) => s.body).map((s) => `# ${s.title}\n${s.body}`)].join('\n\n');
-  const where = (s) => path.join(dir, s.file);
+  const where = (s) => memoryPath(dir, s.file);
 
+  // Over budget: the topic index shrinks first, to titles (no summaries), then to slugs and counts;
+  // then facts and assumptions spill.
+  if (render().length > MAX) byFile.topics.body = topicIndex(false);
+  if (render().length > MAX && topics.length) {
+    const each = topicPath(slateOf(dir), '<slug>');
+    const counts = topics.map((t) => `${t.slug} (${t.items.length})`).join(', ');
+    byFile.topics.body = `${topics.length} topics, each in ${each}: ${counts}`;
+  }
   for (const file of ['facts.md', 'assumptions.md']) {
     if (render().length <= MAX) break;
     const s = byFile[file];
@@ -159,7 +175,7 @@ export async function memoryBlock(dir, { afterCompact = false, waiting = false }
   const out = clip(render(), MAX);
 
   const session = await readSession(dir);
-  session.seen = seenOf(liveItems(memory));
+  session.seen = seenOf(liveItems(memory), topics);
   await writeSession(dir, session);
   return out;
 }
@@ -181,19 +197,19 @@ function outsideQuotes(s) {
   return out;
 }
 
-// One warning line from known-safe tokens only: turn, status, violation kinds (with their IDs).
+// One warning line from known-safe tokens only: turn, status, error kinds (with their IDs).
 // Free text from the log is never echoed; it can quote superseded.md in any form.
 function warningLine(turn, status, detail, log) {
   const text = outsideQuotes(detail);
   const found = [];
-  for (const [re, label] of [...ID_KINDS, ...FIXED_KINDS]) {
+  for (const [re, label] of KINDS) {
     for (const m of text.matchAll(re)) found.push([m.index, label(m)]);
   }
   const what = [...new Set(found.sort((a, b) => a[0] - b[0]).map(([, l]) => l))].join(', ');
   return `slate warning: ${clip(`${turn} ${status}${what ? `: ${what}` : ''}`, WARNING_CHARS)} (see ${log})`;
 }
 
-// curator.log lines `<ISO> t<N> <status>: <detail>` not yet shown, restored/error only.
+// curator.log lines `<ISO> t<N> <status>: <detail>` not yet shown, partial/error only.
 // Only complete lines are consumed; session.logSeen holds the byte offset already read.
 async function newWarnings(dir, session) {
   const log = path.join(dir, 'curator.log');
@@ -221,10 +237,11 @@ export async function changeLine(dir, { waiting = false } = {}) {
   const session = await readSession(dir);
   const entries = [];
 
-  // While the curator runs, memory files hold unchecked edits that may be restored: diff later.
+  // While the curator runs, memory is about to change: diff later.
   if (!waiting) {
     const items = liveItems(await readMemory(dir));
-    const live = seenOf(items);
+    const topics = await readTopics(slateOf(dir));
+    const live = seenOf(items, topics);
     const hidden = new Set();
     let shown = 0;
     let more = 0;
@@ -246,9 +263,16 @@ export async function changeLine(dir, { waiting = false } = {}) {
       if (gone.length) entries.push(`retired ${gone.join(', ')}`);
     }
     if (more) {
-      const [first, ...rest] = [...hidden];
-      entries.push(`+${more} more (see ${[path.join(dir, first), ...rest].join(', ')})`);
+      entries.push(`+${more} more (see ${[...hidden].map((f) => memoryPath(dir, f)).join(', ')})`);
     }
+    // Topic items are counted, not shown: IDs never seen, by topic, the most first (ties by slug:
+    // topics come sorted and the sort is stable). An ID seen anywhere before was moved, not added.
+    const added = topics.map((t) => [t.slug, t.items.filter((it) => !(it.id in session.seen)).length])
+      .filter(([, n]) => n > 0)
+      .sort((a, b) => b[1] - a[1]);
+    entries.push(...added.slice(0, MAX_TOPICS).map(([slug, n]) => `+${n} in ${slug}`));
+    const rest = added.slice(MAX_TOPICS).reduce((sum, [, n]) => sum + n, 0);
+    if (rest) entries.push(`+${rest} more`);
     session.seen = live;
   } else {
     entries.push('memory still updating');

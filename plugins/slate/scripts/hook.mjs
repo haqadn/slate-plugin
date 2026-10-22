@@ -6,20 +6,21 @@ import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  sessionDir, readSession, writeSession, findByPid, moveSession, copySession, setPid, releasePid, claudePid,
+  readSession, writeSession, findByPid, moveSession, copySession, setPid, releasePid, claudePid,
   nextTurn, writeMessage, appendAnswer, appendContinuation, pendingTurns, appendOffload, atomicWrite,
 } from './lib/session.mjs';
 import { waitFree, lockHolder } from './lib/lock.mjs';
+import { slateHome, findSession, slateAccess, sweepSessions } from './lib/slate.mjs';
 import { memoryBlock, changeLine } from './lib/inject.mjs';
 
 const CURATE = fileURLToPath(new URL('./curate.mjs', import.meta.url));
 const START_WAIT_MS = 20000; // SessionStart, and clear before aborting a curator
 const FORK_WAIT_MS = 5000; // fork before aborting a curator
-const ABORT_WAIT_MS = 5000; // for an aborted curator to undo its edit and release
+const ABORT_WAIT_MS = 5000; // for an aborted curator to log and release
 const PROMPT_WAIT_MS = 20000;
 const COMPACT_WAIT_MS = 60000;
 const MAX_WAIT_MS = 25000;
-// A session ID becomes a folder name; anything that could leave .slate/ is not ours.
+// A session ID becomes a folder name; anything that could leave .sessions/ is not ours.
 const SAFE_ID = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
 // Prompts the harness injects (a background agent finishing, a subagent hand-back, messages from
 // other sessions or teammates, system notices). They continue the current turn; they are never
@@ -30,11 +31,11 @@ export const HARNESS_PREFIXES = [
 const isHarness = (prompt) => HARNESS_PREFIXES.some((p) => prompt.startsWith(p));
 // Tools a subagent can return through instead of a final text answer; hooks.json matches these.
 export const HANDBACK_TOOLS = ['SubagentHandback'];
+// Tools whose paths inside the session's slate are allowed without a prompt; hooks.json matches these.
+const ACCESS_TOOLS = ['Read', 'Write', 'Edit', 'Grep', 'Glob'];
 const OFFLOAD_AGENT = 'slate:offload';
 const RETURN_LIMIT = 800; // chars; above this an offload return is sent back once for a rewrite
 
-const exists = (p) => fs.access(p).then(() => true, () => false);
-const hasFolder = (dir) => exists(path.join(dir, 'session.json'));
 
 // How long to wait for a running curator: `fallback`, or SLATE_WAIT_MS (for tests), at most 25s.
 export function curatorWaitMs(env, fallback) {
@@ -53,9 +54,9 @@ function isCurator(pid) {
 }
 
 // Before a folder is moved or copied, its curator must be gone: once the folder moves, the
-// curator's restore and log would target the old path and an unchecked edit would be kept.
-// Wait; then SIGTERM the holder if it is a curator (it undoes its edit and releases); wait again.
-async function settle(dir, waitMs) {
+// curator's apply and log would target the old path.
+// Wait; then SIGTERM the holder if it is a curator (it applies nothing and releases); wait again.
+export async function settle(dir, waitMs) {
   if (await waitFree(dir, waitMs)) return;
   const pid = await lockHolder(dir);
   if (pid && isCurator(pid)) {
@@ -67,7 +68,7 @@ async function settle(dir, waitMs) {
 }
 
 // CLAUDE_PID from the given env, else claudePid()'s own lookup (process env, then the ancestors).
-function currentPid(env) {
+export function currentPid(env) {
   const n = Number(env.CLAUDE_PID);
   return Number.isInteger(n) && n > 0 ? n : claudePid();
 }
@@ -80,16 +81,20 @@ async function setKind(dir, kind) {
   await writeSession(dir, s);
 }
 
-async function sessionStart(input, root, dir, env) {
+// `dir` is the session's folder, or null when it isn't linked to a slate. A /clear or fork lands in
+// the old session's slate, as a sibling folder.
+async function sessionStart(input, home, dir, env) {
   const source = input.source;
-  if (!(await hasFolder(dir))) {
+  if (dir === null) {
     const pid = currentPid(env);
     if (!pid) return { output: null };
     // This process now runs a session without a folder: no folder may keep its pid.
-    if (source === 'startup' || source === 'resume') await releasePid(root, pid);
+    if (source === 'startup' || source === 'resume') await releasePid(home, pid);
     if (source !== 'clear' && source !== 'fork') return { output: null };
-    const found = await findByPid(root, pid);
-    if (!found || found === dir) return { output: null };
+    const found = await findByPid(home, pid);
+    if (!found) return { output: null };
+    dir = path.join(path.dirname(found), input.session_id);
+    if (found === dir) return { output: null };
     if (source === 'clear') {
       await settle(found, curatorWaitMs(env, START_WAIT_MS));
       await moveSession(found, dir);
@@ -103,14 +108,14 @@ async function sessionStart(input, root, dir, env) {
     const pid = currentPid(env);
     if (pid) {
       await setPid(dir, pid);
-      await releasePid(root, pid, dir);
+      await releasePid(home, pid, dir);
     }
   }
   const free = await waitFree(dir, curatorWaitMs(env, START_WAIT_MS));
   const output = context('SessionStart', await memoryBlock(dir, { afterCompact: source === 'compact', waiting: !free }));
   // Turns left uncurated, e.g. by a curator aborted above before the move or copy: drain them now
-  // rather than at the next Stop. Only after the block, so it never reads a curator's unchecked
-  // edit; and only when the lock is free, since a holder rechecks the queue after its release.
+  // rather than at the next Stop. Only after the block, so the block is read before that curator
+  // changes memory; and only when the lock is free, since a holder rechecks the queue after its release.
   const pending = free ? await pendingTurns(dir) : null;
   return pending ? { output, spawned: spawnCurator(dir, pending.to, env) } : { output };
 }
@@ -123,7 +128,7 @@ async function userPromptSubmit(input, dir, env) {
   }
   if (isHarness(prompt)) {
     // E.g. a background agent finished; the answer that follows continues the current turn. Don't
-    // wait, but don't diff memory a running curator may still restore either.
+    // wait, but don't diff memory a running curator is about to change either.
     await setKind(dir, 'notification');
     const waiting = !(await waitFree(dir, 0));
     return { output: context('UserPromptSubmit', await changeLine(dir, { waiting })) };
@@ -134,7 +139,7 @@ async function userPromptSubmit(input, dir, env) {
   return { output: context('UserPromptSubmit', await changeLine(dir, { waiting })) };
 }
 
-function spawnCurator(dir, turn, env) {
+export function spawnCurator(dir, turn, env) {
   const model = env.CLAUDE_PLUGIN_OPTION_CURATORMODEL || 'sonnet';
   const args = [CURATE, dir, String(turn), model];
   const child = spawn(process.execPath, args, { detached: true, stdio: 'ignore', env });
@@ -190,6 +195,14 @@ async function subagentStop(input, dir) {
 // handbacks/<agent_id> makes the agent's next hand-back go through, whatever its length. A message
 // let through is saved as handbacks/<agent_id>.return for the offloads.md entry.
 async function preToolUse(input, dir) {
+  if (ACCESS_TOOLS.includes(input.tool_name)) {
+    if (slateAccess(input.tool_name, input.tool_input, dir) !== 'allow') return { output: null };
+    return {
+      output: {
+        hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'slate folder' },
+      },
+    };
+  }
   const text = input.tool_input?.message;
   const agent = input.agent_id;
   if (input.agent_type !== OFFLOAD_AGENT || !HANDBACK_TOOLS.includes(input.tool_name) || typeof text !== 'string') {
@@ -225,15 +238,19 @@ export async function handle(event, input, env = process.env) {
   // SubagentStop and a subagent's PreToolUse carry its agent_id; any other event with one fired
   // inside a subagent.
   if (input.agent_id && event !== 'SubagentStop' && event !== 'PreToolUse') return { output: null };
-  const root = env.CLAUDE_PROJECT_DIR || input.cwd;
   const id = input.session_id;
-  if (!root || typeof id !== 'string' || !SAFE_ID.test(id)) return { output: null };
-  const dir = sessionDir(root, id);
+  if (typeof id !== 'string' || !SAFE_ID.test(id)) return { output: null };
+  const home = slateHome(env);
+  const dir = await findSession(home, id);
 
-  if (event === 'SubagentStop') return (await hasFolder(dir)) ? subagentStop(input, dir) : { output: null };
-  if (event === 'PreToolUse') return (await hasFolder(dir)) ? preToolUse(input, dir) : { output: null };
-  if (event === 'SessionStart') return sessionStart(input, root, dir, env);
-  if (!(await hasFolder(dir))) return { output: null };
+  if (event === 'SessionStart') {
+    // Housekeeping, so it runs unlinked too. Only at startup, never on the session's own folder.
+    if (input.source === 'startup') await sweepSessions(home, { keep: dir }).catch(() => {});
+    return sessionStart(input, home, dir, env);
+  }
+  if (dir === null) return { output: null };
+  if (event === 'SubagentStop') return subagentStop(input, dir);
+  if (event === 'PreToolUse') return preToolUse(input, dir);
   switch (event) {
     case 'UserPromptSubmit':
       return userPromptSubmit(input, dir, env);

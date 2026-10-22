@@ -8,12 +8,14 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { runCurator, drain, resolveClaudeBin, CURATOR_ENV_DENY } from '../plugins/slate/scripts/curate.mjs';
+import { CHANGE_SCHEMA, applyChanges } from '../plugins/slate/scripts/lib/apply.mjs';
+import { slateOf, memoryPath } from '../plugins/slate/scripts/lib/slate.mjs';
+import { initSession } from './helpers.mjs';
 import {
-  initSession, writeMessage, appendAnswer, appendContinuation, readMemory, writeMemory, readSession, writeSession,
+  writeMessage, appendAnswer, appendContinuation, readMemory, writeMemory, readSession, writeSession,
 } from '../plugins/slate/scripts/lib/session.mjs';
 import { acquire } from '../plugins/slate/scripts/lib/lock.mjs';
 import { MEMORY_FILES } from '../plugins/slate/scripts/lib/items.mjs';
-import { checkCuratorEdit } from '../plugins/slate/scripts/lib/check.mjs';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-claude.mjs', import.meta.url));
 const SHIM = fileURLToPath(new URL('./fixtures/fake-claude-shim.sh', import.meta.url));
@@ -48,7 +50,8 @@ afterEach(() => {
 
 const INSTRUCTIONS = '# Instructions\n- [I1 t1] use npm\n- prefer tabs\n';
 const SUPERSEDED = '# Superseded\n- [I2 t1 retired t1] use yarn (reason: user chose npm)\n';
-const GOOD_INSTRUCTIONS = `${INSTRUCTIONS}- [I3 t2] fake item\n`;
+// The fake's add for turn 2, after the apply step adopted the plain bullet as I3.
+const GOOD_INSTRUCTIONS = '# Instructions\n- [I1 t1] use npm\n- [I3 t0] prefer tabs\n- [I4 t2@sid] fake item 2\n';
 const TURN = 2;
 
 async function setup(mode, { message = 'switch to pnpm', answer = 'Done, using pnpm.' } = {}) {
@@ -87,7 +90,7 @@ async function logLines(dir) {
   }
 }
 function assertLog(line, status) {
-  const m = /^(\S+) t(\d+) (ok|retry|restored|error): (.*)$/.exec(line);
+  const m = /^(\S+) t(\d+) (ok|retry|partial|error): (.*)$/.exec(line);
   assert.ok(m, `bad log line: ${line}`);
   assert.ok(!Number.isNaN(Date.parse(m[1])), `bad timestamp: ${m[1]}`);
   assert.equal(new Date(m[1]).toISOString(), m[1]);
@@ -98,7 +101,7 @@ function assertLog(line, status) {
 const lockGone = async (dir) => !(await exists(path.join(dir, 'curator.lock')));
 const flag = (args, name) => args[args.indexOf(name) + 1];
 
-test('command: prompt first, every flag, path-scoped rules, env, cwd, stdin ignored', async () => {
+test('command: prompt first, every flag, read-only path-scoped rules, the change schema, env, cwd, stdin ignored', async () => {
   const { root, dir, record } = await setup('good');
   process.env.SLATE_TEST_INHERITED = 'yes';
   const r = await runCurator({ dir, turn: TURN, bin: FAKE });
@@ -116,20 +119,25 @@ test('command: prompt first, every flag, path-scoped rules, env, cwd, stdin igno
     assert.ok(args.includes(f), f);
   }
   assert.equal(flag(args, '--permission-mode'), 'dontAsk');
-  assert.equal(flag(args, '--tools'), 'Read,Edit,Write');
+  assert.equal(flag(args, '--tools'), 'Read');
+  assert.equal(flag(args, '--output-format'), 'json');
+  assert.deepEqual(JSON.parse(flag(args, '--json-schema')), CHANGE_SCHEMA);
+  for (const a of args.slice(2)) assert.doesNotMatch(a, /\b(Edit|Write)\b/, 'no write tool or rule');
 
   const real = realpathSync(dir);
   if (process.platform === 'darwin') assert.notEqual(real, dir, 'tmpdir goes through a symlink on macOS');
-  const rules = MEMORY_FILES.flatMap((f) => [`Read(/${path.join(real, f)})`, `Edit(/${path.join(real, f)})`]);
-  // --allowedTools is variadic, so it comes last and takes exactly the ten rules.
+  const rules = MEMORY_FILES.map((f) => `Read(/${memoryPath(real, f)})`);
+  for (const rule of rules) assert.match(rule, /^Read\(\/\/.+\.md\)$/);
+  rules.push(`Read(/${path.join(slateOf(real), 'topics')}/**)`);
+  // --allowedTools is variadic, so it comes last and takes exactly the five file rules and the topics rule.
   assert.deepEqual(args.slice(args.indexOf('--allowedTools') + 1), rules);
-  for (const rule of rules) assert.match(rule, /^(Read|Edit)\(\/\/.+\.md\)$/);
+  assert.match(rules.at(-1), /^Read\(\/\/.+\/topics\/\*\*\)$/);
   assert.ok(args.indexOf('--tools') < args.indexOf('--allowedTools'));
 
   assert.equal(env.SLATE_CURATOR, '1');
   assert.equal(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1');
   assert.equal(env.SLATE_TEST_INHERITED, 'yes');
-  assert.equal(call.cwd, realpathSync(root));
+  assert.equal(call.cwd, slateOf(real));
   assert.equal(call.stdinRdev, statSync('/dev/null').rdev);
 });
 
@@ -157,13 +165,12 @@ test('prompt: rules, turn, full message, capped answer, five absolute paths', as
 
   assert.ok(prompt.includes((await fs.readFile(RULES, 'utf8')).trim()), 'rules');
   assert.ok(prompt.includes('Current turn: 2'), 'turn');
-  assert.ok(prompt.includes('Adopted plain bullets get `t0`.'), 'adoption tag');
   assert.ok(prompt.includes(message), 'message verbatim');
   assert.ok(prompt.includes('a'.repeat(12000)), 'answer kept up to the cap');
   assert.ok(!prompt.includes('ANSWER_TAIL'), 'answer capped');
   assert.ok(prompt.includes('[answer truncated]'));
   const real = realpathSync(dir);
-  for (const f of MEMORY_FILES) assert.ok(prompt.includes(path.join(real, f)), f);
+  for (const f of MEMORY_FILES) assert.ok(prompt.includes(memoryPath(real, f)), f);
 });
 
 test('prompt: a short answer is passed whole, without a truncation note', async () => {
@@ -232,62 +239,86 @@ test('bin: runCurator uses CLAUDE_CODE_EXECPATH, read before it is stripped from
   assert.ok(!('CLAUDE_CODE_EXECPATH' in env));
 });
 
-test('good: keeps the edit, logs ok, releases the lock', async () => {
+test('good: applies the change list, logs ok, releases the lock', async () => {
   const { dir, record, before } = await setup('good');
   const r = await runCurator({ dir, turn: TURN, bin: FAKE });
-  assert.deepEqual(r, { ok: true, attempts: 1, violations: [] });
+  assert.deepEqual(r, { ok: true, attempts: 1, errors: [] });
   const now = await readMemory(dir);
   assert.equal(now['instructions.md'], GOOD_INSTRUCTIONS);
   for (const f of MEMORY_FILES) if (f !== 'instructions.md') assert.equal(now[f], before[f], f);
   const log = await logLines(dir);
   assert.equal(log.length, 1);
-  assertLog(log[0], 'ok');
+  assert.equal(assertLog(log[0], 'ok'), 'attempt 1: applied adopt I3, 0:add I4');
   assert.equal((await calls(record)).length, 1);
   assert.ok(await lockGone(dir));
 });
 
-test('bad: retries once, then restores the snapshot byte for byte and logs restored', async () => {
-  const { dir, record, before } = await setup('bad');
+test('invalid twice: the retry applies the valid ops, drops the rest and logs partial', async () => {
+  const { dir, record, before } = await setup('invalid');
   const r = await runCurator({ dir, turn: TURN, bin: FAKE });
-  assert.deepEqual(r, { ok: false, attempts: 2, violations: ['I1 reworded'] });
-  assert.deepEqual(await readMemory(dir), before);
+  assert.deepEqual(r, { ok: false, attempts: 2, errors: ['1:no source'], partial: true });
+  const now = await readMemory(dir);
+  assert.equal(now['instructions.md'], GOOD_INSTRUCTIONS);
+  for (const f of MEMORY_FILES) if (f !== 'instructions.md') assert.equal(now[f], before[f], f);
   const log = await logLines(dir);
   assert.equal(log.length, 2);
-  assert.match(assertLog(log[0], 'retry'), /I1 reworded/);
-  assert.match(assertLog(log[1], 'restored'), /I1 reworded/);
+  assert.equal(assertLog(log[0], 'retry'), '1:no source');
+  assert.equal(assertLog(log[1], 'partial'), '1:no source; applied adopt I3, 0:add I4');
   assert.equal((await calls(record)).length, 2);
   assert.ok(await lockGone(dir));
 });
 
-test('bad-then-good: keeps the second attempt; its prompt carries the first violations', async () => {
-  const { dir, record } = await setup('bad-then-good');
+test('invalid-then-good: the first list applies nothing; the retry prompt lists its errors', async () => {
+  const { dir, record } = await setup('invalid-then-good');
   const r = await runCurator({ dir, turn: TURN, bin: FAKE });
-  assert.deepEqual(r, { ok: true, attempts: 2, violations: [] });
-  // I1 is intact, so the first (reworded) edit was undone before the retry.
+  assert.deepEqual(r, { ok: true, attempts: 2, errors: [] });
   assert.equal((await readMemory(dir))['instructions.md'], GOOD_INSTRUCTIONS);
   const [first, second] = await calls(record);
+  assert.equal(second.seen, INSTRUCTIONS, 'memory as it was, not even an adoption');
   assert.ok(!first.prompt.includes('rejected'));
-  assert.ok(second.prompt.endsWith('Your previous edit was rejected and undone: I1 reworded. Fix and retry.'));
   assert.ok(second.prompt.startsWith(first.prompt));
+  const note = second.prompt.slice(first.prompt.length);
+  assert.ok(note.includes('rejected') && note.includes('1:no source'), note);
+  assert.ok(note.includes('Memory may have changed since your read; reread the files'), note);
   const log = await logLines(dir);
   assert.equal(log.length, 2);
-  assert.match(assertLog(log[0], 'retry'), /I1 reworded/);
-  assertLog(log[1], 'ok');
+  assert.equal(assertLog(log[0], 'retry'), '1:no source');
+  assert.equal(assertLog(log[1], 'ok'), 'attempt 2: applied adopt I3, 0:add I4');
   assert.ok(await lockGone(dir));
 });
 
+test('stale: another session changed the item first; the retry rereads and replaces the newer one', async () => {
+  const { dir, record } = await setup('stale');
+  const r = await runCurator({ dir, turn: TURN, bin: FAKE });
+  assert.deepEqual(r, { ok: true, attempts: 2, errors: [] });
+  const [first, second] = await calls(record);
+  assert.ok(first.seen.includes('- [I1 t1] use npm'));
+  assert.ok(second.seen.includes('- [I4 t3@0ther000] use bun'), "the retry read the other session's item");
+  assert.ok(second.prompt.includes('0:stale I1'));
+  const now = await readMemory(dir);
+  assert.equal(now['instructions.md'], '# Instructions\n- [I5 t0] prefer tabs\n- [I6 t2@sid] use pnpm\n');
+  assert.equal(now['superseded.md'], `${SUPERSEDED}` +
+    '- [I1 t1 retired t3@0ther000] use npm (reason: other session chose bun)\n' +
+    '- [I4 t3@0ther000 retired t2@sid] use bun (reason: user switched to pnpm)\n');
+  const log = await logLines(dir);
+  assert.equal(assertLog(log[0], 'retry'), '0:stale I1');
+  assertLog(log[1], 'ok');
+});
+
 for (const [name, mode, bin] of [
-  ['fail (edits, then exits 1)', 'fail', FAKE],
+  ['fail (exits 1)', 'fail', FAKE],
+  ['output that is not JSON', 'garbage', FAKE],
+  ['a result without structured_output', 'no-structured', FAKE],
   ['a binary that does not exist', 'good', '/nonexistent/slate-claude'],
 ]) {
-  test(`${name}: logs error, leaves files unchanged, releases the lock, does not throw`, async () => {
+  test(`${name}: logs error, leaves memory unchanged, releases the lock, does not throw`, async () => {
     const { dir, before } = await setup(mode);
     const r = await runCurator({ dir, turn: TURN, bin });
     assert.equal(r.ok, false);
     assert.equal(r.attempts, 1);
-    assert.equal(r.violations.length, 1);
-    assert.match(r.violations[0], /^error: /);
-    assert.equal(r.error, true, 'an error, not a rejected edit: the drain retries it once');
+    assert.equal(r.errors.length, 1);
+    assert.match(r.errors[0], /^error: /);
+    assert.equal(r.error, true, 'an error, not a partial apply: the drain retries it once');
     assert.deepEqual(await readMemory(dir), before);
     const log = await logLines(dir);
     assert.equal(log.length, 1);
@@ -301,7 +332,7 @@ test('timeout: kills the child, logs error: timeout, leaves files unchanged', as
   const t0 = Date.now();
   const r = await runCurator({ dir, turn: TURN, bin: FAKE, timeoutMs: 1000 });
   assert.ok(Date.now() - t0 < 2500, 'returned before the fake finished sleeping');
-  assert.deepEqual(r, { ok: false, attempts: 1, violations: ['error: timeout'], error: true });
+  assert.deepEqual(r, { ok: false, attempts: 1, errors: ['error: timeout'], error: true });
   const log = await logLines(dir);
   assert.equal(log.length, 1);
   assert.equal(assertLog(log[0], 'error'), 'timeout');
@@ -314,9 +345,9 @@ test('timeout: kills the child, logs error: timeout, leaves files unchanged', as
 test('timeout under a shim that does not exec: the whole group dies, no late edit', async () => {
   const { dir, record, before } = await setup('sleep');
   const r = await runCurator({ dir, turn: TURN, bin: SHIM, timeoutMs: 1000 });
-  assert.deepEqual(r, { ok: false, attempts: 1, violations: ['error: timeout'], error: true });
+  assert.deepEqual(r, { ok: false, attempts: 1, errors: ['error: timeout'], error: true });
   assert.ok(await lockGone(dir));
-  await new Promise((res) => setTimeout(res, 3000)); // the fake would have edited by now
+  await new Promise((res) => setTimeout(res, 3000)); // the fake would have answered by now
   assert.deepEqual(await readMemory(dir), before);
   const [{ pid }] = await calls(record);
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
@@ -336,25 +367,12 @@ test('a process outside the group holding stderr open does not keep the runner w
   }
 });
 
-test('restore is byte for byte and keeps an absent file absent', async () => {
-  const { dir } = await setup('fail');
-  const odd = Buffer.concat([
-    Buffer.from('﻿# Instructions\r\n- [I1 t1] use npm\r\n- caf'), Buffer.from([0xff]), Buffer.from('\r\n'),
-  ]);
-  await fs.writeFile(path.join(dir, 'instructions.md'), odd);
-  await fs.rm(path.join(dir, 'now.md'));
-  const r = await runCurator({ dir, turn: TURN, bin: FAKE });
-  assert.equal(r.ok, false);
-  assert.ok((await fs.readFile(path.join(dir, 'instructions.md'))).equals(odd));
-  assert.ok(!(await exists(path.join(dir, 'now.md'))), 'now.md stays absent');
-});
-
 test('lock held: returns without running and without logging', async () => {
   const { dir, record, before } = await setup('good');
   const release = await acquire(dir);
   try {
     const r = await runCurator({ dir, turn: TURN, bin: FAKE });
-    assert.deepEqual(r, { ok: false, attempts: 0, violations: ['locked'] });
+    assert.deepEqual(r, { ok: false, attempts: 0, errors: ['locked'] });
     assert.deepEqual(await calls(record), []);
     assert.deepEqual(await logLines(dir), []);
     assert.deepEqual(await readMemory(dir), before);
@@ -364,44 +382,47 @@ test('lock held: returns without running and without logging', async () => {
   }
 });
 
-test("curator-rules.md: the worked example passes the safety check", async () => {
+test("curator-rules.md: the worked example's change list applies as the example says", async () => {
   const rules = await fs.readFile(RULES, 'utf8');
-  const old = '- [I1 t1] use npm';
-  const added = '- [I2 t4] use pnpm';
-  const retired = '- [I1 t1 retired t4] use npm (reason: user switched to pnpm)';
-  for (const line of [old, added, retired]) assert.ok(rules.includes(`\n${line}\n`), line);
-  const empty = { 'assumptions.md': '# Assumptions\n', 'facts.md': '# Facts\n', 'now.md': '' };
-  const before = { ...empty, 'instructions.md': `# Instructions\n${old}\n`, 'superseded.md': '# Superseded\n' };
-  const afterEdit = {
-    ...empty,
-    'instructions.md': `# Instructions\n${added}\n`,
-    'superseded.md': `# Superseded\n${retired}\n`,
-  };
-  assert.deepEqual(checkCuratorEdit(before, afterEdit, 4), []);
+  const before = '- [I1 t1@82b3114c] use npm';
+  const added = '- [I2 t4@9f0e1a2b] use pnpm';
+  const retired = '- [I1 t1@82b3114c retired t4@9f0e1a2b] use npm (reason: user switched to pnpm)';
+  for (const line of [before, added, retired]) assert.ok(rules.includes(`\n${line}\n`), line);
+  const { ops } = JSON.parse(/```json\n(.*)\n```/.exec(rules)[1]);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'slate-curate-'));
+  temps.push(root);
+  const { dir } = await initSession(root, '9f0e1a2b-session', 1);
+  await writeMemory(dir, { 'instructions.md': `# Instructions\n${before}\n` });
+  const r = await applyChanges(dir, ops, { turn: 4, sessionId: '9f0e1a2b-session' });
+  assert.deepEqual(r.errors, []);
+  const mem = await readMemory(dir);
+  assert.equal(mem['instructions.md'], `# Instructions\n${added}\n`);
+  assert.equal(mem['superseded.md'], `# Superseded\n${retired}\n`);
 });
 
 test('curator-rules.md: wording the curator relies on', async () => {
   const rules = await fs.readFile(RULES, 'utf8');
   for (const s of [
-    "Every item line you don't retire stays exactly as it is.",
-    'To retire a plain user bullet (no ID), adopt it as `- [<ID> t0] <exact text>` and retire that ID in the same edit.',
+    'Instructions are shared by every session',
+    '"For wpcom#249668: never touch X"',
     '"use the staging DB for this"',
-    'If `now.md` is over 10 lines, shorten it.',
-    'Never store a fact that points to a report file or a `.slate/` path',
+    'Never write an ID for a new item.',
+    'Name an existing ID only to retire, replace or move it, or in `relevant`.',
+    'Always return `relevant`',
+    'lasting project knowledge',
+    'never in a key file',
+    'most sessions need on most turns',
+    'Every key `add` names its home topic',
+    'never retire it and add it again',
+    'reread the files and decide again',
+    'Never cite a report',
+    // Live acceptance (Task 8): with "the topic files this turn touches", the curator never opened
+    // general.md and returned an empty `relevant` for a turn whose answer repeated a fact kept there.
+    'before deciding, read every topic file whose title or summary matches the turn\'s subject, and `topics/general.md`',
+    'every fact and assumption, key or topic, that the message or the answer used or depends on',
   ]) assert.ok(rules.includes(s), s);
-});
-
-test('retiring a plain user bullet by adopting it at t0 passes the safety check', () => {
-  const empty = { 'assumptions.md': '# Assumptions\n', 'facts.md': '# Facts\n', 'now.md': '' };
-  const before = {
-    ...empty, 'instructions.md': '# Instructions\n- [I1 t1] use npm\n- prefer tabs\n', 'superseded.md': '# Superseded\n',
-  };
-  const afterEdit = {
-    ...empty,
-    'instructions.md': '# Instructions\n- [I1 t1] use npm\n- [I3 t2] use spaces\n',
-    'superseded.md': '# Superseded\n- [I2 t0 retired t2] prefer tabs (reason: user switched to spaces)\n',
-  };
-  assert.deepEqual(checkCuratorEdit(before, afterEdit, 2), []);
+  assert.ok(!rules.includes('the topic files this turn touches'), 'reading topics is not left to a guess');
+  for (const s of ['Edit', 'Write', '.slate/', 'rejected']) assert.ok(!rules.includes(s), `no ${s}`);
 });
 
 test('CLI: node curate.mjs <dir> <turn> [model] drains the queue', async () => {
@@ -478,7 +499,7 @@ test('drain: three turns queued while the lock is held are all curated, in order
   assert.deepEqual(await promptTurns(record), [1, 2, 3]);
   assert.deepEqual(await logTurns(dir), ['t1 ok', 't2 ok', 't3 ok']);
   assert.equal((await readMemory(dir))['instructions.md'],
-    '# Instructions\n- [I1 t1] fake item\n- [I2 t2] fake item\n- [I3 t3] fake item\n');
+    '# Instructions\n- [I1 t1@sid] fake item 1\n- [I2 t2@sid] fake item 2\n- [I3 t3@sid] fake item 3\n');
   assert.deepEqual(await curated(dir), { turn: 3, size: await turnSize(dir, 3) });
   assert.deepEqual(await queueFiles(dir), ['0003.md'], 'curated turns are swept; the newest stays');
   assert.ok(await lockGone(dir));
@@ -534,20 +555,20 @@ test('M6: a turn that ends in error is retried once on the next drain, then mark
   assert.deepEqual(await promptTurns(record), [1, 1, 2, 2, 3]);
 });
 
-test('M6: a retry that succeeds keeps its edit; a restored turn is never retried', async () => {
+test('M6: a retry that succeeds keeps its change; a partial turn is never retried', async () => {
   const { dir } = await queued('fail', 1);
   assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, false]]);
   process.env.FAKE_MODE = 'good';
   assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, true]]);
   assert.deepEqual(await curated(dir), { turn: 1, size: await turnSize(dir, 1) });
-  assert.equal((await readMemory(dir))['instructions.md'], '# Instructions\n- [I1 t1] fake item\n');
+  assert.equal((await readMemory(dir))['instructions.md'], '# Instructions\n- [I1 t1@sid] fake item 1\n');
 
-  process.env.FAKE_MODE = 'bad'; // rewords I1: rejected twice, restored
+  process.env.FAKE_MODE = 'invalid'; // an unsourced fact, twice: dropped, the rest applied
   await addTurn(dir, 2);
   assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[2, false]]);
   assert.deepEqual(await curated(dir), { turn: 2, size: await turnSize(dir, 2) }, 'marked done at once');
   assert.deepEqual((await drain({ dir, bin: FAKE })).runs, []);
-  assert.deepEqual(await logTurns(dir), ['t1 error', 't1 ok', 't2 retry', 't2 restored']);
+  assert.deepEqual(await logTurns(dir), ['t1 error', 't1 ok', 't2 retry', 't2 partial']);
 });
 
 test('M6: a drain asked for while a turn errors retries it at once, then moves on', async () => {
@@ -588,13 +609,13 @@ test('drain: work added just before the release is picked up by the recheck', as
   assert.ok(await lockGone(dir));
 });
 
-test('CLI: SIGTERM aborts mid-edit: kills claude, restores, logs aborted, releases, turn stays queued', async () => {
+test('CLI: SIGTERM aborts mid-run: kills claude, applies nothing, logs aborted, releases, turn stays queued', async () => {
   const { dir, record, before } = await queued('hang', 1);
   const child = spawn(process.execPath, [CURATE, dir, '1', 'sonnet'], {
     env: { ...process.env, SLATE_CLAUDE_BIN: FAKE }, stdio: 'ignore',
   });
   const exited = new Promise((r) => child.on('exit', (code, signal) => r({ code, signal })));
-  await until(async () => (await readMemory(dir))['instructions.md'].includes('fake item'));
+  await until(async () => (await calls(record)).length === 1);
   const t0 = Date.now();
   child.kill('SIGTERM');
   const { code, signal } = await exited;
@@ -625,22 +646,22 @@ test('queue: a parked turn keeps its file; the retry curates it and sweeps it', 
   assert.deepEqual(await queueFiles(dir), ['0002.md']);
 });
 
-test('queue: a restored turn is swept once a newer turn exists', async () => {
-  const { dir } = await queued('bad', 2);
-  await writeMemory(dir, { 'instructions.md': '# Instructions\n- [I1 t0] keep me\n' });
+test('queue: a partial turn is swept once a newer turn exists', async () => {
+  const { dir } = await queued('invalid', 2);
   assert.deepEqual(runTurns(await drain({ dir, bin: FAKE })), [[1, false], [2, false]]);
-  assert.deepEqual(await logTurns(dir), ['t1 retry', 't1 restored', 't2 retry', 't2 restored']);
+  assert.deepEqual(await logTurns(dir), ['t1 retry', 't1 partial', 't2 retry', 't2 partial']);
   assert.deepEqual(await queueFiles(dir), ['0002.md']);
 });
 
 test('queue: an aborted turn keeps its file', async () => {
-  const { dir } = await queued('hang', 2);
+  const { dir, record, before } = await queued('hang', 2);
   const ac = new AbortController();
   const running = drain({ dir, bin: FAKE, signal: ac.signal });
-  await until(async () => (await readMemory(dir))['instructions.md'].includes('fake item'));
+  await until(async () => (await calls(record)).length === 1);
   ac.abort();
   const r = await running;
   assert.equal(r.aborted, true);
+  assert.deepEqual(await readMemory(dir), before, 'nothing applied');
   assert.deepEqual(await queueFiles(dir), ['0001.md', '0002.md']);
   assert.equal(await curated(dir), null);
 });
@@ -674,4 +695,51 @@ test('queue: a follow-up appended mid-curation, then a new turn, is curated befo
   assert.deepEqual(runTurns(r), [[1, true], [1, true]]);
   assert.ok((await calls(record))[1].prompt.includes('answer 1\n\nlate follow-up'));
   assert.deepEqual(await queueFiles(dir), ['0002.md']);
+});
+
+test('a slate deleted while its curator runs: the apply fails and nothing is recreated', async () => {
+  const { dir, record } = await queued('sleep', 1);
+  process.env.FAKE_SLEEP_MS = '500';
+  const running = drain({ dir, bin: FAKE }).catch(() => null);
+  await until(async () => (await calls(record)).length === 1);
+  await fs.rm(slateOf(dir), { recursive: true });
+  await running;
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(await exists(slateOf(dir)), false);
+});
+
+// --- topics and relevance ---
+
+test('prompt: lists the key files and the topic index with slug, title, summary, count and path', async () => {
+  const { dir, record } = await setup('good');
+  const topics = path.join(slateOf(dir), 'topics');
+  await fs.mkdir(topics);
+  await fs.writeFile(path.join(topics, 'build.md'), '# Build\n> How it builds.\n- [F7 t1] uses vite (user)\n');
+  await runCurator({ dir, turn: TURN, bin: FAKE });
+  const [{ prompt }] = await calls(record);
+  const real = realpathSync(dir);
+  for (const f of MEMORY_FILES) assert.ok(prompt.includes(`- ${memoryPath(real, f)}\n`), f);
+  assert.ok(prompt.includes(`- build: Build — How it builds. (1 items) ${path.join(slateOf(real), 'topics', 'build.md')}\n`), prompt);
+});
+
+test('prompt: no topics yet says so', async () => {
+  const { dir, record } = await setup('good');
+  await runCurator({ dir, turn: TURN, bin: FAKE });
+  const [{ prompt }] = await calls(record);
+  assert.ok(prompt.includes('Topics: none yet.'), prompt.slice(-1500));
+});
+
+test('relevant: passed through to the apply; demotions are logged on the ok line and are not warnings', async () => {
+  const { dir } = await setup('relevant');
+  const big = `- [F5 t1] ${'x'.repeat(2950)} (user)`;
+  await writeMemory(dir, { 'facts.md': `# Facts\n- [F1 t1] Node 24 (package.json)\n${big}\n` });
+  const r = await runCurator({ dir, turn: TURN, bin: FAKE });
+  assert.deepEqual(r, { ok: true, attempts: 1, errors: [] });
+  const log = await logLines(dir);
+  assert.equal(assertLog(log[0], 'ok'), 'attempt 1: applied adopt I3, 0:add F6; demoted F5>general');
+  const usage = JSON.parse(await fs.readFile(path.join(slateOf(dir), 'usage.json'), 'utf8'));
+  assert.equal(usage.F1.count, 1, 'F1 was relevant');
+  assert.equal(usage.F6.home, 'general');
+  assert.ok(!('F99' in usage), 'an unknown ID is ignored');
+  assert.ok((await fs.readFile(path.join(slateOf(dir), 'topics', 'general.md'), 'utf8')).includes(big));
 });

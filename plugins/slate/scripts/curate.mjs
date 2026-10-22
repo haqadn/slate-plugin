@@ -1,24 +1,27 @@
-// Curator runner: snapshot the five memory files, let a fresh `claude -p` edit them, then keep the
-// edit only if the safety check passes. One retry with the violations; otherwise restore.
+// Curator runner: a fresh, read-only `claude -p` reads memory and returns a change list, which
+// applyChanges (lib/apply.mjs) applies. Errors go back to the model once; the retry's valid ops
+// apply and the rest are dropped with a `partial` warning.
 // CLI: node curate.mjs <dir> <turn> [model]. It drains every pending turn of the session; <turn> is
-// advisory. SIGTERM aborts: the running edit is undone and that turn stays queued.
+// advisory. SIGTERM aborts: nothing from the running turn is applied and that turn stays queued.
 import fs from 'node:fs/promises';
 import { realpathSync, statSync, accessSync, constants } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  writeMemory, readTurn, readSession, readCurated, turnState, atomicWrite, queueFile, sweepQueue,
+  readTurn, readSession, readCurated, turnState, atomicWrite, queueFile, sweepQueue,
 } from './lib/session.mjs';
 import { acquire } from './lib/lock.mjs';
-import { checkCuratorEdit } from './lib/check.mjs';
+import { applyChanges, CHANGE_SCHEMA } from './lib/apply.mjs';
 import { MEMORY_FILES } from './lib/items.mjs';
+import { memoryPath, slateOf, listTopics } from './lib/slate.mjs';
 
 const RULES_FILE = new URL('../curator-rules.md', import.meta.url);
 const ANSWER_MAX = 12000;
 const MESSAGE_MAX = 100_000; // keeps argv well under ARG_MAX (E2BIG)
 const TIMEOUT_MS = 300_000;
 const STDERR_MAX = 300;
+const STDOUT_MAX = 1_000_000;
 const STDERR_GRACE_MS = 500;
 const MAX_ATTEMPTS = 2;
 const NO_ANSWER = '[no answer: turn was interrupted]';
@@ -36,7 +39,7 @@ export const CURATOR_ENV_DENY = [
   'CLAUDE_CODE_SSE_PORT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_ENV_FILE', 'CLAUDE_EFFORT',
 ];
 
-function curatorEnv(env) {
+export function curatorEnv(env) {
   const out = { ...env };
   for (const k of CURATOR_ENV_DENY) delete out[k];
   out.SLATE_CURATOR = '1';
@@ -70,7 +73,11 @@ function cap(text, max, note) {
   return `${text.slice(0, cut)}\n${note}`;
 }
 
-function buildPrompt({ rules, turn, real, message, answer }) {
+// The topic index: one line per topic with its slug, title, summary, item count and path.
+export const topicLine = (t) => `- ${t.slug}: ${t.title}${t.summary ? ` — ${t.summary}` : ''} (${t.count} items) ${t.path}`;
+const topicLines = (topics) => (topics.length ? ['Topics:', ...topics.map(topicLine)] : ['Topics: none yet.']);
+
+function buildPrompt({ rules, turn, real, topics, message, answer }) {
   const turnFile = queueFile(real, turn);
   return [
     rules.trim(),
@@ -78,10 +85,11 @@ function buildPrompt({ rules, turn, real, message, answer }) {
     '# This turn',
     '',
     `Current turn: ${turn}`,
-    `New items get \`t${turn}\`. Retired lines get \`retired t${turn}\`. Adopted plain bullets get \`t0\`.`,
     '',
     'Memory files:',
-    ...MEMORY_FILES.map((f) => `- ${path.join(real, f)}`),
+    ...MEMORY_FILES.map((f) => `- ${memoryPath(real, f)}`),
+    '',
+    ...topicLines(topics),
     '',
     "The user's message, verbatim:",
     '<message>',
@@ -96,12 +104,12 @@ function buildPrompt({ rules, turn, real, message, answer }) {
 }
 
 // Order and rule syntax per docs/verified.md section 5: the prompt goes right after -p, before
-// the variadic --tools / --allowedTools. An Edit(//abs) rule also covers Write.
+// the variadic --tools / --allowedTools. Read only: the change list comes back on stdout.
 function curatorArgs(prompt, model, real) {
-  const rules = MEMORY_FILES.flatMap((f) => {
-    const abs = path.join(real, f);
-    return [`Read(/${abs})`, `Edit(/${abs})`];
-  });
+  const rules = [
+    ...MEMORY_FILES.map((f) => `Read(/${memoryPath(real, f)})`),
+    `Read(/${path.join(slateOf(real), 'topics')}/**)`,
+  ];
   return [
     '-p', prompt,
     '--model', model,
@@ -111,7 +119,9 @@ function curatorArgs(prompt, model, real) {
     '--disable-slash-commands',
     '--no-session-persistence',
     '--permission-mode', 'dontAsk',
-    '--tools', 'Read,Edit,Write',
+    '--output-format', 'json',
+    '--json-schema', JSON.stringify(CHANGE_SCHEMA),
+    '--tools', 'Read',
     '--allowedTools', ...rules,
   ];
 }
@@ -128,8 +138,9 @@ function killGroup(child) {
   }
 }
 
-// Resolves null on success, ABORTED once `signal` fires, else a one-line error detail. Never rejects.
-function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
+// Resolves `{ error, stdout }`: error is null on success, ABORTED once `signal` fires, else a
+// one-line detail. Never rejects.
+export function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
   return new Promise((resolve) => {
     let child;
     let timer;
@@ -138,22 +149,24 @@ function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
     let settled = false;
     let timedOut = false;
     let aborted = false;
+    let stdout = '';
     let stderr = '';
     const onAbort = () => {
       aborted = true;
       if (child) killGroup(child);
       if (exit) finish(ABORTED);
     };
-    const finish = (detail) => {
+    const finish = (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(grace);
       signal?.removeEventListener('abort', onAbort);
-      // A process outside the group may still hold stderr open; don't let it keep us alive.
+      // A process outside the group may still hold a pipe open; don't let it keep us alive.
+      child?.stdout?.destroy();
       child?.stderr?.destroy();
       child?.unref();
-      resolve(detail);
+      resolve({ error, stdout });
     };
     const outcome = () => {
       if (aborted) return ABORTED;
@@ -167,7 +180,7 @@ function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
       return;
     }
     try {
-      child = spawn(bin, args, { cwd, env, stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+      child = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     } catch (e) {
       finish(`spawn failed: ${e.message}`);
       return;
@@ -177,6 +190,10 @@ function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
       timedOut = true;
       killGroup(child);
     }, timeoutMs);
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (d) => {
+      if (stdout.length < STDOUT_MAX) stdout += d;
+    });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (d) => {
       stderr = (stderr + d).slice(-STDERR_MAX * 4);
@@ -185,7 +202,7 @@ function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
     child.on('exit', (code, signal) => {
       exit = { code, signal };
       clearTimeout(timer);
-      killGroup(child); // nothing it left behind may edit after the check
+      killGroup(child); // nothing it left behind keeps running
       grace = setTimeout(() => finish(outcome()), timedOut || aborted ? 0 : STDERR_GRACE_MS);
     });
     child.on('close', () => {
@@ -194,35 +211,29 @@ function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
   });
 }
 
-// Raw bytes of the five files; null for a file that doesn't exist.
-async function snapshot(dir) {
-  const out = {};
-  for (const f of MEMORY_FILES) {
-    try {
-      out[f] = await fs.readFile(path.join(dir, f));
-    } catch (e) {
-      if (e.code !== 'ENOENT') throw e;
-      out[f] = null;
-    }
+// The change list from `--output-format json`: the result's top-level structured_output, with its
+// ops and the IDs relevant to the turn.
+export function parseChanges(stdout) {
+  try {
+    const out = JSON.parse(stdout)?.structured_output;
+    if (!Array.isArray(out?.ops)) return null;
+    return { ops: out.ops, relevant: Array.isArray(out.relevant) ? out.relevant : [] };
+  } catch {
+    return null;
   }
-  return out;
 }
 
-// What checkCuratorEdit sees: same as readMemory, absent files read as ''.
-const asText = (snap) => Object.fromEntries(MEMORY_FILES.map((f) => [f, snap[f]?.toString('utf8') ?? '']));
+const retryNote = (errors) =>
+  'Your previous change list was rejected, so nothing was applied. ' +
+  `Problems, as <op index>:<problem>: ${errors.join('; ')}. ` +
+  'Memory may have changed since your read; reread the files, then return the whole corrected list.';
 
-const sameBytes = (a, b) => (a === null || b === null ? a === b : a.equals(b));
-
-async function restore(dir, snap) {
-  const now = await snapshot(dir);
-  const rewrite = {};
-  for (const f of MEMORY_FILES) {
-    if (sameBytes(now[f], snap[f])) continue;
-    if (snap[f] === null) await fs.rm(path.join(dir, f), { force: true });
-    else rewrite[f] = snap[f];
-  }
-  if (Object.keys(rewrite).length) await writeMemory(dir, rewrite);
-}
+// What an apply did, for the log: tokens only, never item text. Demotions are not warnings.
+const summary = ({ applied, skipped, demoted }) => [
+  applied.length ? `applied ${applied.join(', ')}` : 'applied nothing',
+  skipped.length ? `skipped ${skipped.join(', ')}` : '',
+  demoted.length ? `demoted ${demoted.join(', ')}` : '',
+].filter(Boolean).join('; ');
 
 async function log(dir, turn, status, detail) {
   const line = `${new Date().toISOString()} t${turn} ${status}: ${oneLine(detail)}\n`;
@@ -231,69 +242,56 @@ async function log(dir, turn, status, detail) {
   } catch {}
 }
 
-function changedFiles(before, after) {
-  const files = MEMORY_FILES.filter((f) => !sameBytes(before[f], after[f]));
-  return files.length ? `changed ${files.join(', ')}` : 'no change';
-}
-
-// One turn; the caller holds the lock. On abort the snapshot is restored and `aborted: true` is set.
+// One turn; the caller holds the session's curator.lock. Attempt 1 applies strictly; on errors the
+// model sees them and attempt 2 applies leniently. A run that fails or is aborted applies nothing.
 async function curateTurn({ dir, turn, model, bin, timeoutMs, signal }) {
-  let before;
   let attempts = 0;
-  const aborted = async () => {
-    await restore(dir, before);
-    await log(dir, turn, 'aborted', 'requeued');
-    return { ok: false, attempts, violations: ['aborted: requeued'], aborted: true };
+  const end = async (status, detail, result) => {
+    await log(dir, turn, status, detail);
+    return { ok: status === 'ok', attempts, ...result };
   };
+  const failed = (detail) => end('error', detail, { errors: [`error: ${detail}`], error: true });
   try {
-    before = await snapshot(dir);
     const real = realpathSync(dir);
     const state = await turnState(dir, turn);
     const read = await readTurn(dir, turn);
     const answer = state?.answered ? read.answer : NO_ANSWER;
     const base = buildPrompt({
-      rules: await fs.readFile(RULES_FILE, 'utf8'), turn, real, message: read.message, answer,
+      rules: await fs.readFile(RULES_FILE, 'utf8'),
+      turn,
+      real,
+      topics: await listTopics(slateOf(real)),
+      message: read.message,
+      answer,
     });
     const opts = {
-      cwd: path.dirname(path.dirname(real)), // the project dir: <project>/.slate/<id>
+      cwd: slateOf(real),
       env: curatorEnv(process.env),
       timeoutMs,
       signal,
     };
 
     let prompt = base;
-    let violations = [];
-    while (attempts < MAX_ATTEMPTS) {
+    for (;;) {
       attempts++;
-      const err = await runClaude(bin, curatorArgs(prompt, model, real), opts);
-      if (err === ABORTED) return await aborted();
-      if (err) {
-        await restore(dir, before);
-        await log(dir, turn, 'error', err);
-        return { ok: false, attempts, violations: [`error: ${err}`], error: true };
+      const run = await runClaude(bin, curatorArgs(prompt, model, real), opts);
+      if (run.error === ABORTED || signal?.aborted) {
+        return end('aborted', 'requeued', { errors: ['aborted: requeued'], aborted: true });
       }
-      const after = await snapshot(dir);
-      violations = checkCuratorEdit(asText(before), asText(after), turn);
-      if (violations.length === 0) {
-        await log(dir, turn, 'ok', `attempt ${attempts}, ${changedFiles(before, after)}`);
-        return { ok: true, attempts, violations: [] };
-      }
-      await restore(dir, before);
-      if (signal?.aborted) return await aborted();
-      if (attempts < MAX_ATTEMPTS) {
-        await log(dir, turn, 'retry', violations.join('; '));
-        prompt = `${base}\n\nYour previous edit was rejected and undone: ${violations.join('; ')}. Fix and retry.`;
-      }
+      if (run.error) return failed(run.error);
+      const changes = parseChanges(run.stdout);
+      if (!changes) return failed('no change list in output');
+      const lenient = attempts === MAX_ATTEMPTS;
+      const r = await applyChanges(dir, changes.ops, {
+        turn, sessionId: path.basename(dir), lenient, relevant: changes.relevant,
+      });
+      if (r.errors.length === 0) return end('ok', `attempt ${attempts}: ${summary(r)}`, { errors: [] });
+      if (lenient) return end('partial', `${r.errors.join('; ')}; ${summary(r)}`, { errors: r.errors, partial: true });
+      await log(dir, turn, 'retry', r.errors.join('; '));
+      prompt = `${base}\n\n${retryNote(r.errors)}`;
     }
-    await log(dir, turn, 'restored', violations.join('; '));
-    return { ok: false, attempts, violations };
   } catch (e) {
-    const detail = oneLine(e.message);
-    try {
-      if (before) await restore(dir, before);
-    } catch {}
-    await log(dir, turn, 'error', detail);
-    return { ok: false, attempts, violations: [`error: ${detail}`], error: true };
+    return failed(oneLine(e.message));
   }
 }
 
@@ -304,9 +302,9 @@ export async function runCurator({
   try {
     release = await acquire(dir);
   } catch (e) {
-    return { ok: false, attempts: 0, violations: [`error: ${oneLine(e.message)}`] };
+    return { ok: false, attempts: 0, errors: [`error: ${oneLine(e.message)}`] };
   }
-  if (!release) return { ok: false, attempts: 0, violations: ['locked'] };
+  if (!release) return { ok: false, attempts: 0, errors: ['locked'] };
   try {
     return await curateTurn({ dir, turn, model, bin, timeoutMs, signal });
   } finally {
@@ -351,7 +349,7 @@ async function nextWork(dir) {
 
 // Curates every pending turn in order. A curator that finds the lock held returns at once: the
 // holder rechecks after its release, so the work isn't lost. A turn whose curation ends in an
-// error (not a rejected edit) stays queued once, for the next drain: a later Stop, or one that
+// error (not a partial apply) stays queued once, for the next drain: a later Stop, or one that
 // came in during this run; a second error marks it done. `beforeRelease` is a test seam.
 export async function drain({
   dir, model = 'sonnet', bin = resolveClaudeBin(), timeoutMs = TIMEOUT_MS, signal, beforeRelease,
@@ -400,7 +398,7 @@ async function main([dir, turnArg, model]) {
     process.exitCode = 1;
     return;
   }
-  // SIGTERM (from a SessionStart clear/fork that must move this folder): undo, release, exit.
+  // SIGTERM (from a SessionStart clear/fork that must move this folder): abort, release, exit.
   const ac = new AbortController();
   process.on('SIGTERM', () => ac.abort());
   try {

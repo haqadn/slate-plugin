@@ -4,11 +4,13 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  projectDir, sessionDir, initSession, readSession, writeSession, findByPid, moveSession,
+  readSession, writeSession, findByPid, moveSession,
   copySession, claudePid, setPid, nextTurn, writeMessage, appendAnswer, appendContinuation,
   readTurn, readMemory, writeMemory, turnState, releasePid, queueFile, sweepQueue, appendOffload,
 } from '../plugins/slate/scripts/lib/session.mjs';
 import { MEMORY_FILES } from '../plugins/slate/scripts/lib/items.mjs';
+import { initSession, sessionDir } from './helpers.mjs';
+import { slateOf, memoryPath, createSlate, createSession, listSlates, findSession, sessionDirs } from '../plugins/slate/scripts/lib/slate.mjs';
 
 const temps = [];
 async function tmp() {
@@ -20,58 +22,6 @@ after(async () => {
   for (const d of temps) await fs.rm(d, { recursive: true, force: true });
 });
 const exists = (p) => fs.access(p).then(() => true, () => false);
-
-test('projectDir prefers CLAUDE_PROJECT_DIR, falls back to cwd', () => {
-  const saved = process.env.CLAUDE_PROJECT_DIR;
-  try {
-    process.env.CLAUDE_PROJECT_DIR = '/a';
-    assert.equal(projectDir({ cwd: '/b' }), '/a');
-    delete process.env.CLAUDE_PROJECT_DIR;
-    assert.equal(projectDir({ cwd: '/b' }), '/b');
-  } finally {
-    if (saved === undefined) delete process.env.CLAUDE_PROJECT_DIR;
-    else process.env.CLAUDE_PROJECT_DIR = saved;
-  }
-});
-
-test('initSession creates the layout; second call is a no-op', async () => {
-  const root = await tmp();
-  const r = await initSession(root, 's1', 111);
-  assert.equal(r.created, true);
-  assert.equal(r.dir, sessionDir(root, 's1'));
-  assert.equal(r.dir, path.join(root, '.slate', 's1'));
-  assert.equal(await fs.readFile(path.join(root, '.slate', '.gitignore'), 'utf8'), '*\n');
-  for (const f of MEMORY_FILES) assert.ok(await exists(path.join(r.dir, f)), f);
-  assert.equal(await fs.readFile(path.join(r.dir, 'instructions.md'), 'utf8'), '# Instructions\n');
-  assert.equal(await fs.readFile(path.join(r.dir, 'assumptions.md'), 'utf8'), '# Assumptions\n');
-  assert.equal(await fs.readFile(path.join(r.dir, 'facts.md'), 'utf8'), '# Facts\n');
-  assert.equal(await fs.readFile(path.join(r.dir, 'superseded.md'), 'utf8'), '# Superseded\n');
-  assert.equal(await fs.readFile(path.join(r.dir, 'now.md'), 'utf8'), '');
-  assert.ok((await fs.stat(path.join(r.dir, 'queue'))).isDirectory());
-  assert.equal(await exists(path.join(r.dir, 'conversation')), false);
-  assert.ok((await fs.stat(path.join(r.dir, 'reports'))).isDirectory());
-  const s = await readSession(r.dir);
-  assert.equal(s.pid, 111);
-  assert.equal(s.from, null);
-  assert.equal(s.turn, 0);
-  assert.deepEqual(s.seen, {});
-  assert.ok(!Number.isNaN(Date.parse(s.created)));
-
-  await fs.writeFile(path.join(r.dir, 'facts.md'), '# Facts\n- [F1 t1] x (a)\n');
-  const again = await initSession(root, 's1', 999);
-  assert.equal(again.created, false);
-  assert.equal(await fs.readFile(path.join(r.dir, 'facts.md'), 'utf8'), '# Facts\n- [F1 t1] x (a)\n');
-  assert.equal((await readSession(r.dir)).pid, 111);
-});
-
-test('.gitignore only written when .slate is new, never recreated', async () => {
-  const root = await tmp();
-  await initSession(root, 's1', 1);
-  const gi = path.join(root, '.slate', '.gitignore');
-  await fs.rm(gi);
-  await initSession(root, 's2', 2);
-  assert.equal(await exists(gi), false);
-});
 
 test('turn files round-trip tricky messages in full', async () => {
   const root = await tmp();
@@ -166,7 +116,7 @@ test('findByPid picks the right folder; moveSession moves only that one', async 
   assert.equal(await findByPid(root, 222), dest);
 });
 
-test('findByPid with no .slate returns null', async () => {
+test('findByPid with no slates returns null', async () => {
   assert.equal(await findByPid(await tmp(), 1), null);
 });
 
@@ -263,8 +213,8 @@ test('releasePid clears the pid in every other folder holding it; findByPid then
   assert.equal((await readSession(b)).pid, null);
   assert.equal(await findByPid(root, 111), null);
   const bare = await tmp();
-  await releasePid(bare, 111); // no .slate: nothing to do, nothing created
-  assert.equal(await exists(path.join(bare, '.slate')), false);
+  await releasePid(bare, 111); // no slates: nothing to do, nothing created
+  assert.deepEqual(await fs.readdir(bare), []);
 });
 
 test('queueFile names queue/NNNN.md', () => {
@@ -307,7 +257,7 @@ test('sweepQueue without a queue folder does nothing', async () => {
 
 // --- offloads.md ---
 
-const offloads = (dir) => fs.readFile(path.join(dir, 'offloads.md'), 'utf8');
+const offloads = (dir) => fs.readFile(path.join(slateOf(dir), 'offloads.md'), 'utf8');
 const entry = { turn: 3, at: '2026-10-13T10:00:00.000Z', agentId: 'a1b2', transcript: '/t/agent-a1b2.jsonl' };
 
 test('appendOffload: the first entry adds the title; later ones only append', async () => {
@@ -317,9 +267,9 @@ test('appendOffload: the first entry adds the title; later ones only append', as
   await appendOffload(dir, { ...entry, turn: 4, agentId: 'c3', text: 'done' });
   assert.equal(await offloads(dir), [
     '# Offloads', '',
-    '## t3 2026-10-13T10:00:00.000Z a1b2', 'transcript: /t/agent-a1b2.jsonl', '',
+    '## t3@s1 2026-10-13T10:00:00.000Z a1b2', 'transcript: /t/agent-a1b2.jsonl', '',
     '> Found 3 callers.', '> Report: reports/callers.md', '',
-    '## t4 2026-10-13T10:00:00.000Z c3', 'transcript: /t/agent-a1b2.jsonl', '',
+    '## t4@s1 2026-10-13T10:00:00.000Z c3', 'transcript: /t/agent-a1b2.jsonl', '',
     '> done', '', '',
   ].join('\n'));
 });
@@ -357,7 +307,65 @@ test('appendOffload: concurrent entries both land whole', async () => {
   const text = await offloads(dir);
   for (const [id, c] of [['A', 'a'], ['B', 'b']]) {
     const quoted = long(c).split('\n').map((l) => `> ${l}`).join('\n');
-    assert.ok(text.includes(`## t3 2026-10-13T10:00:00.000Z ${id}\ntranscript: /t/agent-a1b2.jsonl\n\n${quoted}\n\n`), id);
+    assert.ok(text.includes(`## t3@s1 2026-10-13T10:00:00.000Z ${id}\ntranscript: /t/agent-a1b2.jsonl\n\n${quoted}\n\n`), id);
   }
   assert.equal(text.match(/^# Offloads$/gm).length, 1);
+});
+
+test('appendOffload: header carries the first 8 chars of the session ID', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, '82b3114c-aaaa-bbbb-cccc-0123456789ab', 1);
+  await appendOffload(dir, { ...entry, turn: 4, text: 'x' });
+  assert.match(await offloads(dir), /^## t4@82b3114c 2026-10-13T10:00:00.000Z a1b2$/m);
+});
+
+test('appendOffload: two concurrent first appends leave one title and two whole entries', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await Promise.all([
+    appendOffload(dir, { ...entry, agentId: 'A', text: 'aaa' }),
+    appendOffload(dir, { ...entry, agentId: 'B', text: 'bbb' }),
+  ]);
+  const text = await offloads(dir);
+  assert.equal(text.match(/^# Offloads$/gm).length, 1);
+  assert.ok(text.startsWith('# Offloads\n\n## t3@s1'));
+  for (const [id, c] of [['A', 'aaa'], ['B', 'bbb']]) {
+    assert.ok(text.includes(`## t3@s1 2026-10-13T10:00:00.000Z ${id}\ntranscript: /t/agent-a1b2.jsonl\n\n> ${c}\n\n`), id);
+  }
+  assert.deepEqual((await fs.readdir(slateOf(dir))).filter((f) => f.endsWith('.tmp')), []);
+});
+
+test('appendOffload: an existing offloads.md with old headers is appended to unchanged', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  const old = '# Offloads\n\n## t12 2026-10-01T00:00:00.000Z a0\ntranscript: none\n\n> old\n\n';
+  await fs.writeFile(path.join(slateOf(dir), 'offloads.md'), old);
+  await appendOffload(dir, { ...entry, text: 'new' });
+  const text = await offloads(dir);
+  assert.ok(text.startsWith(old));
+  assert.equal(text.match(/^# Offloads$/gm).length, 1);
+  assert.ok(text.includes('## t3@s1 '));
+});
+
+test('readMemory / writeMemory resolve shared files in the slate and now.md in the session', async () => {
+  const root = await tmp();
+  const { dir } = await initSession(root, 's1', 1);
+  await writeMemory(dir, { 'facts.md': '# Facts\n- [F1 t1] x (a)\n', 'now.md': 'Goal\n' });
+  assert.equal(await fs.readFile(path.join(slateOf(dir), 'facts.md'), 'utf8'), '# Facts\n- [F1 t1] x (a)\n');
+  assert.equal(await fs.readFile(path.join(dir, 'now.md'), 'utf8'), 'Goal\n');
+  assert.equal(await exists(path.join(dir, 'facts.md')), false);
+  assert.equal((await readMemory(dir))['facts.md'], '# Facts\n- [F1 t1] x (a)\n');
+});
+
+test('findByPid and releasePid work across two slates; the newest session.json wins a shared pid', async () => {
+  const root = await tmp();
+  const a = (await initSession(root, 'sa', 111, 'one')).dir;
+  const b = (await initSession(root, 'sb', 111, 'two')).dir;
+  const old = new Date(Date.now() - 60000);
+  await fs.utimes(path.join(a, 'session.json'), old, old);
+  assert.equal(await findByPid(root, 111), b);
+  await releasePid(root, 111, a);
+  assert.equal((await readSession(a)).pid, 111);
+  assert.equal((await readSession(b)).pid, null);
+  assert.equal(await findByPid(root, 111), a);
 });

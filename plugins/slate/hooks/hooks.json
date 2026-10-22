@@ -43,6 +43,12 @@
         "hooks": [
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs\" PreToolUse", "timeout": 10 }
         ]
+      },
+      {
+        "matcher": "Read|Write|Edit|Grep|Glob",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs\" PreToolUse", "timeout": 10 }
+        ]
       }
     ]
   }
