@@ -20,7 +20,10 @@ claude plugin install slate@slate-plugin
 
 | In `~/slate/<name>/` | Holds |
 |---|---|
-| `instructions.md`, `assumptions.md`, `facts.md` | I, A and F items, shared by every session |
+| `instructions.md` | I items, shared by every session; always injected |
+| `facts.md`, `assumptions.md` | key F and A items: what most sessions need on most turns; capped at 3,000 and 1,500 chars of items |
+| `topics/<slug>.md` | every other F and A item, by topic: `# <Title>`, `> <summary>`, then items; listed in the memory block, read when a task needs them |
+| `usage.json` | per F and A item: when the curator last marked it relevant, how often, and its home topic |
 | `superseded.md` | retired items, append-only; never injected |
 | `reports/` | details written by offload agents |
 | `offloads.md` | one entry per offload run: its return, its session and the path to its transcript |
@@ -36,7 +39,7 @@ claude plugin install slate@slate-plugin
 
 ## Hand edits
 
-Edit memory files when no `memory.lock` exists; an edit during a run can be undone. A plain bullet without an ID is adopted with the next ID, text unchanged.
+Edit memory files when no `memory.lock` exists; an edit during a run can be undone. A plain bullet without an ID is adopted with the next ID, text unchanged; in a topic file it becomes a fact.
 
 ## Cleanup
 
@@ -50,5 +53,6 @@ Reads in the linked slate and writes under `reports/` are allowed without a prom
 
 ## Notes
 
+- When `facts.md` or `assumptions.md` goes over its cap, the curator's apply step moves the least recently relevant items to their home topics (`general` if none) until it fits, and logs them as `demoted` in `curator.log`.
 - Turn files escape exact marker lines with a leading backslash.
 - The curator finds `claude` through `CLAUDE_CODE_EXECPATH` and runs with `--setting-sources ""`: OAuth login works; `apiKeyHelper` auth can't reach it.

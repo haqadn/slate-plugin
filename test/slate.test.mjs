@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   slateHome, validName, slateDir, slateOf, memoryPath, createSlate, createSession, listSlates, sessionDirs,
-  findSession, slateAccess, sweepSessions,
+  findSession, slateAccess, sweepSessions, listTopics, validTopic,
 } from '../plugins/slate/scripts/lib/slate.mjs';
 
 const temps = [];
@@ -30,6 +30,11 @@ test('validName', () => {
   for (const bad of ['Jetpack', 'jetpack seo', '-x', 'x-', 'a--b', '../x', '', 'a'.repeat(65), 'a/b', 'a_b', null, 5]) {
     assert.equal(validName(bad), false, String(bad));
   }
+});
+
+test('validTopic: the slate-name rule, and `key` is reserved for the key files', () => {
+  for (const ok of ['canonical', 'general', 'seo-2']) assert.equal(validTopic(ok), true, ok);
+  for (const bad of ['key', 'Canonical', '../x', 'a b', '', null]) assert.equal(validTopic(bad), false, String(bad));
 });
 
 test('slateDir and slateOf', () => {
@@ -227,4 +232,24 @@ test('slateAccess: paths are trimmed and must be absolute', async () => {
   } finally {
     process.chdir(was);
   }
+});
+
+test('listTopics: a topic file round-trips its title, summary, live count and path, sorted by slug', async () => {
+  const home = await tmp();
+  const { dir } = await createSlate(home, 'seo');
+  assert.deepEqual(await listTopics(dir), [], 'no topics/ folder yet');
+  const topics = path.join(dir, 'topics');
+  await fs.mkdir(topics);
+  await fs.writeFile(path.join(topics, 'sitemaps.md'), '# Sitemaps\n> How sitemaps are built.\n- [F3 t1@82b3114c] one (user)\n');
+  await fs.writeFile(path.join(topics, 'canonical.md'), '# Canonical URLs\r\n> Which URL wins.\r\n' +
+    '- [F1 t1] a (user)\r\n- [A2 t2@82b3114c] b\r\n- [F4 t1 retired t2] gone (reason: r)\r\n- plain bullet\r\n');
+  await fs.writeFile(path.join(topics, 'no-header.md'), '- [F5 t1] c (user)\n');
+  await fs.writeFile(path.join(topics, 'Bad Name.md'), '# Bad\n> x\n');
+  await fs.writeFile(path.join(topics, 'key.md'), '# Key\n> reserved\n');
+  await fs.writeFile(path.join(topics, 'notes.txt'), 'x\n');
+  assert.deepEqual(await listTopics(dir), [
+    { slug: 'canonical', title: 'Canonical URLs', summary: 'Which URL wins.', count: 2, path: path.join(topics, 'canonical.md') },
+    { slug: 'no-header', title: 'no-header', summary: '', count: 1, path: path.join(topics, 'no-header.md') },
+    { slug: 'sitemaps', title: 'Sitemaps', summary: 'How sitemaps are built.', count: 1, path: path.join(topics, 'sitemaps.md') },
+  ]);
 });

@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { rulesText, memoryBlock, changeLine } from '../plugins/slate/scripts/lib/inject.mjs';
-import { memoryPath } from '../plugins/slate/scripts/lib/slate.mjs';
+import { memoryPath, slateOf } from '../plugins/slate/scripts/lib/slate.mjs';
 import { MEMORY_FILES } from '../plugins/slate/scripts/lib/items.mjs';
 import { initSession } from './helpers.mjs';
 import {
@@ -30,6 +30,11 @@ const write = (dir, file, text) => fs.writeFile(fileOf(dir, file), text);
 const append = (dir, file, text) => fs.appendFile(fileOf(dir, file), text);
 const lines = (prefix, n, size) =>
   Array.from({ length: n }, (_, i) => `- [${prefix}${i + 1} t1] ${'x'.repeat(size)}`).join('\n');
+const topicPath = (dir, slug) => path.join(slateOf(dir), 'topics', `${slug}.md`);
+async function writeTopic(dir, slug, text) {
+  await fs.mkdir(path.join(slateOf(dir), 'topics'), { recursive: true });
+  await fs.writeFile(topicPath(dir, slug), text);
+}
 
 // --- rules ---
 
@@ -39,19 +44,21 @@ test('rules.md carries the main-thread rules', async () => {
     '{{slate}}/instructions.md', '{{session}}/now.md', '{{slate}}/reports/<slug>.md', 'a slug no other report uses',
     'Slate-folder files: superseded.md', 'Go longer when the task needs it.',
     'Keep conversation, decisions, small targeted reads here.', 'Return ≤10 lines', 'instead of doing it yourself', 'when unsure, offload',
-    'memory still updating', 'slate warning', 'Task line', 'replaces', 'offloads.md', 'transcript path']) {
+    'memory still updating', 'slate warning', 'Task line', 'replaces', 'offloads.md', 'transcript path',
+    'topic files', '`# Topics`', 'read the ones the task needs', '`+2 in x`']) {
     assert.ok(raw.includes(s), `rules.md lacks ${JSON.stringify(s)}`);
   }
   // Recent Claude Code has no Grep or Glob tool, and Bash on slate paths is denied in the default
   // permission mode (live acceptance, 2.1.308): reports are found through offloads.md and read with Read.
   assert.match(raw, /offloads\.md[^\n]*report and transcript paths/, 'offloads.md is how a session finds a report');
   assert.match(raw, /read-only for you[^\n]*Bash there is denied/, 'slate files are read with Read, never Bash');
+  assert.match(raw, /Agent brief: "Read [^\n]*topic files[^\n]*Task:/, 'a brief names the topic files the task needs');
   assert.ok(!raw.includes('{{dir}}'));
   assert.ok(!raw.includes('conversation/'), 'turn files are a curator queue, not for the main thread');
   assert.ok(raw.indexOf('{{slate}}') < 50 && raw.indexOf('{{session}}') < 100, 'both folders named at the top');
 });
 
-test('rulesText fills every placeholder and stays ≤1,700 chars with a 120-char session path', async () => {
+test('rulesText fills every placeholder and stays ≤1,900 chars with a 120-char session path', async () => {
   const id = '0b7e8f5c-1234-4abc-9def-0123456789ab';
   const tail = `/.sessions/${id}`;
   const slate = `/Users/someone/${'p'.repeat(120 - '/Users/someone/'.length - tail.length)}`;
@@ -63,7 +70,7 @@ test('rulesText fills every placeholder and stays ≤1,700 chars with a 120-char
   assert.ok(t.includes(`${slate}/instructions.md`));
   assert.ok(t.includes(`${dir}/now.md`));
   assert.ok(t.includes(`${slate}/reports/<slug>.md`));
-  assert.ok(t.length <= 1700, `rules are ${t.length} chars`);
+  assert.ok(t.length <= 1900, `rules are ${t.length} chars`);
 });
 
 test('rulesText inserts the paths literally, even with $ patterns', async () => {
@@ -193,6 +200,15 @@ test('core: warnings echo only status, IDs and error kinds, never log text', asy
     't4 error',
     't5 error',
   ]) assert.ok(out.split('\n').includes(`slate warning: ${w} (see ${log})`), `${w}\n${out}`);
+
+  // the kinds of topic, home and move errors
+  await append(dir, 'curator.log', [
+    't7 partial: 0:bad slug; 1:empty title; 2:empty summary; 3:multi-line title; 4:multi-line summary',
+    't8 partial: 0:missing topic; 1:no home; 2:instruction move; 3:stale F4; applied 4:move F2>key; demoted F1>x',
+  ].map((l) => `2026-10-07T10:00:00.000Z ${l}\n`).join(''));
+  assert.equal(await changeLine(dir, { waiting: false }), [REMINDER,
+    `slate warning: t7 partial: bad slug, empty title, empty summary, multi-line title, multi-line summary (see ${log})`,
+    `slate warning: t8 partial: missing topic, no home, instruction move, stale F4 (see ${log})`].join('\n'));
 
   // IDs and kinds inside quotes are never picked up
   await append(dir, 'curator.log', '2026-10-07T10:00:00.000Z t6 error: exit 1: "0:stale I7 and 1:no source"; 2:stale I2\n');
@@ -520,4 +536,81 @@ test('old-format data: untagged items, old retired lines and a session.json with
   assert.ok(block.includes('- [I3 t12] old item') && block.includes('- [I4 t2] new item'));
   assert.ok(!block.includes('ZZ-GONE-ZZ'));
   assert.equal(typeof (await changeLine(dir)), 'string');
+});
+
+// --- topics ---
+
+test('memoryBlock: a # Topics index after assumptions, one line per topic; topic items are not injected', async () => {
+  const dir = await session();
+  assert.ok(!(await memoryBlock(dir)).includes('\n\n# Topics\n'), 'no topics, no section');
+  await write(dir, 'assumptions.md', '# Assumptions\n- [A1 t2] user is on macOS\n');
+  await writeTopic(dir, 'canonical', '# Canonical URLs\n> Which URL wins.\n- [F3 t1] a (user)\n- [A4 t1] b\n- plain\n');
+  await writeTopic(dir, 'build', '# Build\n> How it builds.\n- [F5 t1] c (user)\n');
+  const b = await memoryBlock(dir);
+  const index = `# Topics\n- Build — How it builds. (1) ${topicPath(dir, 'build')}\n` +
+    `- Canonical URLs — Which URL wins. (2) ${topicPath(dir, 'canonical')}`;
+  assert.ok(b.endsWith(index), b.slice(-300));
+  assert.ok(b.indexOf('- [A1 t2] user is on macOS') < b.indexOf('\n\n# Topics\n'));
+  assert.ok(!b.includes('- [F3 t1] a (user)'), 'topic items stay in their files');
+});
+
+test('core: a topic title or summary carrying retired text is not shown', async () => {
+  const dir = await session();
+  await write(dir, 'superseded.md', '# Superseded\n- [F1 t1 retired t2] ZZ-GONE-ZZ (reason: r)\n');
+  await writeTopic(dir, 'old', '# Old\n> ZZ-GONE-ZZ\n- [F2 t1] x (user)\n');
+  await writeTopic(dir, 'tagged', '# [F9 t1 retired t2] y\n> fine\n');
+  const b = await memoryBlock(dir);
+  assert.ok(!b.includes('ZZ-GONE-ZZ') && !b.includes('retired t2'), b.slice(-400));
+  assert.ok(b.includes(`- old (1) ${topicPath(dir, 'old')}`));
+  assert.ok(b.includes(`- tagged (0) ${topicPath(dir, 'tagged')}`));
+});
+
+test('memoryBlock: over budget, the topic index shrinks before facts spill', async () => {
+  const dir = await session();
+  for (let i = 1; i <= 40; i++) {
+    await writeTopic(dir, `t${i}`, `# Topic ${i}\n> ${'s'.repeat(150)}\n- [F${100 + i} t1] x (user)\n`);
+  }
+  await write(dir, 'facts.md', `# Facts\n${lines('F', 5, 600)}\n`);
+  const b = await memoryBlock(dir);
+  assert.ok(b.length <= MAX, `${b.length}`);
+  assert.ok(b.includes(`- [F5 t1] ${'x'.repeat(600)}`), 'facts still shown in full');
+  assert.ok(!b.includes('s'.repeat(150)), 'summaries dropped');
+  assert.ok(b.includes('t1 (1)') && b.includes('t40 (1)'), 'every topic still named');
+  assert.ok(b.includes(path.join(slateOf(dir), 'topics', '<slug>.md')), 'and where to find it');
+});
+
+test('memoryBlock: seen covers topic items, so the next change line is quiet', async () => {
+  const dir = await session();
+  await writeTopic(dir, 'build', '# Build\n> x\n- [F5 t1] c (user)\n');
+  await memoryBlock(dir);
+  assert.equal(await changeLine(dir), REMINDER);
+});
+
+test('changeLine: topic adds show as +N in <slug>; a move shows nothing; a promoted item shows once as a key item', async () => {
+  const dir = await session();
+  await write(dir, 'facts.md', '# Facts\n- [F1 t1] key fact (user)\n');
+  await writeTopic(dir, 'canonical', '# Canonical\n> x\n- [F2 t1] old (user)\n');
+  await memoryBlock(dir);
+  await fs.appendFile(topicPath(dir, 'canonical'), '- [F3 t2] new one (user)\n- [A4 t2] new two\n');
+  assert.equal(await changeLine(dir), `${REMINDER}\nslate: +2 in canonical`);
+
+  // F1 demoted from key to canonical; F2 promoted from canonical to key.
+  await write(dir, 'facts.md', '# Facts\n- [F2 t1] old (user)\n');
+  await writeTopic(dir, 'canonical', '# Canonical\n> x\n- [F3 t2] new one (user)\n- [A4 t2] new two\n- [F1 t1] key fact (user)\n');
+  assert.equal(await changeLine(dir), `${REMINDER}\nslate: +F2 old (user)`);
+  assert.equal(await changeLine(dir), REMINDER, 'shown once');
+
+  await writeTopic(dir, 'other', '# Other\n> y\n- [F1 t1] key fact (user)\n');
+  await writeTopic(dir, 'canonical', '# Canonical\n> x\n- [A4 t2] new two\n');
+  assert.equal(await changeLine(dir), `${REMINDER}\nslate: retired F3`, 'a move between topics is no change');
+});
+
+test('changeLine: at most 3 topics by name, the most added first, then +M more', async () => {
+  const dir = await session();
+  await memoryBlock(dir);
+  let n = 0;
+  const items = (k) => Array.from({ length: k }, () => `- [F${++n} t1] f${n} (user)\n`).join('');
+  for (const [slug, k] of [['a', 1], ['b', 3], ['c', 2], ['d', 1], ['e', 2]]) await writeTopic(dir, slug, `# ${slug}\n> s\n${items(k)}`);
+  assert.equal(await changeLine(dir), `${REMINDER}\nslate: +3 in b · +2 in c · +2 in e · +2 more`);
+  assert.equal(await changeLine(dir), REMINDER);
 });

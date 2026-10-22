@@ -47,6 +47,7 @@ test('agent frontmatter', async () => {
   assert.match(agent, /hand-back tool.*600|600.*hand-back tool/i, 'the return limit also covers a hand-back message');
   assert.match(agent, /\.jsonl.*transcript|transcript.*\.jsonl/i, 'a past run is reachable through its transcript path');
   assert.match(agent, /never overwrite an existing report/i);
+  assert.match(agent, /topic files named in your brief/i, 'an offload reads the topic files its brief names');
   // Recent Claude Code has no Grep or Glob tool, and Bash on slate paths is denied in the default
   // permission mode (live acceptance, 2.1.308): an `ls` of reports/ sank the whole offload.
   assert.match(agent, /Write won't replace a file you haven't read/, 'no pre-check of reports/: Write itself guards');

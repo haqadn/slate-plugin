@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import { realpathSync, lstatSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { parseMemoryFile } from './items.mjs';
 
 const NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const NAME_MAX = 64;
@@ -23,6 +24,11 @@ export function validName(name) {
   return typeof name === 'string' && name.length <= NAME_MAX && NAME.test(name);
 }
 
+// A topic's slug follows the slate-name rule; `key` names the key files, so no topic takes it.
+export function validTopic(slug) {
+  return validName(slug) && slug !== 'key';
+}
+
 export function slateDir(home, name) {
   return path.join(home, name);
 }
@@ -36,6 +42,50 @@ export function memoryPath(sessionDir, file) {
   if (file === 'now.md') return path.join(sessionDir, file);
   if (SHARED.includes(file)) return path.join(slateOf(sessionDir), file);
   throw new Error(`not a memory file: ${file}`);
+}
+
+export function topicPath(slate, slug) {
+  return path.join(slate, 'topics', `${slug}.md`);
+}
+
+// Every topics/<slug>.md, sorted by slug, with its raw text and what it holds: line 1 `# <Title>`,
+// line 2 `> <summary>`, then items. A missing header reads as the slug and an empty summary.
+export async function readTopics(slate) {
+  let names;
+  try {
+    names = await fs.readdir(path.join(slate, 'topics'));
+  } catch (e) {
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return [];
+    throw e;
+  }
+  const slugs = names.filter((n) => n.endsWith('.md')).map((n) => n.slice(0, -3)).filter(validTopic).sort();
+  const out = [];
+  for (const slug of slugs) {
+    const file = topicPath(slate, slug);
+    let text;
+    try {
+      text = await fs.readFile(file, 'utf8');
+    } catch (e) {
+      if (e.code === 'ENOENT' || e.code === 'EISDIR') continue;
+      throw e;
+    }
+    const [first = '', second = ''] = text.split(/\r?\n/, 2);
+    out.push({
+      slug,
+      title: /^# (.*)$/.exec(first)?.[1].trim() || slug,
+      summary: /^>(.*)$/.exec(second)?.[1].trim() ?? '',
+      items: parseMemoryFile(text).items,
+      path: file,
+      text,
+    });
+  }
+  return out;
+}
+
+export async function listTopics(slate) {
+  return (await readTopics(slate)).map(({ slug, title, summary, items, path: p }) => ({
+    slug, title, summary, count: items.length, path: p,
+  }));
 }
 
 async function mkdirNew(dir) {

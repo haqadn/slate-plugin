@@ -127,9 +127,11 @@ test('command: prompt first, every flag, read-only path-scoped rules, the change
   const real = realpathSync(dir);
   if (process.platform === 'darwin') assert.notEqual(real, dir, 'tmpdir goes through a symlink on macOS');
   const rules = MEMORY_FILES.map((f) => `Read(/${memoryPath(real, f)})`);
-  // --allowedTools is variadic, so it comes last and takes exactly the five rules.
-  assert.deepEqual(args.slice(args.indexOf('--allowedTools') + 1), rules);
   for (const rule of rules) assert.match(rule, /^Read\(\/\/.+\.md\)$/);
+  rules.push(`Read(/${path.join(slateOf(real), 'topics')}/**)`);
+  // --allowedTools is variadic, so it comes last and takes exactly the five file rules and the topics rule.
+  assert.deepEqual(args.slice(args.indexOf('--allowedTools') + 1), rules);
+  assert.match(rules.at(-1), /^Read\(\/\/.+\/topics\/\*\*\)$/);
   assert.ok(args.indexOf('--tools') < args.indexOf('--allowedTools'));
 
   assert.equal(env.SLATE_CURATOR, '1');
@@ -405,7 +407,13 @@ test('curator-rules.md: wording the curator relies on', async () => {
     '"For wpcom#249668: never touch X"',
     '"use the staging DB for this"',
     'Never write an ID for a new item.',
-    'Name an existing ID only to retire or replace it.',
+    'Name an existing ID only to retire, replace or move it, or in `relevant`.',
+    'Always return `relevant`',
+    'lasting project knowledge',
+    'never in a key file',
+    'most sessions need on most turns',
+    'Every key `add` names its home topic',
+    'never retire it and add it again',
     'reread the files and decide again',
     'Never cite a report',
   ]) assert.ok(rules.includes(s), s);
@@ -693,4 +701,40 @@ test('a slate deleted while its curator runs: the apply fails and nothing is rec
   await running;
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(await exists(slateOf(dir)), false);
+});
+
+// --- topics and relevance ---
+
+test('prompt: lists the key files and the topic index with slug, title, summary, count and path', async () => {
+  const { dir, record } = await setup('good');
+  const topics = path.join(slateOf(dir), 'topics');
+  await fs.mkdir(topics);
+  await fs.writeFile(path.join(topics, 'build.md'), '# Build\n> How it builds.\n- [F7 t1] uses vite (user)\n');
+  await runCurator({ dir, turn: TURN, bin: FAKE });
+  const [{ prompt }] = await calls(record);
+  const real = realpathSync(dir);
+  for (const f of MEMORY_FILES) assert.ok(prompt.includes(`- ${memoryPath(real, f)}\n`), f);
+  assert.ok(prompt.includes(`- build: Build — How it builds. (1 items) ${path.join(slateOf(real), 'topics', 'build.md')}\n`), prompt);
+});
+
+test('prompt: no topics yet says so', async () => {
+  const { dir, record } = await setup('good');
+  await runCurator({ dir, turn: TURN, bin: FAKE });
+  const [{ prompt }] = await calls(record);
+  assert.ok(prompt.includes('Topics: none yet.'), prompt.slice(-1500));
+});
+
+test('relevant: passed through to the apply; demotions are logged on the ok line and are not warnings', async () => {
+  const { dir } = await setup('relevant');
+  const big = `- [F5 t1] ${'x'.repeat(2950)} (user)`;
+  await writeMemory(dir, { 'facts.md': `# Facts\n- [F1 t1] Node 24 (package.json)\n${big}\n` });
+  const r = await runCurator({ dir, turn: TURN, bin: FAKE });
+  assert.deepEqual(r, { ok: true, attempts: 1, errors: [] });
+  const log = await logLines(dir);
+  assert.equal(assertLog(log[0], 'ok'), 'attempt 1: applied adopt I3, 0:add F6; demoted F5>general');
+  const usage = JSON.parse(await fs.readFile(path.join(slateOf(dir), 'usage.json'), 'utf8'));
+  assert.equal(usage.F1.count, 1, 'F1 was relevant');
+  assert.equal(usage.F6.home, 'general');
+  assert.ok(!('F99' in usage), 'an unknown ID is ignored');
+  assert.ok((await fs.readFile(path.join(slateOf(dir), 'topics', 'general.md'), 'utf8')).includes(big));
 });

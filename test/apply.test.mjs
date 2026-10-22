@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { applyChanges, CHANGE_SCHEMA } from '../plugins/slate/scripts/lib/apply.mjs';
+import { applyChanges, CHANGE_SCHEMA, FACTS_CAP, ASSUMPTIONS_CAP } from '../plugins/slate/scripts/lib/apply.mjs';
 import { createSession, slateOf } from '../plugins/slate/scripts/lib/slate.mjs';
 import { readMemory, writeMemory } from '../plugins/slate/scripts/lib/session.mjs';
 import { acquire } from '../plugins/slate/scripts/lib/lock.mjs';
@@ -52,10 +52,10 @@ test('add: next ID above every live or retired one of its type, tagged with turn
   const { dir, before } = await slate();
   const r = await applyChanges(dir, [
     { op: 'add', type: 'I', text: 'never force-push' },
-    { op: 'add', type: 'A', text: 'deploys run nightly' },
-    { op: 'add', type: 'F', text: 'port 8080 (config.yml)' },
+    { op: 'add', type: 'A', text: 'deploys run nightly', home: 'general' },
+    { op: 'add', type: 'F', text: 'port 8080 (config.yml)', home: 'general' },
   ], OPTS);
-  assert.deepEqual(r, { applied: ['0:add I8', '1:add A10', '2:add F3'], skipped: [], errors: [] });
+  assert.deepEqual(r, { applied: ['0:add I8', '1:add A10', '2:add F3'], skipped: [], errors: [], demoted: [] });
   const now = await readMemory(dir);
   assert.equal(now['instructions.md'], `${before['instructions.md']}- [I8 ${TAG}] never force-push\n`);
   assert.equal(now['assumptions.md'], `${before['assumptions.md']}- [A10 ${TAG}] deploys run nightly\n`);
@@ -76,7 +76,7 @@ test('add: an ID of that type anywhere in the four shared files counts', async (
 
 test('add: a file without a trailing newline gets one before the new line', async () => {
   const { dir } = await slate({ ...BASE, 'facts.md': '# Facts\n- [F2 t1] Node 24 (package.json)' });
-  await applyChanges(dir, [{ op: 'add', type: 'F', text: 'y (user)' }], OPTS);
+  await applyChanges(dir, [{ op: 'add', type: 'F', text: 'y (user)', home: 'general' }], OPTS);
   assert.equal((await readMemory(dir))['facts.md'], `# Facts\n- [F2 t1] Node 24 (package.json)\n- [F3 ${TAG}] y (user)\n`);
 });
 
@@ -86,7 +86,7 @@ test('retire: the exact line moves to superseded.md with the retired tag and rea
     { op: 'retire', id: 'I1', reason: 'user switched to pnpm' },
     { op: 'retire', id: 'I2', reason: 'not needed' },
   ], OPTS);
-  assert.deepEqual(r, { applied: ['0:retire I1', '1:retire I2'], skipped: [], errors: [] });
+  assert.deepEqual(r, { applied: ['0:retire I1', '1:retire I2'], skipped: [], errors: [], demoted: [] });
   const now = await readMemory(dir);
   assert.equal(now['instructions.md'], '# Instructions\n\n## Build\n\n## Style\n- [I4 t2] no semicolons\n');
   assert.equal(now['superseded.md'], `${before['superseded.md']}` +
@@ -100,7 +100,7 @@ test('replace: retires the old item and adds the new text as a new item of the s
     { op: 'replace', id: 'I1', text: 'use pnpm', reason: 'user switched' },
     { op: 'replace', id: 'F2', text: 'Node 24.1 (node --version)', reason: 'checked' },
   ], OPTS);
-  assert.deepEqual(r, { applied: ['0:replace I1 I8', '1:replace F2 F3'], skipped: [], errors: [] });
+  assert.deepEqual(r, { applied: ['0:replace I1 I8', '1:replace F2 F3'], skipped: [], errors: [], demoted: [] });
   const now = await readMemory(dir);
   assert.equal(now['instructions.md'],
     `# Instructions\n\n## Build\n- [I2 t3@0ther000] run tests first\n\n## Style\n- [I4 t2] no semicolons\n- [I8 ${TAG}] use pnpm\n`);
@@ -115,7 +115,7 @@ test('now: rewrites only this session\'s now.md; shared files and other sessions
   const { dir: other } = await createSession(slateOf(dir), 'other', 2);
   await fs.writeFile(path.join(other, 'now.md'), 'Goal: other work\n');
   const r = await applyChanges(dir, [{ op: 'now', text: 'Goal: ship\n\nNext: run tests' }], OPTS);
-  assert.deepEqual(r, { applied: ['0:now'], skipped: [], errors: [] });
+  assert.deepEqual(r, { applied: ['0:now'], skipped: [], errors: [], demoted: [] });
   const now = await readMemory(dir);
   assert.equal(now['now.md'], 'Goal: ship\n\nNext: run tests\n');
   for (const f of ['instructions.md', 'assumptions.md', 'facts.md', 'superseded.md']) assert.equal(now[f], before[f], f);
@@ -141,7 +141,7 @@ test('plain user bullets are adopted at t0 with their text unchanged, even with 
     'facts.md': '# Facts\r\n- repo is at /srv/app (user)\r\n',
   });
   const r = await applyChanges(dir, [], OPTS);
-  assert.deepEqual(r, { applied: ['adopt I8', 'adopt F1'], skipped: [], errors: [] });
+  assert.deepEqual(r, { applied: ['adopt I8', 'adopt F1'], skipped: [], errors: [], demoted: [] });
   const now = await readMemory(dir);
   assert.equal(now['instructions.md'], '# Instructions\n- [I1 t1] use npm\n- [I8 t0] prefer tabs  \nfree text line\n* star bullet\n' +
     '- [I3] malformed tag\n- ~~use yarn~~ (retired I7)\n');
@@ -152,7 +152,7 @@ test('an add whose text matches a live item exactly is skipped, adopted bullets 
   const { dir, before } = await slate({ ...BASE, 'assumptions.md': '# Assumptions\n- prefer tabs\n' });
   const r = await applyChanges(dir, [
     { op: 'add', type: 'I', text: 'use npm' },
-    { op: 'add', type: 'A', text: 'prefer tabs' },
+    { op: 'add', type: 'A', text: 'prefer tabs', home: 'general' },
     { op: 'add', type: 'I', text: 'new rule' },
     { op: 'add', type: 'I', text: 'new rule' },
     { op: 'add', type: 'I', text: 'use yarn' }, // retired, not live: added again
@@ -161,6 +161,7 @@ test('an add whose text matches a live item exactly is skipped, adopted bullets 
     applied: ['adopt A10', '2:add I8', '4:add I9'],
     skipped: ['0:duplicate I1', '1:duplicate A10', '3:duplicate I8'],
     errors: [],
+    demoted: [],
   });
   assert.equal((await readMemory(dir))['instructions.md'],
     `${before['instructions.md']}- [I8 ${TAG}] new rule\n- [I9 ${TAG}] use yarn\n`);
@@ -175,7 +176,7 @@ test('strict: one stale ID means nothing is applied, adoption included', async (
     { op: 'retire', id: 'I7', reason: 'already retired' },
     { op: 'replace', id: 'F9', text: 'x (user)', reason: 'never existed' },
   ], OPTS);
-  assert.deepEqual(r, { applied: [], skipped: [], errors: ['1:stale I7', '2:stale F9'] });
+  assert.deepEqual(r, { applied: [], skipped: [], errors: ['1:stale I7', '2:stale F9'], demoted: [] });
   assert.deepEqual(await readMemory(dir), before);
 });
 
@@ -194,9 +195,11 @@ test('lenient: a stale replace still adds its new item; a stale retire is droppe
   const r = await applyChanges(dir, [
     { op: 'replace', id: 'I5', text: 'use pnpm', reason: 'user switched' },
     { op: 'retire', id: 'A3', reason: 'r' },
-    { op: 'add', type: 'A', text: 'fine' },
+    { op: 'add', type: 'A', text: 'fine', home: 'general' },
   ], { ...OPTS, lenient: true });
-  assert.deepEqual(r, { applied: ['0:add I8', '2:add A10'], skipped: [], errors: ['0:stale I5', '1:stale A3'] });
+  assert.deepEqual(r, {
+    applied: ['0:add I8', '2:add A10'], skipped: [], errors: ['0:stale I5', '1:stale A3'], demoted: [],
+  });
   const now = await readMemory(dir);
   assert.equal(now['instructions.md'], `${before['instructions.md']}- [I8 ${TAG}] use pnpm\n`);
   assert.equal(now['superseded.md'], before['superseded.md']);
@@ -229,6 +232,27 @@ const INVALID = [
   ['now over 10 lines', { op: 'now', text: Array.from({ length: 11 }, (_, i) => `line ${i}`).join('\n') }, 'now too long'],
   ['item tag in now', { op: 'now', text: 'Goal: x\n- [I1 t1] use npm' }, 'tag in now'],
   ['retired note in now', { op: 'now', text: 'Goal: x (retired I1)' }, 'tag in now'],
+  // topics, homes and moves
+  ['topic with a bad slug', { op: 'topic', slug: 'Canonical URLs', title: 'T', summary: 'S' }, 'bad slug'],
+  ['topic named key', { op: 'topic', slug: 'key', title: 'T', summary: 'S' }, 'bad slug'],
+  ['add into a bad slug', { op: 'add', type: 'F', text: 'x (user)', topic: '../x' }, 'bad slug'],
+  ['home with a bad slug', { op: 'add', type: 'A', text: 'x', home: 'a b' }, 'bad slug'],
+  ['move to a bad slug', { op: 'move', id: 'F2', to: 'x/y' }, 'bad slug'],
+  ['topic without a summary', { op: 'topic', slug: 'seo', title: 'SEO' }, 'bad op'],
+  ['topic with an empty title', { op: 'topic', slug: 'seo', title: ' ', summary: 'S' }, 'empty title'],
+  ['topic with an empty summary', { op: 'topic', slug: 'seo', title: 'SEO', summary: '' }, 'empty summary'],
+  ['topic with a multi-line title', { op: 'topic', slug: 'seo', title: 'a\nb', summary: 'S' }, 'multi-line title'],
+  ['topic with a multi-line summary', { op: 'topic', slug: 'seo', title: 'SEO', summary: 'a\r\nb' }, 'multi-line summary'],
+  ['add into a missing topic', { op: 'add', type: 'F', text: 'x (user)', topic: 'nope' }, 'missing topic'],
+  ['key fact without a home', { op: 'add', type: 'F', text: 'x (user)' }, 'no home'],
+  ['key assumption without a home', { op: 'add', type: 'A', text: 'x' }, 'no home'],
+  ['home naming a missing topic', { op: 'add', type: 'F', text: 'x (user)', home: 'nope' }, 'missing topic'],
+  ['move to a missing topic', { op: 'move', id: 'F2', to: 'nope' }, 'missing topic'],
+  ['move of an instruction', { op: 'move', id: 'I1', to: 'general' }, 'instruction move'],
+  ['move with a bad ID', { op: 'move', id: 'F', to: 'key' }, 'bad id'],
+  ['move of a missing item', { op: 'move', id: 'F9', to: 'key' }, 'stale F9'],
+  ['instruction into a topic', { op: 'add', type: 'I', text: 'x', topic: 'general' }, 'bad op'],
+  ['add with both topic and home', { op: 'add', type: 'F', text: 'x (user)', topic: 'general', home: 'general' }, 'bad op'],
 ];
 
 for (const [name, op, kind] of INVALID) {
@@ -237,15 +261,16 @@ for (const [name, op, kind] of INVALID) {
     const fix = (o) => (o && typeof o.text === 'string' ? { ...o, text: o.text.replace(ROOT_SLATE, slateOf(dir)) } : o);
     const ops = [{ op: 'add', type: 'I', text: 'valid rule' }, fix(op)];
     const strict = await applyChanges(dir, ops, OPTS);
-    assert.deepEqual(strict, { applied: [], skipped: [], errors: [`1:${kind}`] });
+    assert.deepEqual(strict, { applied: [], skipped: [], errors: [`1:${kind}`], demoted: [] });
     assertSafe(strict);
     assert.deepEqual(await readMemory(dir), before);
 
     const lenient = await applyChanges(dir, ops, { ...OPTS, lenient: true });
-    assert.deepEqual(lenient, { applied: ['0:add I8'], skipped: [], errors: [`1:${kind}`] });
+    assert.deepEqual(lenient, { applied: ['0:add I8'], skipped: [], errors: [`1:${kind}`], demoted: [] });
     const now = await readMemory(dir);
     assert.equal(now['instructions.md'], `${before['instructions.md']}- [I8 ${TAG}] valid rule\n`);
     for (const f of ['assumptions.md', 'facts.md', 'superseded.md', 'now.md']) assert.equal(now[f], before[f], f);
+    for (const f of ['topics', 'usage.json']) assert.equal(await exists(path.join(slateOf(dir), f)), false, f);
   });
 }
 
@@ -262,7 +287,7 @@ test('valid edge cases: 10 lines of now with blanks, a nested source, an empty n
   const ten = Array.from({ length: 10 }, (_, i) => `line ${i}`).join('\n\n');
   const r = await applyChanges(dir, [
     { op: 'now', text: ten },
-    { op: 'add', type: 'F', text: 'tests pass (npm test (v2))' },
+    { op: 'add', type: 'F', text: 'tests pass (npm test (v2))', home: 'general' },
   ], OPTS);
   assert.deepEqual(r.errors, []);
   assert.equal((await readMemory(dir))['now.md'], `${ten}\n`);
@@ -270,19 +295,32 @@ test('valid edge cases: 10 lines of now with blanks, a nested source, an empty n
   assert.equal((await readMemory(dir))['now.md'], '');
 });
 
-test('CHANGE_SCHEMA: ops is a list of four closed op shapes; add has no id', () => {
-  assert.deepEqual(CHANGE_SCHEMA.required, ['ops']);
+test('CHANGE_SCHEMA: ops is a list of closed op shapes plus relevant IDs; add has no id', () => {
+  assert.deepEqual(CHANGE_SCHEMA.required, ['ops', 'relevant']);
   assert.equal(CHANGE_SCHEMA.additionalProperties, false);
+  assert.deepEqual(CHANGE_SCHEMA.properties.relevant, { type: 'array', items: { type: 'string' } });
   const shapes = CHANGE_SCHEMA.properties.ops.items.oneOf;
-  const byOp = Object.fromEntries(shapes.map((s) => [s.properties.op.const, s]));
-  assert.deepEqual(Object.keys(byOp).sort(), ['add', 'now', 'replace', 'retire']);
-  const fields = { add: ['op', 'type', 'text'], retire: ['op', 'id', 'reason'], replace: ['op', 'id', 'text', 'reason'], now: ['op', 'text'] };
-  for (const [op, keys] of Object.entries(fields)) {
-    assert.equal(byOp[op].additionalProperties, false, op);
-    assert.deepEqual(Object.keys(byOp[op].properties).sort(), [...keys].sort(), op);
-    assert.deepEqual([...byOp[op].required].sort(), [...keys].sort(), op);
+  const key = (s) => [s.properties.op.const, ...Object.keys(s.properties).filter((k) => k !== 'op').sort()].join(' ');
+  const fields = {
+    add: [['type', 'text'], ['type', 'text', 'topic'], ['type', 'text', 'home']],
+    retire: [['id', 'reason']],
+    replace: [['id', 'text', 'reason']],
+    now: [['text']],
+    topic: [['slug', 'title', 'summary']],
+    move: [['id', 'to']],
+  };
+  const want = Object.entries(fields).flatMap(([op, sets]) => sets.map((f) => [op, ...[...f].sort()].join(' ')));
+  assert.deepEqual(shapes.map(key).sort(), want.sort());
+  for (const s of shapes) {
+    assert.equal(s.additionalProperties, false, key(s));
+    assert.deepEqual([...s.required].sort(), Object.keys(s.properties).sort(), key(s));
   }
-  assert.deepEqual(byOp.add.properties.type.enum, ['I', 'A', 'F']);
+  const adds = shapes.filter((s) => s.properties.op.const === 'add');
+  // An instruction never goes in a topic; a fact or assumption is added to a topic or with a home.
+  assert.deepEqual(adds.find((s) => !s.properties.topic && !s.properties.home).properties.type.enum, ['I']);
+  for (const s of adds.filter((x) => x.properties.topic || x.properties.home)) {
+    assert.deepEqual(s.properties.type.enum, ['A', 'F'], key(s));
+  }
 });
 
 // --- memory.lock ---
@@ -373,4 +411,271 @@ test('a deleted slate: applyChanges throws and recreates nothing', async () => {
     { op: 'add', type: 'I', text: 'x' }, { op: 'now', text: 'Goal: x' },
   ], OPTS));
   assert.equal(await exists(s), false);
+});
+
+// --- topics, relevance and caps ---
+
+const T1 = new Date('2026-10-20T10:00:00.000Z');
+const T2 = new Date('2026-10-21T10:00:00.000Z');
+const T3 = new Date('2026-10-22T10:00:00.000Z');
+const topicFile = (dir, slug) => path.join(slateOf(dir), 'topics', `${slug}.md`);
+const readTopic = (dir, slug) => fs.readFile(topicFile(dir, slug), 'utf8');
+async function writeTopic(dir, slug, text) {
+  await fs.mkdir(path.join(slateOf(dir), 'topics'), { recursive: true });
+  await fs.writeFile(topicFile(dir, slug), text);
+}
+const usagePath = (dir) => path.join(slateOf(dir), 'usage.json');
+const readUsage = async (dir) => JSON.parse(await fs.readFile(usagePath(dir), 'utf8'));
+const writeUsage = (dir, usage) => fs.writeFile(usagePath(dir), JSON.stringify(usage));
+const use = (date, count, home) => ({ last: date.toISOString(), count, ...(home && { home }) });
+// An item line of exactly n chars, its text unique to its ID.
+function itemLine(id, n) {
+  const head = `- [${id} t1] ${id} `;
+  return `${head}${'x'.repeat(n - head.length - ' (user)'.length)} (user)`;
+}
+const BUILD = '# Build\n> How the project builds.\n';
+
+test('topic: creates topics/<slug>.md with its title and summary; another updates only the header', async () => {
+  const { dir, before } = await slate();
+  let r = await applyChanges(dir, [{ op: 'topic', slug: 'canonical', title: 'Canonical URLs', summary: 'Which URL wins.' }], OPTS);
+  assert.deepEqual(r, { applied: ['0:topic canonical'], skipped: [], errors: [], demoted: [] });
+  assert.equal(await readTopic(dir, 'canonical'), '# Canonical URLs\n> Which URL wins.\n');
+  await fs.appendFile(topicFile(dir, 'canonical'), '- [F5 t1]  kept  as is (user)\n');
+  r = await applyChanges(dir, [{ op: 'topic', slug: 'canonical', title: ' Canonical ', summary: 'Rules for canonical tags.' }], OPTS);
+  assert.deepEqual(r.applied, ['0:topic canonical']);
+  assert.equal(await readTopic(dir, 'canonical'), '# Canonical\n> Rules for canonical tags.\n- [F5 t1]  kept  as is (user)\n');
+  assert.deepEqual(await readMemory(dir), before);
+});
+
+test('topic ops apply first: an add earlier in the list can go into a topic the list creates', async () => {
+  const { dir, before } = await slate();
+  const r = await applyChanges(dir, [
+    { op: 'add', type: 'F', text: 'one canonical tag per page (user)', topic: 'canonical' },
+    { op: 'add', type: 'A', text: 'themes print their own tag', topic: 'canonical' },
+    { op: 'topic', slug: 'canonical', title: 'Canonical URLs', summary: 'Which URL wins.' },
+  ], { ...OPTS, now: T1 });
+  assert.deepEqual(r, {
+    applied: ['2:topic canonical', '0:add F3>canonical', '1:add A10>canonical'], skipped: [], errors: [], demoted: [],
+  });
+  assert.equal(await readTopic(dir, 'canonical'), '# Canonical URLs\n> Which URL wins.\n' +
+    `- [F3 ${TAG}] one canonical tag per page (user)\n- [A10 ${TAG}] themes print their own tag\n`);
+  assert.deepEqual(await readMemory(dir), before, 'key files untouched');
+  assert.deepEqual(await readUsage(dir), { A10: use(T1, 0), F3: use(T1, 0) }, 'added items are stamped');
+});
+
+test('a key add lands in its key file and records its home in usage.json', async () => {
+  const { dir, before } = await slate();
+  await writeTopic(dir, 'build', BUILD);
+  const r = await applyChanges(dir, [{ op: 'add', type: 'F', text: 'pnpm 9 (package.json)', home: 'build' }], { ...OPTS, now: T1 });
+  assert.deepEqual(r.applied, ['0:add F3']);
+  assert.equal((await readMemory(dir))['facts.md'], `${before['facts.md']}- [F3 ${TAG}] pnpm 9 (package.json)\n`);
+  assert.equal(await readTopic(dir, 'build'), BUILD);
+  assert.deepEqual(await readUsage(dir), { F3: use(T1, 0, 'build') });
+});
+
+test('general: a home before it exists; created with its title and summary when an item lands in it', async () => {
+  const { dir } = await slate();
+  await applyChanges(dir, [{ op: 'add', type: 'A', text: 'deploys run nightly', home: 'general' }], OPTS);
+  assert.equal(await exists(path.join(slateOf(dir), 'topics')), false, 'no topic needed yet');
+  const r = await applyChanges(dir, [{ op: 'move', id: 'A10', to: 'general' }], OPTS);
+  assert.deepEqual(r.applied, ['0:move A10>general']);
+  assert.equal(await readTopic(dir, 'general'),
+    `# General\n> Items without a more specific topic.\n- [A10 ${TAG}] deploys run nightly\n`);
+});
+
+test('move: key to topic and topic to key keep the line byte-identical; a promoted item is stamped with its home', async () => {
+  const facts = '# Facts\n- [F2 t1] Node 24 (package.json)\n- [F3 t4@0ther000]  odd  spacing (user)\n';
+  const { dir } = await slate({ ...BASE, 'facts.md': facts });
+  await writeTopic(dir, 'build', `${BUILD}- [F6 t2@0ther000] uses vite (vite.config.ts)\n`);
+  const r = await applyChanges(dir, [
+    { op: 'move', id: 'F3', to: 'build' },
+    { op: 'move', id: 'F6', to: 'key' },
+  ], { ...OPTS, now: T1 });
+  assert.deepEqual(r, { applied: ['0:move F3>build', '1:move F6>key'], skipped: [], errors: [], demoted: [] });
+  assert.equal((await readMemory(dir))['facts.md'],
+    '# Facts\n- [F2 t1] Node 24 (package.json)\n- [F6 t2@0ther000] uses vite (vite.config.ts)\n');
+  assert.equal(await readTopic(dir, 'build'), `${BUILD}- [F3 t4@0ther000]  odd  spacing (user)\n`);
+  assert.deepEqual(await readUsage(dir), { F6: use(T1, 0, 'build') });
+
+  const again = await applyChanges(dir, [{ op: 'move', id: 'F6', to: 'key' }, { op: 'move', id: 'F3', to: 'build' }], OPTS);
+  assert.deepEqual(again, { applied: [], skipped: ['0:in place F6', '1:in place F3'], errors: [], demoted: [] });
+});
+
+test('retire and replace reach topic items; a replacement stays in its topic; the next ID counts topic files', async () => {
+  const { dir, before } = await slate();
+  await writeTopic(dir, 'build', `${BUILD}- [F20 t1] uses vite (vite.config.ts)\n- [A30 t1] CI caches deps\n`);
+  const r = await applyChanges(dir, [
+    { op: 'replace', id: 'F20', text: 'uses vite 6 (vite.config.ts)', reason: 'upgraded' },
+    { op: 'retire', id: 'A30', reason: 'checked: it does not' },
+    { op: 'add', type: 'A', text: 'deploys run nightly', home: 'build' },
+  ], OPTS);
+  assert.deepEqual(r.applied, ['0:replace F20 F21', '1:retire A30', '2:add A31']);
+  assert.equal(await readTopic(dir, 'build'), `${BUILD}- [F21 ${TAG}] uses vite 6 (vite.config.ts)\n`);
+  assert.equal((await readMemory(dir))['superseded.md'], `${before['superseded.md']}` +
+    `- [F20 t1 retired ${TAG}] uses vite (vite.config.ts) (reason: upgraded)\n` +
+    `- [A30 t1 retired ${TAG}] CI caches deps (reason: checked: it does not)\n`);
+});
+
+test('an add whose text is live in a topic is a duplicate', async () => {
+  const { dir } = await slate();
+  await writeTopic(dir, 'build', `${BUILD}- [F20 t1] uses vite (vite.config.ts)\n`);
+  const r = await applyChanges(dir, [{ op: 'add', type: 'F', text: 'uses vite (vite.config.ts)', home: 'build' }], OPTS);
+  assert.deepEqual(r.skipped, ['0:duplicate F20']);
+});
+
+test('a plain bullet in a topic file is adopted as a fact at t0, text unchanged', async () => {
+  const { dir } = await slate();
+  await writeTopic(dir, 'build', `${BUILD}- uses vite (user)\n`);
+  const r = await applyChanges(dir, [], OPTS);
+  assert.deepEqual(r.applied, ['adopt F3']);
+  assert.equal(await readTopic(dir, 'build'), `${BUILD}- [F3 t0] uses vite (user)\n`);
+});
+
+test('relevant: live facts and assumptions get last and count; unknown, retired, instruction and malformed IDs are ignored', async () => {
+  const { dir } = await slate();
+  await writeTopic(dir, 'build', `${BUILD}- [F20 t1] uses vite (vite.config.ts)\n`);
+  await applyChanges(dir, [], { ...OPTS, relevant: ['F2', 'F20', 'A1', 'F2'], now: T1 });
+  assert.deepEqual(await readUsage(dir), { A1: use(T1, 1), F2: use(T1, 1), F20: use(T1, 1) });
+  await applyChanges(dir, [], { ...OPTS, relevant: ['F2', 'F99', 'A9', 'I1', 'F 2', 7], now: T2 });
+  assert.deepEqual(await readUsage(dir), { A1: use(T1, 1), F2: use(T2, 2), F20: use(T1, 1) });
+});
+
+test('strict: an error writes no usage either', async () => {
+  const { dir } = await slate();
+  const r = await applyChanges(dir, [{ op: 'retire', id: 'F9', reason: 'r' }], { ...OPTS, relevant: ['F2'] });
+  assert.deepEqual(r.errors, ['0:stale F9']);
+  assert.equal(await exists(usagePath(dir)), false);
+});
+
+test('usage.json drops the entry of an item that is no longer live', async () => {
+  const { dir } = await slate();
+  await applyChanges(dir, [], { ...OPTS, relevant: ['F2', 'A1'], now: T1 });
+  await applyChanges(dir, [{ op: 'retire', id: 'F2', reason: 'gone' }], OPTS);
+  assert.deepEqual(await readUsage(dir), { A1: use(T1, 1) });
+});
+
+test('caps: 3,000 chars of fact lines and 1,500 of assumption lines', () => {
+  assert.equal(FACTS_CAP, 3000);
+  assert.equal(ASSUMPTIONS_CAP, 1500);
+});
+
+test('caps: going past 3,000 demotes the least recently relevant key fact to its home, line unchanged', async () => {
+  const lines = [itemLine('F1', 1000), itemLine('F2', 1000), itemLine('F3', 900)];
+  const { dir } = await slate({ ...BASE, 'facts.md': `# Facts\n${lines.join('\n')}\n` });
+  await writeTopic(dir, 'build', BUILD);
+  await writeTopic(dir, 'seo', '# SEO\n> Search.\n');
+  await writeUsage(dir, { F1: use(T2, 1, 'build'), F2: use(T1, 9, 'seo'), F3: use(T3, 1, 'build') });
+  const r = await applyChanges(dir, [{ op: 'add', type: 'F', text: `${'n'.repeat(200)} (user)`, home: 'build' }], { ...OPTS, now: T3 });
+  assert.deepEqual(r, { applied: ['0:add F4'], skipped: [], errors: [], demoted: ['F2>seo'] });
+  assert.equal((await readMemory(dir))['facts.md'],
+    `# Facts\n${lines[0]}\n${lines[2]}\n- [F4 ${TAG}] ${'n'.repeat(200)} (user)\n`);
+  assert.equal(await readTopic(dir, 'seo'), `# SEO\n> Search.\n${lines[1]}\n`);
+  assert.equal(await readTopic(dir, 'build'), BUILD);
+  assert.deepEqual((await readUsage(dir)).F2, use(T1, 9, 'seo'), 'a demoted item keeps its usage');
+});
+
+test('caps: on a tie the lower count goes, then the lower ID', async () => {
+  const lines = [itemLine('F1', 1000), itemLine('F2', 1000), itemLine('F3', 900)];
+  const { dir } = await slate({ ...BASE, 'facts.md': `# Facts\n${lines.join('\n')}\n` });
+  await writeTopic(dir, 'build', BUILD);
+  await writeUsage(dir, { F1: use(T1, 3, 'build'), F2: use(T1, 1, 'build'), F3: use(T1, 1, 'build') });
+  const r = await applyChanges(dir, [{ op: 'add', type: 'F', text: `${'n'.repeat(200)} (user)`, home: 'build' }], OPTS);
+  assert.deepEqual(r.demoted, ['F2>build']);
+  assert.equal(await readTopic(dir, 'build'), `${BUILD}${lines[1]}\n`);
+});
+
+test('caps: an item with no usage counts as oldest; with no home it goes to general, which is created', async () => {
+  const lines = [itemLine('F1', 1500), itemLine('F2', 1400)];
+  const { dir } = await slate({ ...BASE, 'facts.md': `# Facts\n${lines.join('\n')}\n` });
+  await writeUsage(dir, { F1: use(T1, 1) });
+  const r = await applyChanges(dir, [{ op: 'add', type: 'F', text: `${'n'.repeat(200)} (user)`, home: 'general' }], OPTS);
+  assert.deepEqual(r.demoted, ['F2>general']);
+  assert.equal(await readTopic(dir, 'general'), `# General\n> Items without a more specific topic.\n${lines[1]}\n`);
+});
+
+test('caps: items added or promoted by the same list are never demoted, even if the file stays over', async () => {
+  const { dir } = await slate({ ...BASE, 'facts.md': `# Facts\n${itemLine('F1', 1000)}\n` });
+  await writeTopic(dir, 'build', `${BUILD}${itemLine('F9', 1500)}\n`);
+  const r = await applyChanges(dir, [
+    { op: 'move', id: 'F9', to: 'key' },
+    { op: 'add', type: 'F', text: `${'n'.repeat(1500)} (user)`, home: 'build' },
+  ], OPTS);
+  assert.deepEqual(r, { applied: ['0:move F9>key', '1:add F10'], skipped: [], errors: [], demoted: ['F1>general'] });
+  const facts = (await readMemory(dir))['facts.md'];
+  assert.ok(facts.includes(itemLine('F9', 1500)) && facts.includes('- [F10 '), facts.slice(0, 80));
+  assert.ok(facts.length > FACTS_CAP, 'still over: demotion never fails the apply');
+});
+
+test('caps: assumptions.md obeys 1,500 chars', async () => {
+  const lines = [itemLine('A1', 800), itemLine('A2', 600)];
+  const { dir } = await slate({ ...BASE, 'assumptions.md': `# Assumptions\n${lines.join('\n')}\n` });
+  await writeUsage(dir, { A2: use(T1, 1) });
+  const r = await applyChanges(dir, [{ op: 'add', type: 'A', text: 'n'.repeat(200), home: 'general' }], OPTS);
+  assert.deepEqual(r.demoted, ['A1>general']);
+  assert.equal((await readMemory(dir))['assumptions.md'], `# Assumptions\n${lines[1]}\n- [A10 ${TAG}] ${'n'.repeat(200)}\n`);
+  assert.equal(await readTopic(dir, 'general'), `# General\n> Items without a more specific topic.\n${lines[0]}\n`);
+});
+
+test('caps: only item lines count; a key file at the cap is left alone', async () => {
+  const facts = `# Facts\n\n## Notes\nfree text ${'z'.repeat(500)}\n${itemLine('F1', 1500)}\n${itemLine('F2', 1500)}\n`;
+  const { dir } = await slate({ ...BASE, 'facts.md': facts });
+  const r = await applyChanges(dir, [], OPTS);
+  assert.deepEqual(r.demoted, []);
+  assert.equal((await readMemory(dir))['facts.md'], facts);
+});
+
+const ADD_TOPICS = `
+const [mod, dir, sid, tag, start, count] = process.argv.slice(1);
+const { applyChanges } = await import(mod);
+await new Promise((r) => setTimeout(r, Math.max(0, Number(start) - Date.now())));
+for (let i = 1; i <= Number(count); i++) {
+  const text = tag + ' ' + i + ' ' + 'p'.repeat(40);
+  const op = i % 3 === 0 ? { op: 'add', type: 'I', text }
+    : i % 3 === 1 ? { op: 'add', type: 'F', text: text + ' (user)', topic: 'shared' }
+    : { op: 'add', type: 'F', text: text + ' (user)', home: 'shared' };
+  const r = await applyChanges(dir, [op], { turn: i, sessionId: sid, relevant: ['F1'] });
+  if (r.applied.length !== 1 || r.errors.length) throw new Error(JSON.stringify(r));
+}
+`;
+
+test('Review Focus 2: six processes adding to key files and topics with relevant lose nothing and share no ID', async () => {
+  const PROCS = 6;
+  const ADDS = 30;
+  const { dir } = await slate({
+    'instructions.md': '# Instructions\n', 'facts.md': '# Facts\n- [F1 t1] the seed (user)\n', 'superseded.md': '# Superseded\n',
+  });
+  await writeTopic(dir, 'shared', '# Shared\n> Everything.\n');
+  const sessions = [{ dir, sid: SID }];
+  for (let p = 1; p < PROCS; p++) {
+    const sid = `${p}${'b'.repeat(7)}-other`;
+    sessions.push({ dir: (await createSession(slateOf(dir), sid, 2)).dir, sid });
+  }
+  const start = String(Date.now() + 500);
+  const kids = sessions.map(({ dir: d, sid }, p) =>
+    child(ADD_TOPICS, [APPLY, d, sid, `from ${p}`, start, String(ADDS)], ['ignore', 'ignore', 'inherit']));
+  const codes = await Promise.all(kids.map(async (k) => (await once(k, 'exit'))[0]));
+  assert.deepEqual(codes, Array(PROCS).fill(0));
+
+  const mem = await readMemory(dir);
+  const topics = path.join(slateOf(dir), 'topics');
+  const texts = [mem['instructions.md'], mem['facts.md']];
+  for (const f of await fs.readdir(topics)) texts.push(await fs.readFile(path.join(topics, f), 'utf8'));
+  const lines = texts.join('\n').split('\n').filter((l) => /^- \[[IAF]\d+ /.test(l));
+  assert.equal(lines.length, PROCS * ADDS + 1);
+  const ids = lines.map((l) => /^- \[([IAF]\d+) /.exec(l)[1]);
+  assert.equal(new Set(ids).size, ids.length, 'unique IDs');
+  const nums = (type) => ids.filter((id) => id[0] === type).map((id) => Number(id.slice(1))).sort((a, b) => a - b);
+  assert.deepEqual(nums('I'), Array.from({ length: PROCS * ADDS / 3 }, (_, i) => i + 1));
+  assert.deepEqual(nums('F'), Array.from({ length: (PROCS * ADDS * 2) / 3 + 1 }, (_, i) => i + 1));
+  const all = new Set(lines.map((l) => l.replace(/^- \[[^\]]*\] /, '').replace(/ \(user\)$/, '')));
+  for (let p = 0; p < PROCS; p++) {
+    for (let i = 1; i <= ADDS; i++) assert.ok(all.has(`from ${p} ${i} ${'p'.repeat(40)}`), `from ${p} ${i}`);
+  }
+  assert.equal((await readUsage(dir)).F1.count, PROCS * ADDS, 'no relevance update lost');
+  const keyChars = mem['facts.md'].split('\n').filter((l) => l.startsWith('- [')).reduce((n, l) => n + l.length, 0);
+  assert.ok(keyChars <= FACTS_CAP, `facts.md holds ${keyChars} chars of items`);
+  for (const d of [slateOf(dir), topics]) {
+    const left = (await fs.readdir(d)).filter((n) => n.includes('.lock') || n.endsWith('.tmp'));
+    assert.deepEqual(left, [], `no lock, claim or temp file left in ${d}`);
+  }
 });

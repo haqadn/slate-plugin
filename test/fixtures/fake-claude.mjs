@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Fake `claude` for curator tests. Records each call to $FAKE_RECORD (one JSON line, with `seen`,
 // instructions.md as it read it) and prints a `--output-format json` result whose
-// `structured_output` is a change list, per $FAKE_MODE:
+// `structured_output` is a change list (`relevant` empty unless said), per $FAKE_MODE:
 //   good             add "fake item <turn>"
+//   relevant         add the key fact "fake fact <turn> (user)" with home general; relevant F1, F99
 //   invalid          that add, plus an F item without a source
 //   invalid-then-good
 //   stale            first call: another session retires I1 (adding I4 "use bun") just after the
@@ -43,8 +44,8 @@ if (record) {
 const GOOD = [{ op: 'add', type: 'I', text: `fake item ${turn}` }];
 const INVALID = [...GOOD, { op: 'add', type: 'F', text: 'an unsourced fact' }];
 
-function reply(ops) {
-  const out = { ops };
+function reply(ops, relevant = []) {
+  const out = { ops, relevant };
   const result = { type: 'result', subtype: 'success', is_error: false, result: JSON.stringify(out), structured_output: out };
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
@@ -64,6 +65,9 @@ const sleep = (fallback) => new Promise((r) => setTimeout(r, Number(process.env.
 switch (mode) {
   case 'good':
     reply(GOOD);
+    break;
+  case 'relevant':
+    reply([{ op: 'add', type: 'F', text: `fake fact ${turn} (user)`, home: 'general' }], ['F1', 'F99']);
     break;
   case 'invalid':
     reply(INVALID);

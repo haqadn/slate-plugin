@@ -14,7 +14,7 @@ import {
 import { acquire } from './lib/lock.mjs';
 import { applyChanges, CHANGE_SCHEMA } from './lib/apply.mjs';
 import { MEMORY_FILES } from './lib/items.mjs';
-import { memoryPath, slateOf } from './lib/slate.mjs';
+import { memoryPath, slateOf, listTopics } from './lib/slate.mjs';
 
 const RULES_FILE = new URL('../curator-rules.md', import.meta.url);
 const ANSWER_MAX = 12000;
@@ -73,7 +73,11 @@ function cap(text, max, note) {
   return `${text.slice(0, cut)}\n${note}`;
 }
 
-function buildPrompt({ rules, turn, real, message, answer }) {
+// The topic index: one line per topic with its slug, title, summary, item count and path.
+const topicLine = (t) => `- ${t.slug}: ${t.title}${t.summary ? ` — ${t.summary}` : ''} (${t.count} items) ${t.path}`;
+const topicLines = (topics) => (topics.length ? ['Topics:', ...topics.map(topicLine)] : ['Topics: none yet.']);
+
+function buildPrompt({ rules, turn, real, topics, message, answer }) {
   const turnFile = queueFile(real, turn);
   return [
     rules.trim(),
@@ -84,6 +88,8 @@ function buildPrompt({ rules, turn, real, message, answer }) {
     '',
     'Memory files:',
     ...MEMORY_FILES.map((f) => `- ${memoryPath(real, f)}`),
+    '',
+    ...topicLines(topics),
     '',
     "The user's message, verbatim:",
     '<message>',
@@ -100,7 +106,10 @@ function buildPrompt({ rules, turn, real, message, answer }) {
 // Order and rule syntax per docs/verified.md section 5: the prompt goes right after -p, before
 // the variadic --tools / --allowedTools. Read only: the change list comes back on stdout.
 function curatorArgs(prompt, model, real) {
-  const rules = MEMORY_FILES.map((f) => `Read(/${memoryPath(real, f)})`);
+  const rules = [
+    ...MEMORY_FILES.map((f) => `Read(/${memoryPath(real, f)})`),
+    `Read(/${path.join(slateOf(real), 'topics')}/**)`,
+  ];
   return [
     '-p', prompt,
     '--model', model,
@@ -202,11 +211,13 @@ function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
   });
 }
 
-// The change list from `--output-format json`: the result's top-level structured_output.
-function parseOps(stdout) {
+// The change list from `--output-format json`: the result's top-level structured_output, with its
+// ops and the IDs relevant to the turn.
+function parseChanges(stdout) {
   try {
-    const ops = JSON.parse(stdout)?.structured_output?.ops;
-    return Array.isArray(ops) ? ops : null;
+    const out = JSON.parse(stdout)?.structured_output;
+    if (!Array.isArray(out?.ops)) return null;
+    return { ops: out.ops, relevant: Array.isArray(out.relevant) ? out.relevant : [] };
   } catch {
     return null;
   }
@@ -217,10 +228,11 @@ const retryNote = (errors) =>
   `Problems, as <op index>:<problem>: ${errors.join('; ')}. ` +
   'Memory may have changed since your read; reread the files, then return the whole corrected list.';
 
-// What an apply did, for the log: tokens only, never item text.
-const summary = ({ applied, skipped }) => [
+// What an apply did, for the log: tokens only, never item text. Demotions are not warnings.
+const summary = ({ applied, skipped, demoted }) => [
   applied.length ? `applied ${applied.join(', ')}` : 'applied nothing',
   skipped.length ? `skipped ${skipped.join(', ')}` : '',
+  demoted.length ? `demoted ${demoted.join(', ')}` : '',
 ].filter(Boolean).join('; ');
 
 async function log(dir, turn, status, detail) {
@@ -245,7 +257,12 @@ async function curateTurn({ dir, turn, model, bin, timeoutMs, signal }) {
     const read = await readTurn(dir, turn);
     const answer = state?.answered ? read.answer : NO_ANSWER;
     const base = buildPrompt({
-      rules: await fs.readFile(RULES_FILE, 'utf8'), turn, real, message: read.message, answer,
+      rules: await fs.readFile(RULES_FILE, 'utf8'),
+      turn,
+      real,
+      topics: await listTopics(slateOf(real)),
+      message: read.message,
+      answer,
     });
     const opts = {
       cwd: slateOf(real),
@@ -262,10 +279,12 @@ async function curateTurn({ dir, turn, model, bin, timeoutMs, signal }) {
         return end('aborted', 'requeued', { errors: ['aborted: requeued'], aborted: true });
       }
       if (run.error) return failed(run.error);
-      const ops = parseOps(run.stdout);
-      if (!ops) return failed('no change list in output');
+      const changes = parseChanges(run.stdout);
+      if (!changes) return failed('no change list in output');
       const lenient = attempts === MAX_ATTEMPTS;
-      const r = await applyChanges(dir, ops, { turn, sessionId: path.basename(dir), lenient });
+      const r = await applyChanges(dir, changes.ops, {
+        turn, sessionId: path.basename(dir), lenient, relevant: changes.relevant,
+      });
       if (r.errors.length === 0) return end('ok', `attempt ${attempts}: ${summary(r)}`, { errors: [] });
       if (lenient) return end('partial', `${r.errors.join('; ')}; ${summary(r)}`, { errors: r.errors, partial: true });
       await log(dir, turn, 'retry', r.errors.join('; '));
