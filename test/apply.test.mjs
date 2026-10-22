@@ -616,6 +616,24 @@ test('caps: assumptions.md obeys 1,500 chars', async () => {
   assert.equal(await readTopic(dir, 'general'), `# General\n> Items without a more specific topic.\n${lines[0]}\n`);
 });
 
+test('caps: a bullet adopted by this apply is stamped and not demoted; a later apply demotes it by recency', async () => {
+  const T4 = new Date('2026-10-23T10:00:00.000Z');
+  const bullet = `${'u'.repeat(883)} (user)`; // adopted as `- [F3 t0] …`, 900 chars
+  const lines = [itemLine('F1', 1000), itemLine('F2', 1000)];
+  const { dir } = await slate({ ...BASE, 'facts.md': `# Facts\n${lines.join('\n')}\n- ${bullet}\n` });
+  await writeUsage(dir, { F1: use(T1, 1), F2: use(T2, 1) });
+  let r = await applyChanges(dir, [{ op: 'add', type: 'F', text: `${'n'.repeat(200)} (user)`, home: 'general' }], { ...OPTS, now: T3 });
+  assert.deepEqual(r, { applied: ['adopt F3', '0:add F4'], skipped: [], errors: [], demoted: ['F1>general'] });
+  assert.equal((await readMemory(dir))['facts.md'],
+    `# Facts\n${lines[1]}\n- [F3 t0] ${bullet}\n- [F4 ${TAG}] ${'n'.repeat(200)} (user)\n`);
+  assert.deepEqual((await readUsage(dir)).F3, use(T3, 0), 'an adopted item is stamped like an add');
+
+  r = await applyChanges(dir, [{ op: 'add', type: 'F', text: `${'m'.repeat(1000)} (user)`, home: 'general' }],
+    { ...OPTS, relevant: ['F2', 'F4'], now: T4 });
+  assert.deepEqual(r.demoted, ['F3>general'], 'now the least recently relevant');
+  assert.ok((await readTopic(dir, 'general')).endsWith(`- [F3 t0] ${bullet}\n`));
+});
+
 test('caps: only item lines count; a key file at the cap is left alone', async () => {
   const facts = `# Facts\n\n## Notes\nfree text ${'z'.repeat(500)}\n${itemLine('F1', 1500)}\n${itemLine('F2', 1500)}\n`;
   const { dir } = await slate({ ...BASE, 'facts.md': facts });

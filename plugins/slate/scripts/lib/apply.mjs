@@ -213,7 +213,7 @@ export async function applyChanges(dir, ops, {
     const skipped = [];
     const errors = [];
     const demoted = [];
-    const fresh = new Set(); // IDs this list adds or promotes: stamped with `now`, never demoted
+    const fresh = new Set(); // IDs this apply adopts, adds or promotes: stamped with `now`, never demoted
 
     const next = Object.fromEntries(TYPES.map((t) => [t, 1]));
     for (const t of [...SHARED.map((f) => text[f]), ...found.map((x) => x.text)]) {
@@ -229,6 +229,7 @@ export async function applyChanges(dir, ops, {
       const id = newId(type);
       file.lines[i] = formatItem({ id, turn: 0, text: line.slice(2) }) + raw.slice(line.length);
       file.changed = true;
+      fresh.add(id);
       applied.push(`adopt ${id}`);
     });
     for (const type of TYPES) adopt(mem[ITEM_FILES[type]], type);
