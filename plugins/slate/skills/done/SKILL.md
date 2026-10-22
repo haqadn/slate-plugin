@@ -12,4 +12,4 @@ The slate to delete is `$ARGUMENTS` if given, otherwise the slate this session i
 
 Ask yes/no with AskUserQuestion, naming the slate and saying that its memory, reports and every session's notes are deleted for good. On no, stop.
 
-On yes, run `node "${CLAUDE_PLUGIN_ROOT}/scripts/slate.mjs" done "${CLAUDE_SESSION_ID}" <name> --yes` with Bash and report the first line of its output. On `refused <name> live <ids>`, name the live sessions: they must be closed or linked elsewhere first.
+On yes, run `node "${CLAUDE_PLUGIN_ROOT}/scripts/slate.mjs" done "${CLAUDE_SESSION_ID}" '<name>' --yes` with Bash (name in single quotes, as typed) and report the first line of its output. On `refused <name> live <ids>`, name the live sessions: they must be closed or linked elsewhere first.

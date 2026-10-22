@@ -10,7 +10,7 @@ import {
   nextTurn, writeMessage, appendAnswer, appendContinuation, pendingTurns, appendOffload, atomicWrite,
 } from './lib/session.mjs';
 import { waitFree, lockHolder } from './lib/lock.mjs';
-import { slateHome, findSession } from './lib/slate.mjs';
+import { slateHome, findSession, slateAccess, sweepSessions } from './lib/slate.mjs';
 import { memoryBlock, changeLine } from './lib/inject.mjs';
 
 const CURATE = fileURLToPath(new URL('./curate.mjs', import.meta.url));
@@ -31,6 +31,8 @@ export const HARNESS_PREFIXES = [
 const isHarness = (prompt) => HARNESS_PREFIXES.some((p) => prompt.startsWith(p));
 // Tools a subagent can return through instead of a final text answer; hooks.json matches these.
 export const HANDBACK_TOOLS = ['SubagentHandback'];
+// Tools whose paths inside the session's slate are allowed without a prompt; hooks.json matches these.
+const ACCESS_TOOLS = ['Read', 'Write', 'Edit', 'Grep', 'Glob'];
 const OFFLOAD_AGENT = 'slate:offload';
 const RETURN_LIMIT = 800; // chars; above this an offload return is sent back once for a rewrite
 
@@ -193,6 +195,14 @@ async function subagentStop(input, dir) {
 // handbacks/<agent_id> makes the agent's next hand-back go through, whatever its length. A message
 // let through is saved as handbacks/<agent_id>.return for the offloads.md entry.
 async function preToolUse(input, dir) {
+  if (ACCESS_TOOLS.includes(input.tool_name)) {
+    if (slateAccess(input.tool_name, input.tool_input, dir) !== 'allow') return { output: null };
+    return {
+      output: {
+        hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'slate folder' },
+      },
+    };
+  }
   const text = input.tool_input?.message;
   const agent = input.agent_id;
   if (input.agent_type !== OFFLOAD_AGENT || !HANDBACK_TOOLS.includes(input.tool_name) || typeof text !== 'string') {
@@ -233,7 +243,11 @@ export async function handle(event, input, env = process.env) {
   const home = slateHome(env);
   const dir = await findSession(home, id);
 
-  if (event === 'SessionStart') return sessionStart(input, home, dir, env);
+  if (event === 'SessionStart') {
+    // Housekeeping, so it runs unlinked too. Only at startup, never on the session's own folder.
+    if (input.source === 'startup') await sweepSessions(home, { keep: dir }).catch(() => {});
+    return sessionStart(input, home, dir, env);
+  }
   if (dir === null) return { output: null };
   if (event === 'SubagentStop') return subagentStop(input, dir);
   if (event === 'PreToolUse') return preToolUse(input, dir);

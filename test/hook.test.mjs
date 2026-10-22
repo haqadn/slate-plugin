@@ -920,11 +920,15 @@ test('hooks.json: five events, matcher, timeouts, quoted plugin-root commands', 
   const want = { SessionStart: 60, UserPromptSubmit: 30, Stop: 10, PreCompact: 90, SubagentStop: 10, PreToolUse: 10 };
   for (const event of events) {
     const groups = cfg.hooks[event];
-    assert.equal(groups.length, 1, event);
+    assert.equal(groups.length, event === 'PreToolUse' ? 2 : 1, event);
     const [group] = groups;
     if (event === 'SessionStart') assert.equal(group.matcher, 'startup|resume|clear|compact|fork');
     else if (event === 'SubagentStop') assert.equal(group.matcher, 'slate:offload'); // matched on agent_type
-    else if (event === 'PreToolUse') assert.equal(group.matcher, HANDBACK_TOOLS.join('|'));
+    else if (event === 'PreToolUse') {
+      assert.equal(group.matcher, HANDBACK_TOOLS.join('|'));
+      assert.equal(groups[1].matcher, 'Read|Write|Edit|Grep|Glob');
+      assert.deepEqual(groups[1].hooks, group.hooks);
+    }
     else assert.equal(group.matcher, undefined, event);
     assert.deepEqual(group.hooks, [{
       type: 'command',
@@ -934,4 +938,126 @@ test('hooks.json: five events, matcher, timeouts, quoted plugin-root commands', 
   }
   const root = fileURLToPath(new URL('../plugins/slate/', import.meta.url));
   assert.ok(await exists(path.join(root, 'scripts', 'hook.mjs')));
+});
+
+// --- PreToolUse (slate folder access) ---
+
+const ALLOW = {
+  hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'slate folder' },
+};
+const access = (id, root, tool_name, tool_input, fields = {}) => ({
+  hook_event_name: 'PreToolUse', session_id: id, cwd: root, tool_name, tool_input, tool_use_id: 't2', ...fields,
+});
+const verdict = async (env, input) => (await handle('PreToolUse', input, env)).output;
+
+test('PreToolUse access: Read in the slate allows, main thread and subagent', async () => {
+  const { root, env, id } = await activeSession();
+  const facts = path.join(root, 'topic', 'facts.md');
+  assert.deepEqual(await verdict(env, access(id, root, 'Read', { file_path: facts })), ALLOW);
+  const sub = { agent_id: 'a1', agent_type: 'slate:offload' };
+  assert.deepEqual(await verdict(env, access(id, root, 'Read', { file_path: facts }, sub)), ALLOW);
+  assert.deepEqual(await verdict(env, access(id, root, 'Grep', { pattern: 'x', path: path.join(root, 'topic') }, sub)), ALLOW);
+  assert.deepEqual(await verdict(env, access(id, root, 'Glob', { pattern: '*', path: path.join(root, 'topic', 'reports') })), ALLOW);
+});
+
+test('PreToolUse access: Write and Edit only inside reports/', async () => {
+  const { root, env, id } = await activeSession();
+  const slate = path.join(root, 'topic');
+  for (const tool of ['Write', 'Edit']) {
+    assert.deepEqual(await verdict(env, access(id, root, tool, { file_path: path.join(slate, 'reports', 'x.md') })), ALLOW);
+    assert.equal(await verdict(env, access(id, root, tool, { file_path: path.join(slate, 'facts.md') })), null);
+  }
+});
+
+test('PreToolUse access: other slates, unlinked sessions, no path, other tools get no decision', async () => {
+  const { root, env, id } = await activeSession();
+  await initSession(root, 'other', 1, 'elsewhere');
+  const theirs = path.join(root, 'elsewhere', 'facts.md');
+  assert.equal(await verdict(env, access(id, root, 'Read', { file_path: theirs })), null);
+  assert.equal(await verdict(env, access(id, root, 'Grep', { pattern: 'x' })), null);
+  assert.equal(await verdict(env, access(id, root, 'Glob', { pattern: '*' })), null);
+  assert.equal(await verdict(env, access(id, root, 'Read', {})), null);
+  assert.equal(await verdict(env, access(id, root, 'Bash', { file_path: path.join(root, 'topic', 'facts.md') })), null);
+  const mine = path.join(root, 'topic', 'facts.md');
+  assert.equal(await verdict(env, access('nobody', root, 'Read', { file_path: mine })), null);
+  assert.equal(await verdict({ ...env, SLATE_CURATOR: '1' }, access(id, root, 'Read', { file_path: mine })), null);
+});
+
+test('PreToolUse access: path spellings', async () => {
+  const { root, env, id } = await activeSession();
+  const slate = path.join(root, 'topic');
+  const real = realpathSync(root);
+  // The same folder through its realpath, and through a symlink to the home.
+  const link = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'slate-link-')), 'home');
+  temps.push(path.dirname(link));
+  await fs.symlink(root, link);
+  for (const home of [real, link]) {
+    assert.deepEqual(await verdict(env, access(id, root, 'Read', { file_path: path.join(home, 'topic', 'facts.md') })), ALLOW, home);
+    assert.deepEqual(await verdict(env, access(id, root, 'Write', { file_path: path.join(home, 'topic', 'reports', 'n.md') })), ALLOW, home);
+  }
+  // Home given as a symlink in SLATE_HOME: the slate's realpath still matches.
+  const viaLink = { ...env, SLATE_HOME: link };
+  assert.deepEqual(await verdict(viaLink, access(id, root, 'Read', { file_path: path.join(real, 'topic', 'facts.md') })), ALLOW);
+  assert.equal(await verdict(env, access(id, root, 'Write', { file_path: path.join(slate, 'reports', '..', '..', 'outside') })), null);
+  assert.equal(await verdict(env, access(id, root, 'Read', { file_path: path.join(slate, '..', 'outside') })), null);
+  assert.equal(await verdict(env, access(id, root, 'Read', { file_path: slate + '-x' })), null);
+});
+
+test('PreToolUse access: a symlink inside the slate that points outside gets no decision', async () => {
+  const { root, env, id } = await activeSession();
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'slate-outside-'));
+  temps.push(outside);
+  await fs.writeFile(path.join(outside, 'secret.md'), 's');
+  const reports = path.join(root, 'topic', 'reports');
+  await fs.symlink(outside, path.join(reports, 'dir'));
+  await fs.symlink(path.join(outside, 'secret.md'), path.join(reports, 'file.md'));
+  await fs.symlink(path.join(outside, 'missing.md'), path.join(reports, 'dangling.md'));
+  for (const file_path of [path.join(reports, 'dir', 'secret.md'), path.join(reports, 'dir', 'new.md'),
+    path.join(reports, 'file.md'), path.join(reports, 'dangling.md')]) {
+    assert.equal(await verdict(env, access(id, root, 'Read', { file_path })), null, file_path);
+    assert.equal(await verdict(env, access(id, root, 'Write', { file_path })), null, file_path);
+  }
+});
+
+test('PreToolUse access: Write through a reports/ symlink to elsewhere in the slate is refused', async () => {
+  const { root, env, id } = await activeSession();
+  await fs.symlink(path.join(root, 'topic'), path.join(root, 'topic', 'reports', 'up'));
+  const file_path = path.join(root, 'topic', 'reports', 'up', 'facts.md');
+  assert.deepEqual(await verdict(env, access(id, root, 'Read', { file_path })), ALLOW);
+  assert.equal(await verdict(env, access(id, root, 'Write', { file_path })), null);
+});
+
+test('PreToolUse access: the hand-back cap still works beside it', async () => {
+  const { root, env, id } = await activeSession();
+  assert.deepEqual(await verdict(env, handback(id, root)), DENY_801);
+});
+
+// --- SessionStart sweep ---
+
+const OLD = 31 * 24 * 3600 * 1000;
+async function age(dir, ms) {
+  const t = new Date(Date.now() - ms);
+  await fs.utimes(path.join(dir, 'session.json'), t, t);
+}
+
+test('SessionStart startup sweeps idle sessions, linked or not; other sources do not', async () => {
+  const { root, env, id } = await activeSession();
+  const { dir: old } = await initSession(root, 'old', null);
+  await age(old, OLD);
+  assert.equal((await handle('SessionStart', start(id, root, 'resume'), env)).output !== undefined, true);
+  assert.equal(await exists(old), true, 'resume does not sweep');
+  await handle('SessionStart', start(id, root, 'startup'), env);
+  assert.equal(await exists(old), false);
+  const unlinked = await project();
+  const { dir: old2 } = await initSession(unlinked.root, 'old', null);
+  await age(old2, OLD);
+  await handle('SessionStart', start('fresh', unlinked.root, 'startup'), unlinked.env);
+  assert.equal(await exists(old2), false, 'swept in an unlinked session too');
+});
+
+test('SessionStart startup never sweeps its own session', async () => {
+  const { root, env, id, dir } = await activeSession();
+  await age(dir, OLD);
+  await handle('SessionStart', start(id, root, 'startup'), env);
+  assert.equal(await exists(dir), true);
 });

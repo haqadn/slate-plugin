@@ -1,5 +1,6 @@
 // Shared slate layout: <home>/<name>/ holds the shared files; .sessions/<id>/ holds one session's.
 import fs from 'node:fs/promises';
+import { realpathSync, lstatSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -120,4 +121,80 @@ export async function findSession(home, sessionId) {
     if (await mtime(path.join(dir, 'session.json')) !== null) return dir;
   }
   return null;
+}
+
+const MAX_IDLE_MS = 30 * 24 * 3600 * 1000;
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+// Deletes session folders (detached ones too) not touched for maxIdleMs whose process is gone.
+// Only readdir, stat and one small read per old folder: it runs at every startup.
+export async function sweepSessions(home, { now = Date.now(), maxIdleMs = MAX_IDLE_MS, keep = null } = {}) {
+  const deleted = [];
+  for (const name of (await subdirs(home)).filter(validName)) {
+    const sessions = path.join(slateDir(home, name), '.sessions');
+    for (const id of await subdirs(sessions)) {
+      const dir = path.join(sessions, id);
+      if (dir === keep) continue;
+      const file = path.join(dir, 'session.json');
+      const t = await mtime(file);
+      if (t === null || t >= now - maxIdleMs) continue;
+      let pid = null;
+      try {
+        pid = JSON.parse(await fs.readFile(file, 'utf8')).pid ?? null;
+      } catch {}
+      if (Number.isInteger(pid) && pid > 0 && alive(pid)) continue;
+      try {
+        await fs.rm(dir, { recursive: true, force: true });
+        deleted.push(dir);
+      } catch {}
+    }
+  }
+  return deleted;
+}
+
+// The real location of p: symlinks resolved in its deepest existing part, the rest appended.
+// null when a symlink on the way dangles, since a write through it would land somewhere unseen.
+function realish(p) {
+  const tail = [];
+  let cur = p;
+  for (;;) {
+    try {
+      return path.join(realpathSync(cur), ...tail.reverse());
+    } catch {
+      try {
+        lstatSync(cur);
+        return null;
+      } catch {}
+      const up = path.dirname(cur);
+      if (up === cur) return null;
+      tail.push(path.basename(cur));
+      cur = up;
+    }
+  }
+}
+
+const under = (p, root) => p === root || p.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+
+// 'allow' when the tool only touches the session's slate: reads anywhere in it, writes in reports/.
+// The path is judged by where it really points, not how it is spelled.
+export function slateAccess(toolName, toolInput, sessionDir) {
+  const writes = toolName === 'Write' || toolName === 'Edit';
+  const key = toolName === 'Read' || writes ? 'file_path' : toolName === 'Grep' || toolName === 'Glob' ? 'path' : null;
+  const given = key && toolInput?.[key];
+  if (typeof given !== 'string' || given === '') return null;
+  const slate = slateOf(sessionDir);
+  const target = path.resolve(given);
+  const real = realish(target);
+  if (real === null) return null;
+  const base = writes ? path.join(slate, 'reports') : slate;
+  const roots = [path.resolve(base), realish(path.resolve(base))].filter(Boolean);
+  return roots.some((r) => under(real, r)) ? 'allow' : null;
 }

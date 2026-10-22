@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   slateHome, validName, slateDir, slateOf, memoryPath, createSlate, createSession, listSlates, sessionDirs,
-  findSession,
+  findSession, slateAccess, sweepSessions,
 } from '../plugins/slate/scripts/lib/slate.mjs';
 
 const temps = [];
@@ -138,4 +138,54 @@ test('createSlate repairs a partial slate and tolerates callers at once', async 
   const all = await Promise.all(Array.from({ length: 6 }, () => createSlate(home, 'race')));
   assert.equal(all.filter((r) => r.created).length, 1);
   assert.ok((await fs.stat(path.join(home, 'race', '.sessions'))).isDirectory());
+});
+
+// --- sweepSessions ---
+
+const DAY = 24 * 3600 * 1000;
+async function aged(home, id, days, { pid = null, name = 'topic' } = {}) {
+  await createSlate(home, name);
+  const { dir } = await createSession(slateDir(home, name), id, pid);
+  const t = new Date(Date.now() - days * DAY);
+  await fs.utimes(path.join(dir, 'session.json'), t, t);
+  return dir;
+}
+const deadPid = async () => {
+  const { pid } = (await import('node:child_process')).spawnSync(process.execPath, ['-e', '']);
+  return pid;
+};
+
+test('sweepSessions deletes idle sessions with a dead or no pid, and returns them', async () => {
+  const home = await tmp();
+  const dead = await aged(home, 'dead', 31, { pid: await deadPid() });
+  const none = await aged(home, 'none', 40);
+  const live = await aged(home, 'live', 31, { pid: process.pid });
+  const recent = await aged(home, 'recent', 29);
+  const kept = await aged(home, 'kept', 31);
+  const detached = await aged(home, 'abc.detached-1', 31);
+  const out = await sweepSessions(home, { keep: kept });
+  assert.deepEqual(out.sort(), [dead, none, detached].sort());
+  for (const d of [dead, none, detached]) assert.equal(await exists(d), false, d);
+  for (const d of [live, recent, kept]) assert.equal(await exists(d), true, d);
+  assert.equal(await exists(path.join(home, 'topic', 'facts.md')), true, 'the slate stays');
+  assert.deepEqual(await sweepSessions(path.join(home, 'missing')), []);
+});
+
+test('sweepSessions honors now and maxIdleMs', async () => {
+  const home = await tmp();
+  const d = await aged(home, 's', 1);
+  assert.deepEqual(await sweepSessions(home, { maxIdleMs: 2 * DAY }), []);
+  assert.deepEqual(await sweepSessions(home, { maxIdleMs: 2 * DAY, now: Date.now() + 2 * DAY }), [d]);
+});
+
+test('slateAccess: unit checks', async () => {
+  const home = await tmp();
+  const dir = await aged(home, 's', 0);
+  const slate = slateOf(dir);
+  assert.equal(slateAccess('Read', { file_path: path.join(slate, 'facts.md') }, dir), 'allow');
+  assert.equal(slateAccess('Write', { file_path: path.join(slate, 'facts.md') }, dir), null);
+  assert.equal(slateAccess('Write', { file_path: path.join(slate, 'reports', 'a', 'b.md') }, dir), 'allow');
+  assert.equal(slateAccess('Grep', {}, dir), null);
+  assert.equal(slateAccess('Glob', { path: 5 }, dir), null);
+  assert.equal(slateAccess('Bash', { file_path: slate }, dir), null);
 });

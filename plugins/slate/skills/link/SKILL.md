@@ -12,7 +12,7 @@ Pick the slate name:
 - If the user gave one, it is `$ARGUMENTS`.
 - Otherwise ask with AskUserQuestion: up to the three most recent slates above, plus one name you suggest from this conversation (or from the project and branch). The free-text option takes a new name.
 
-Then run `node "${CLAUDE_PLUGIN_ROOT}/scripts/slate.mjs" link "${CLAUDE_SESSION_ID}" <name>` with Bash. Pass the name as typed, quoted.
+Then run `node "${CLAUDE_PLUGIN_ROOT}/scripts/slate.mjs" link "${CLAUDE_SESSION_ID}" '<name>'` with Bash. Pass the name as typed, in single quotes (double quotes would expand `$(…)` or backticks before the CLI validates the name).
 
 The first line of its output is the status:
 - `linked`, `already-linked` or `switched`: reply with one line saying so, then follow the slate rules printed after it for the rest of this session.
