@@ -293,34 +293,41 @@ function child(code, args, stdio = ['ignore', 'pipe', 'pipe']) {
 }
 
 const ADD_MANY = `
-const [mod, dir, sid, tag, start] = process.argv.slice(1);
+const [mod, dir, sid, tag, start, count] = process.argv.slice(1);
 const { applyChanges } = await import(mod);
 await new Promise((r) => setTimeout(r, Math.max(0, Number(start) - Date.now())));
-for (let i = 1; i <= 20; i++) {
+for (let i = 1; i <= Number(count); i++) {
   const r = await applyChanges(dir, [{ op: 'add', type: 'I', text: tag + ' ' + i }], { turn: i, sessionId: sid });
   if (r.applied.length !== 1) throw new Error(JSON.stringify(r));
 }
 `;
 
-test('Review Focus 2: two processes applying 20 adds each at once lose nothing and share no ID', async () => {
+test('Review Focus 2: six processes applying 30 adds each at once lose nothing and share no ID', async () => {
+  const PROCS = 6;
+  const ADDS = 30;
   const { dir } = await slate({ 'instructions.md': '# Instructions\n', 'superseded.md': '# Superseded\n' });
-  const { dir: other } = await createSession(slateOf(dir), 'bbbbbbbb-other', 2);
+  const sessions = [{ dir, sid: SID }];
+  for (let p = 1; p < PROCS; p++) {
+    const sid = `${p}${'b'.repeat(7)}-other`;
+    sessions.push({ dir: (await createSession(slateOf(dir), sid, 2)).dir, sid });
+  }
   const start = String(Date.now() + 500);
-  const kids = [[dir, SID, 'from a'], [other, 'bbbbbbbb-other', 'from b']]
-    .map(([d, sid, tag]) => child(ADD_MANY, [APPLY, d, sid, tag, start], ['ignore', 'ignore', 'inherit']));
+  const kids = sessions.map(({ dir: d, sid }, p) =>
+    child(ADD_MANY, [APPLY, d, sid, `from ${p}`, start, String(ADDS)], ['ignore', 'ignore', 'inherit']));
   const codes = await Promise.all(kids.map(async (k) => (await once(k, 'exit'))[0]));
-  assert.deepEqual(codes, [0, 0]);
+  assert.deepEqual(codes, Array(PROCS).fill(0));
 
   const lines = (await readMemory(dir))['instructions.md'].split('\n').filter((l) => l.startsWith('- '));
-  assert.equal(lines.length, 40);
+  assert.equal(lines.length, PROCS * ADDS);
   const ids = lines.map((l) => /^- \[(I\d+) /.exec(l)[1]);
-  assert.equal(new Set(ids).size, 40, 'unique IDs');
-  assert.deepEqual(ids.map((id) => Number(id.slice(1))).sort((a, b) => a - b), Array.from({ length: 40 }, (_, i) => i + 1));
+  assert.equal(new Set(ids).size, PROCS * ADDS, 'unique IDs');
+  assert.deepEqual(ids.map((id) => Number(id.slice(1))).sort((a, b) => a - b),
+    Array.from({ length: PROCS * ADDS }, (_, i) => i + 1));
   const texts = new Set(lines.map((l) => l.replace(/^- \[[^\]]*\] /, '')));
-  for (const tag of ['from a', 'from b']) for (let i = 1; i <= 20; i++) assert.ok(texts.has(`${tag} ${i}`), `${tag} ${i}`);
-  assert.ok(lines.some((l) => l.includes('@82b3114c]')) && lines.some((l) => l.includes('@bbbbbbbb]')));
-  const left = (await fs.readdir(slateOf(dir))).filter((n) => n.endsWith('.lock') || n.endsWith('.tmp'));
-  assert.deepEqual(left, [], 'no lock or temp file left behind');
+  for (let p = 0; p < PROCS; p++) for (let i = 1; i <= ADDS; i++) assert.ok(texts.has(`from ${p} ${i}`), `from ${p} ${i}`);
+  for (const { sid } of sessions) assert.ok(lines.some((l) => l.includes(`@${sid.slice(0, 8)}]`)), sid);
+  const left = (await fs.readdir(slateOf(dir))).filter((n) => n.includes('.lock') || n.endsWith('.tmp'));
+  assert.deepEqual(left, [], 'no lock, claim or temp file left behind');
 });
 
 const HOLD = `
@@ -338,7 +345,7 @@ test('Review Focus 2: a memory.lock left by a killed holder is taken over at onc
   holder.kill('SIGKILL');
   await once(holder, 'exit');
   const lock = path.join(slateOf(dir), 'memory.lock');
-  assert.equal((await fs.readFile(lock, 'utf8')).trim(), String(holder.pid), 'the dead holder left its lock');
+  assert.equal(Number.parseInt(await fs.readFile(lock, 'utf8'), 10), holder.pid, 'the dead holder left its lock');
 
   const t0 = Date.now();
   const r = await applyChanges(dir, [{ op: 'add', type: 'I', text: 'after the crash' }], OPTS);
