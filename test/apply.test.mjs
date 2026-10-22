@@ -415,6 +415,34 @@ test('a deleted slate: applyChanges throws and recreates nothing', async () => {
   assert.equal(await exists(s), false);
 });
 
+test('write order: a session folder gone before now.md is written loses no retired item, and its ID is not reused', async (t) => {
+  // F3 is the highest fact, so a lost F3 would hand its ID to the next add.
+  const facts = '# Facts\n- [F2 t1] Node 24 (package.json)\n- [F3 t1] port 8080 (config.yml)\n';
+  const { dir, before } = await slate({ ...BASE, 'facts.md': facts });
+  const s = slateOf(dir);
+  // The session folder moves right after applyChanges checks it, before anything is written.
+  const access = fs.access;
+  t.mock.method(fs, 'access', async (p, ...rest) => {
+    await access(p, ...rest);
+    if (p === dir) await fs.rm(dir, { recursive: true });
+  });
+  await assert.rejects(applyChanges(dir, [
+    { op: 'retire', id: 'F3', reason: 'the port is 9090 now' },
+    { op: 'now', text: 'Goal: move to port 9090' },
+  ], OPTS), { code: 'ENOENT' });
+  t.mock.restoreAll();
+  const read = (f) => fs.readFile(path.join(s, f), 'utf8');
+  assert.equal(await read('superseded.md'),
+    `${before['superseded.md']}- [F3 t1 retired ${TAG}] port 8080 (config.yml) (reason: the port is 9090 now)\n`);
+  assert.equal(await read('facts.md'), '# Facts\n- [F2 t1] Node 24 (package.json)\n', 'slate files are written before now.md');
+  assert.equal(await exists(path.join(s, 'memory.lock')), false, 'the lock is released');
+
+  const { dir: other } = await createSession(s, 'c0ffee00-0000-4000-8000-000000000000', 1);
+  const r = await applyChanges(other, [{ op: 'add', type: 'F', text: 'port 9090 (config.yml)', home: 'general' }],
+    { turn: 1, sessionId: 'c0ffee00-0000-4000-8000-000000000000' });
+  assert.deepEqual(r.applied, ['0:add F4']);
+});
+
 // --- topics, relevance and caps ---
 
 const T1 = new Date('2026-10-20T10:00:00.000Z');
@@ -501,6 +529,36 @@ test('move: key to topic and topic to key keep the line byte-identical; a promot
 
   const again = await applyChanges(dir, [{ op: 'move', id: 'F6', to: 'key' }, { op: 'move', id: 'F3', to: 'build' }], OPTS);
   assert.deepEqual(again, { applied: [], skipped: ['0:in place F6', '1:in place F3'], errors: [], demoted: [] });
+});
+
+test('write order: whichever file fails to write, every item is still in some file and no ID is reused', async (t) => {
+  const ids = ['I1', 'I2', 'I4', 'A1', 'F2', 'F3', 'F6', 'A30'];
+  for (const failing of ['superseded.md', 'build.md', 'facts.md', 'usage.json', 'now.md']) {
+    const facts = '# Facts\n- [F2 t1] Node 24 (package.json)\n- [F3 t4] uses tabs (user)\n';
+    const { dir } = await slate({ ...BASE, 'facts.md': facts });
+    await writeTopic(dir, 'build', `${BUILD}- [F6 t2] uses vite (vite.config.ts)\n- [A30 t1] CI caches deps\n`);
+    // Disk full on one file: each op moves or retires an item out of a file that changes.
+    const rename = fs.rename;
+    t.mock.method(fs, 'rename', async (from, to) => {
+      if (path.basename(to) === failing) throw Object.assign(new Error(`ENOSPC: no space left on device, rename '${to}'`), { code: 'ENOSPC' });
+      return rename(from, to);
+    });
+    await assert.rejects(applyChanges(dir, [
+      { op: 'move', id: 'F3', to: 'build' },
+      { op: 'move', id: 'F6', to: 'key' },
+      { op: 'retire', id: 'A30', reason: 'checked: it does not' },
+      { op: 'now', text: 'Goal: tidy the build facts' },
+    ], OPTS), { code: 'ENOSPC' }, failing);
+    t.mock.restoreAll();
+    const m = await readMemory(dir);
+    const all = [m['instructions.md'], m['assumptions.md'], m['facts.md'], m['superseded.md'], await readTopic(dir, 'build')].join('\n');
+    for (const id of ids) assert.match(all, new RegExp(`^- \\[${id} `, 'm'), `${id} kept with ${failing} failing`);
+    const r = await applyChanges(dir, [
+      { op: 'add', type: 'F', text: 'next fact (user)', home: 'build' },
+      { op: 'add', type: 'A', text: 'next assumption', home: 'build' },
+    ], OPTS);
+    assert.deepEqual(r.applied, ['0:add F7', '1:add A31'], failing);
+  }
 });
 
 test('retire and replace reach topic items; a replacement stays in its topic; the next ID counts topic files', async () => {

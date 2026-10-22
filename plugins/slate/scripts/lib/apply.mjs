@@ -104,8 +104,9 @@ async function lockMemory(slate) {
   }
 }
 
-// A file as raw lines, so untouched lines (and their \r) are written back byte for byte.
-const load = (text) => ({ lines: text.split('\n'), changed: false });
+// A file as raw lines, so untouched lines (and their \r) are written back byte for byte. `out`: the
+// lines moved out of it to another live file, kept on disk until their new file is written.
+const load = (text) => ({ lines: text.split('\n'), changed: false, out: [] });
 const bare = (raw) => (raw.endsWith('\r') ? raw.slice(0, -1) : raw);
 
 function append(file, line) {
@@ -298,6 +299,7 @@ export async function applyChanges(dir, ops, {
     const move = ({ file, index, line }, to) => {
       file.lines.splice(index, 1);
       file.changed = true;
+      file.out.push(line);
       append(to, line);
     };
 
@@ -461,23 +463,43 @@ export async function applyChanges(dir, ops, {
       }
     }
 
-    const changedTopics = [...topics].filter(([, file]) => file.changed);
-    if (changedTopics.length) {
+    // Write order, so a write that fails part way (disk full, a kill, a session folder that moved)
+    // never leaves an item in no file, which would also free its ID for the next add:
+    // 1. superseded.md, so a retired line is on disk before its live line goes;
+    // 2. every other changed slate file, still holding the lines it moves out, so a moved line is in
+    //    its new file before it leaves its old one;
+    // 3. the files that moved lines out, without them; then usage.json;
+    // 4. now.md last: it is the session's, so a session folder that moved fails only now.md.
+    // Each file is replaced whole (atomicWrite), but the set is not: a failure after step 1 can leave
+    // an item retired and still live, or live in two files, until a later apply or a person removes
+    // the extra copy. A failure in step 4 loses only this apply's now.md.
+    const slateFiles = [
+      ...[...topics].map(([slug, file]) => [topicPath(slate, slug), file]),
+      ...ITEM_FILE_NAMES.map((f) => [fileOf(f), mem[f]]),
+    ].filter(([, file]) => file.changed);
+    if ([...topics.values()].some((file) => file.changed)) {
       try {
         await fs.mkdir(path.join(slate, 'topics')); // not recursive: never recreates a deleted slate
       } catch (e) {
         if (e.code !== 'EEXIST') throw e;
       }
     }
-    // Topic files first, so a demotion cut short by a crash leaves its item in two files, not none.
-    for (const [slug, file] of changedTopics) await atomicWrite(topicPath(slate, slug), file.lines.join('\n'));
-    for (const f of MEMORY_FILES) {
-      if (mem[f].changed) await atomicWrite(fileOf(f), mem[f].lines.join('\n'));
-    }
+    const join = (file) => file.lines.join('\n');
+    // The lines a file moved out that aren't back in it (an item moved out and back is in place).
+    const leaving = (file) => file.out.filter((line) => !file.lines.some((raw) => bare(raw) === line));
+    const holding = (file) => {
+      const copy = { lines: [...file.lines] };
+      for (const line of leaving(file)) append(copy, line);
+      return join(copy);
+    };
+    if (mem['superseded.md'].changed) await atomicWrite(fileOf('superseded.md'), join(mem['superseded.md']));
+    for (const [p, file] of slateFiles) await atomicWrite(p, holding(file));
+    for (const [p, file] of slateFiles) if (leaving(file).length) await atomicWrite(p, join(file));
     const usageAfter = formatUsage(usage);
     if (usageAfter !== usageBefore && (usageBefore !== '' || Object.keys(usage).length)) {
       await atomicWrite(usageFile, usageAfter);
     }
+    if (mem['now.md'].changed) await atomicWrite(fileOf('now.md'), join(mem['now.md']));
     return { applied, skipped, errors, demoted };
   } finally {
     await release();
