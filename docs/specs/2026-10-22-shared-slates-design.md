@@ -162,7 +162,7 @@ Added 2026-10-22. The migrated jetpack-seo slate has 251 facts (72 KB, about 7×
 - Demotions are logged in `curator.log`, but they aren't warnings.
 
 **What sessions see**
-- Memory block: rules, instructions, `now.md`, key facts, key assumptions, then a topic index. The index has one line per topic: title, summary, item count and path. The script builds it from the topic files.
+- Memory block: rules, instructions, `now.md`, key facts, key assumptions, then a topic index. The index names the topics folder once, then has one line per topic: file name, title, summary and item count. Over budget, it drops the summaries first, then shrinks to slugs and counts. The script builds it from the topic files.
 - Change line: key-file changes as today. Topic adds are summarized as `+N in <slug>`. A move is not a change.
 - Rules and the offload brief: read the topic files the task needs, and name relevant topic paths in a brief.
 

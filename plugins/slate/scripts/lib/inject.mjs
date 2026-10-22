@@ -87,12 +87,14 @@ function liveLines(text, retired) {
   return [...p.items.map(formatItem).filter((l) => !RETIRED_LIKE.test(l)), ...p.plain.filter(safeText(retired))];
 }
 
-// One topic index line. A title or summary carrying retired text is left out, the slug shown instead.
-const indexLine = (safe) => (t) => {
+// One topic index line, `- <slug>.md — <title>: <summary> (<count>)`, the file named within the
+// topics folder the index names once. `summary` false leaves the summary out. A title or summary
+// carrying retired text is left out, and the line is just the file and count.
+const indexLine = (safe, summary) => (t) => {
   const label = [t.title, t.summary].filter(Boolean).every(safe)
-    ? `${t.title}${t.summary ? ` — ${t.summary}` : ''}`
-    : t.slug;
-  return `- ${label} (${t.items.length}) ${t.path}`;
+    ? ` — ${t.title}${summary && t.summary ? `: ${t.summary}` : ''}`
+    : '';
+  return `- ${t.slug}.md${label} (${t.items.length})`;
 };
 
 // now.md is free text: every non-blank line, in order, headings included.
@@ -130,14 +132,19 @@ export async function memoryBlock(dir, { afterCompact = false, waiting = false }
     const lines = file === 'now.md' ? nowLines(memory[file], retired) : liveLines(memory[file], retired);
     return { title, file, lines, body: lines.join('\n') };
   });
-  const index = topics.map(indexLine(safeText(retired)));
-  sections.push({ title: 'Topics', file: 'topics', lines: index, body: index.join('\n') });
+  // The topics folder once, then a line per topic file.
+  const topicIndex = (summary) => (topics.length
+    ? [`Topic files, in ${path.join(slateOf(dir), 'topics')}/:`, ...topics.map(indexLine(safeText(retired), summary))].join('\n')
+    : '');
+  sections.push({ title: 'Topics', file: 'topics', body: topicIndex(true) });
   const byFile = Object.fromEntries(sections.map((s) => [s.file, s]));
   const render = () =>
     [head, rules, ...sections.filter((s) => s.body).map((s) => `# ${s.title}\n${s.body}`)].join('\n\n');
   const where = (s) => memoryPath(dir, s.file);
 
-  // Over budget: the topic index shrinks to slugs and counts first, then facts and assumptions spill.
+  // Over budget: the topic index shrinks first, to titles (no summaries), then to slugs and counts;
+  // then facts and assumptions spill.
+  if (render().length > MAX) byFile.topics.body = topicIndex(false);
   if (render().length > MAX && topics.length) {
     const each = topicPath(slateOf(dir), '<slug>');
     const counts = topics.map((t) => `${t.slug} (${t.items.length})`).join(', ');

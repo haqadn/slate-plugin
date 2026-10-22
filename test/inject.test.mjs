@@ -547,8 +547,8 @@ test('memoryBlock: a # Topics index after assumptions, one line per topic; topic
   await writeTopic(dir, 'canonical', '# Canonical URLs\n> Which URL wins.\n- [F3 t1] a (user)\n- [A4 t1] b\n- plain\n');
   await writeTopic(dir, 'build', '# Build\n> How it builds.\n- [F5 t1] c (user)\n');
   const b = await memoryBlock(dir);
-  const index = `# Topics\n- Build — How it builds. (1) ${topicPath(dir, 'build')}\n` +
-    `- Canonical URLs — Which URL wins. (2) ${topicPath(dir, 'canonical')}`;
+  const index = `# Topics\nTopic files, in ${path.join(slateOf(dir), 'topics')}/:\n- build.md — Build: How it builds. (1)\n` +
+    '- canonical.md — Canonical URLs: Which URL wins. (2)';
   assert.ok(b.endsWith(index), b.slice(-300));
   assert.ok(b.indexOf('- [A1 t2] user is on macOS') < b.indexOf('\n\n# Topics\n'));
   assert.ok(!b.includes('- [F3 t1] a (user)'), 'topic items stay in their files');
@@ -561,22 +561,102 @@ test('core: a topic title or summary carrying retired text is not shown', async 
   await writeTopic(dir, 'tagged', '# [F9 t1 retired t2] y\n> fine\n');
   const b = await memoryBlock(dir);
   assert.ok(!b.includes('ZZ-GONE-ZZ') && !b.includes('retired t2'), b.slice(-400));
-  assert.ok(b.includes(`- old (1) ${topicPath(dir, 'old')}`));
-  assert.ok(b.includes(`- tagged (0) ${topicPath(dir, 'tagged')}`));
+  assert.ok(b.includes('\n- old.md (1)\n'));
+  assert.ok(b.endsWith('\n- tagged.md (0)'));
 });
 
-test('memoryBlock: over budget, the topic index shrinks before facts spill', async () => {
+test('memoryBlock: over budget, the topic index shrinks to slugs and counts before facts spill', async () => {
   const dir = await session();
   for (let i = 1; i <= 40; i++) {
-    await writeTopic(dir, `t${i}`, `# Topic ${i}\n> ${'s'.repeat(150)}\n- [F${100 + i} t1] x (user)\n`);
+    await writeTopic(dir, `t${i}`, `# Topic ${i} ${'t'.repeat(60)}\n> ${'s'.repeat(150)}\n- [F${100 + i} t1] x (user)\n`);
   }
-  await write(dir, 'facts.md', `# Facts\n${lines('F', 5, 600)}\n`);
+  await write(dir, 'facts.md', `# Facts\n${lines('F', 9, 600)}\n`);
   const b = await memoryBlock(dir);
   assert.ok(b.length <= MAX, `${b.length}`);
-  assert.ok(b.includes(`- [F5 t1] ${'x'.repeat(600)}`), 'facts still shown in full');
-  assert.ok(!b.includes('s'.repeat(150)), 'summaries dropped');
+  assert.ok(b.includes(`- [F9 t1] ${'x'.repeat(600)}`), 'facts still shown in full');
+  assert.ok(!b.includes('s'.repeat(150)) && !b.includes('t'.repeat(60)), 'titles and summaries dropped');
   assert.ok(b.includes('t1 (1)') && b.includes('t40 (1)'), 'every topic still named');
   assert.ok(b.includes(path.join(slateOf(dir), 'topics', '<slug>.md')), 'and where to find it');
+});
+
+// Topics like a real slate's after the reorganize pass: slug, title, summary, item count.
+const REAL_TOPICS = [
+  ['calypso-seo-menu', 'Calypso SEO menu', 'Where the SEO settings live in Calypso and how the menu item is gated.', 6],
+  ['canonical-urls', 'Canonical URLs', 'Rules for rel=canonical output, pagination and variants.', 9],
+  ['feature-flags', 'Feature flags', 'Which flags gate the SEO tools and how the rollout is staged.', 4],
+  ['general', 'General', 'Items without a more specific topic.', 12],
+  ['hreflang', 'Hreflang and localization', 'Hreflang tags, locales and the de-de site layout.', 3],
+  ['linear-project', 'Linear project', 'Issues, milestones and owners for the SEO project in Linear.', 8],
+  ['meta-tags', 'Meta tags', 'Title and description templates, length limits and fallbacks.', 5],
+  ['open-graph', 'Open Graph and social', 'og: and twitter: tags, default images and per-post overrides.', 4],
+  ['performance', 'Performance', 'LCP, image formats and the lazy-loading rollout.', 4],
+  ['redirects', 'Redirects', '301 rules, trailing slashes and the legacy URL map.', 3],
+  ['releases', 'Releases and workflow', 'Release cadence, schedule, tests and changelog conventions.', 7],
+  ['robots-indexing', 'Robots and indexing', 'robots.txt, noindex behavior on staging and search pages.', 4],
+  ['sitemaps', 'Sitemaps', 'Sitemap structure, limits, exclusions and PR #101 image entries.', 6],
+  ['structured-data', 'Structured data', 'JSON-LD schema for products, breadcrumbs, organization and Rich Results status.', 5],
+  ['testing', 'Testing', 'Unit, e2e and manual test steps for SEO changes.', 3],
+];
+// Item lines of `total` chars or just under, `size` chars each, with origin tags like a real slate's.
+function capLines(prefix, total, size) {
+  const out = [];
+  for (let i = 1, used = 0; used + size <= total; i++, used += size) {
+    const head = `- [${prefix}${i} t12@82b3114c] `;
+    out.push(`${head}${'x'.repeat(size - head.length - ' (user)'.length)} (user)`);
+  }
+  return out.join('\n');
+}
+// A session whose paths are as long as a real one's (~/slate/<name>/.sessions/<uuid>): a temp
+// folder's are ~45 chars longer, and the rules and index name them ~10 times.
+async function realPathSession() {
+  const root = await fs.mkdtemp('/tmp/sl-');
+  temps.push(root);
+  return (await initSession(root, '82b3114c-5e73-4142-ae8c-b8564fbac2d9', 1, 'jetpack-seo')).dir;
+}
+// A real slate's other sizes: 7 instructions of 1.2k chars and a 10-line now.md of 1.75k.
+async function realSizeMemory(dir, factChars, assumptionChars) {
+  await write(dir, 'instructions.md', `# Instructions\n${capLines('I', 1190, 170)}\n`);
+  await write(dir, 'now.md', `${Array.from({ length: 10 }, (_, i) => `${i + 1}. ${'n'.repeat(170)}`).join('\n')}\n`);
+  await write(dir, 'facts.md', `# Facts\n${capLines('F', factChars, 100)}\n`);
+  await write(dir, 'assumptions.md', `# Assumptions\n${capLines('A', assumptionChars, 100)}\n`);
+  let id = 100;
+  for (const [slug, title, summary, n] of REAL_TOPICS) {
+    const items = Array.from({ length: n }, () => `- [F${id++} t1] a fact (user)`).join('\n');
+    await writeTopic(dir, slug, `# ${title}\n> ${summary}\n${items}\n`);
+  }
+}
+
+// Before the index, a real slate's block at the key caps is ~9.1k chars (rules 1.6k, instructions
+// 1.2k, now 1.75k, key files 4.5k): ~870 left, and these 15 topics need ~1.55k with summaries.
+test('memoryBlock: the topics folder is named once; 15 real-size topics keep titles and summaries next to real-size memory with key files four-fifths full', async () => {
+  const dir = await realPathSession();
+  await realSizeMemory(dir, 2400, 1200);
+  const b = await memoryBlock(dir);
+  assert.ok(b.length <= MAX, `${b.length}`);
+  const folder = `${path.join(slateOf(dir), 'topics')}/`;
+  const index = b.slice(b.indexOf('\n\n# Topics\n'));
+  assert.ok(index.startsWith(`\n\n# Topics\nTopic files, in ${folder}:\n`), index.slice(0, 200));
+  assert.equal(index.split(folder).length, 2, 'the folder appears once');
+  for (const [slug, title, summary, n] of REAL_TOPICS) {
+    assert.ok(index.includes(`\n- ${slug}.md — ${title}: ${summary} (${n})`), slug);
+  }
+  assert.ok(b.includes(capLines('F', 2400, 100)) && b.includes(capLines('A', 1200, 100)), 'key files in full');
+  assert.ok(!b.includes('too long to show') && !b.includes('more; read'), 'nothing spilled');
+});
+
+test('memoryBlock: with key files at their caps, the index drops summaries, keeps titles, and facts stay in full', async () => {
+  const dir = await realPathSession();
+  await realSizeMemory(dir, 3000, 1500);
+  const b = await memoryBlock(dir);
+  assert.ok(b.length <= MAX, `${b.length}`);
+  const index = b.slice(b.indexOf('\n\n# Topics\n'));
+  assert.ok(index.startsWith(`\n\n# Topics\nTopic files, in ${path.join(slateOf(dir), 'topics')}/:\n`), index.slice(0, 200));
+  for (const [slug, title, summary, n] of REAL_TOPICS) {
+    assert.ok(index.includes(`\n- ${slug}.md — ${title} (${n})`), slug);
+    assert.ok(!index.includes(summary), `${slug}: summary dropped`);
+  }
+  assert.ok(b.includes(capLines('F', 3000, 100)) && b.includes(capLines('A', 1500, 100)), 'key files in full');
+  assert.ok(!b.includes('too long to show') && !b.includes('more; read'), 'nothing spilled');
 });
 
 test('memoryBlock: seen covers topic items, so the next change line is quiet', async () => {
