@@ -13,6 +13,7 @@ import {
 import { acquire } from './lib/lock.mjs';
 import { checkCuratorEdit } from './lib/check.mjs';
 import { MEMORY_FILES } from './lib/items.mjs';
+import { memoryPath, slateOf } from './lib/slate.mjs';
 
 const RULES_FILE = new URL('../curator-rules.md', import.meta.url);
 const ANSWER_MAX = 12000;
@@ -81,7 +82,7 @@ function buildPrompt({ rules, turn, real, message, answer }) {
     `New items get \`t${turn}\`. Retired lines get \`retired t${turn}\`. Adopted plain bullets get \`t0\`.`,
     '',
     'Memory files:',
-    ...MEMORY_FILES.map((f) => `- ${path.join(real, f)}`),
+    ...MEMORY_FILES.map((f) => `- ${memoryPath(real, f)}`),
     '',
     "The user's message, verbatim:",
     '<message>',
@@ -99,7 +100,7 @@ function buildPrompt({ rules, turn, real, message, answer }) {
 // the variadic --tools / --allowedTools. An Edit(//abs) rule also covers Write.
 function curatorArgs(prompt, model, real) {
   const rules = MEMORY_FILES.flatMap((f) => {
-    const abs = path.join(real, f);
+    const abs = memoryPath(real, f);
     return [`Read(/${abs})`, `Edit(/${abs})`];
   });
   return [
@@ -199,7 +200,7 @@ async function snapshot(dir) {
   const out = {};
   for (const f of MEMORY_FILES) {
     try {
-      out[f] = await fs.readFile(path.join(dir, f));
+      out[f] = await fs.readFile(memoryPath(dir, f));
     } catch (e) {
       if (e.code !== 'ENOENT') throw e;
       out[f] = null;
@@ -218,7 +219,7 @@ async function restore(dir, snap) {
   const rewrite = {};
   for (const f of MEMORY_FILES) {
     if (sameBytes(now[f], snap[f])) continue;
-    if (snap[f] === null) await fs.rm(path.join(dir, f), { force: true });
+    if (snap[f] === null) await fs.rm(memoryPath(dir, f), { force: true });
     else rewrite[f] = snap[f];
   }
   if (Object.keys(rewrite).length) await writeMemory(dir, rewrite);
@@ -255,7 +256,7 @@ async function curateTurn({ dir, turn, model, bin, timeoutMs, signal }) {
       rules: await fs.readFile(RULES_FILE, 'utf8'), turn, real, message: read.message, answer,
     });
     const opts = {
-      cwd: path.dirname(path.dirname(real)), // the project dir: <project>/.slate/<id>
+      cwd: slateOf(real),
       env: curatorEnv(process.env),
       timeoutMs,
       signal,

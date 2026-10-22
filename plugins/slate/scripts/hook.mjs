@@ -6,10 +6,11 @@ import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  sessionDir, readSession, writeSession, findByPid, moveSession, copySession, setPid, releasePid, claudePid,
+  readSession, writeSession, findByPid, moveSession, copySession, setPid, releasePid, claudePid,
   nextTurn, writeMessage, appendAnswer, appendContinuation, pendingTurns, appendOffload, atomicWrite,
 } from './lib/session.mjs';
 import { waitFree, lockHolder } from './lib/lock.mjs';
+import { slateHome, findSession } from './lib/slate.mjs';
 import { memoryBlock, changeLine } from './lib/inject.mjs';
 
 const CURATE = fileURLToPath(new URL('./curate.mjs', import.meta.url));
@@ -19,7 +20,7 @@ const ABORT_WAIT_MS = 5000; // for an aborted curator to undo its edit and relea
 const PROMPT_WAIT_MS = 20000;
 const COMPACT_WAIT_MS = 60000;
 const MAX_WAIT_MS = 25000;
-// A session ID becomes a folder name; anything that could leave .slate/ is not ours.
+// A session ID becomes a folder name; anything that could leave .sessions/ is not ours.
 const SAFE_ID = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
 // Prompts the harness injects (a background agent finishing, a subagent hand-back, messages from
 // other sessions or teammates, system notices). They continue the current turn; they are never
@@ -33,8 +34,6 @@ export const HANDBACK_TOOLS = ['SubagentHandback'];
 const OFFLOAD_AGENT = 'slate:offload';
 const RETURN_LIMIT = 800; // chars; above this an offload return is sent back once for a rewrite
 
-const exists = (p) => fs.access(p).then(() => true, () => false);
-const hasFolder = (dir) => exists(path.join(dir, 'session.json'));
 
 // How long to wait for a running curator: `fallback`, or SLATE_WAIT_MS (for tests), at most 25s.
 export function curatorWaitMs(env, fallback) {
@@ -80,16 +79,20 @@ async function setKind(dir, kind) {
   await writeSession(dir, s);
 }
 
-async function sessionStart(input, root, dir, env) {
+// `dir` is the session's folder, or null when it isn't linked to a slate. A /clear or fork lands in
+// the old session's slate, as a sibling folder.
+async function sessionStart(input, home, dir, env) {
   const source = input.source;
-  if (!(await hasFolder(dir))) {
+  if (dir === null) {
     const pid = currentPid(env);
     if (!pid) return { output: null };
     // This process now runs a session without a folder: no folder may keep its pid.
-    if (source === 'startup' || source === 'resume') await releasePid(root, pid);
+    if (source === 'startup' || source === 'resume') await releasePid(home, pid);
     if (source !== 'clear' && source !== 'fork') return { output: null };
-    const found = await findByPid(root, pid);
-    if (!found || found === dir) return { output: null };
+    const found = await findByPid(home, pid);
+    if (!found) return { output: null };
+    dir = path.join(path.dirname(found), input.session_id);
+    if (found === dir) return { output: null };
     if (source === 'clear') {
       await settle(found, curatorWaitMs(env, START_WAIT_MS));
       await moveSession(found, dir);
@@ -103,7 +106,7 @@ async function sessionStart(input, root, dir, env) {
     const pid = currentPid(env);
     if (pid) {
       await setPid(dir, pid);
-      await releasePid(root, pid, dir);
+      await releasePid(home, pid, dir);
     }
   }
   const free = await waitFree(dir, curatorWaitMs(env, START_WAIT_MS));
@@ -225,15 +228,15 @@ export async function handle(event, input, env = process.env) {
   // SubagentStop and a subagent's PreToolUse carry its agent_id; any other event with one fired
   // inside a subagent.
   if (input.agent_id && event !== 'SubagentStop' && event !== 'PreToolUse') return { output: null };
-  const root = env.CLAUDE_PROJECT_DIR || input.cwd;
   const id = input.session_id;
-  if (!root || typeof id !== 'string' || !SAFE_ID.test(id)) return { output: null };
-  const dir = sessionDir(root, id);
+  if (typeof id !== 'string' || !SAFE_ID.test(id)) return { output: null };
+  const home = slateHome(env);
+  const dir = await findSession(home, id);
 
-  if (event === 'SubagentStop') return (await hasFolder(dir)) ? subagentStop(input, dir) : { output: null };
-  if (event === 'PreToolUse') return (await hasFolder(dir)) ? preToolUse(input, dir) : { output: null };
-  if (event === 'SessionStart') return sessionStart(input, root, dir, env);
-  if (!(await hasFolder(dir))) return { output: null };
+  if (event === 'SessionStart') return sessionStart(input, home, dir, env);
+  if (dir === null) return { output: null };
+  if (event === 'SubagentStop') return subagentStop(input, dir);
+  if (event === 'PreToolUse') return preToolUse(input, dir);
   switch (event) {
     case 'UserPromptSubmit':
       return userPromptSubmit(input, dir, env);

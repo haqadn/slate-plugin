@@ -8,8 +8,10 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { runCurator, drain, resolveClaudeBin, CURATOR_ENV_DENY } from '../plugins/slate/scripts/curate.mjs';
+import { slateOf, memoryPath } from '../plugins/slate/scripts/lib/slate.mjs';
+import { initSession } from './helpers.mjs';
 import {
-  initSession, writeMessage, appendAnswer, appendContinuation, readMemory, writeMemory, readSession, writeSession,
+  writeMessage, appendAnswer, appendContinuation, readMemory, writeMemory, readSession, writeSession,
 } from '../plugins/slate/scripts/lib/session.mjs';
 import { acquire } from '../plugins/slate/scripts/lib/lock.mjs';
 import { MEMORY_FILES } from '../plugins/slate/scripts/lib/items.mjs';
@@ -120,7 +122,7 @@ test('command: prompt first, every flag, path-scoped rules, env, cwd, stdin igno
 
   const real = realpathSync(dir);
   if (process.platform === 'darwin') assert.notEqual(real, dir, 'tmpdir goes through a symlink on macOS');
-  const rules = MEMORY_FILES.flatMap((f) => [`Read(/${path.join(real, f)})`, `Edit(/${path.join(real, f)})`]);
+  const rules = MEMORY_FILES.flatMap((f) => [`Read(/${memoryPath(real, f)})`, `Edit(/${memoryPath(real, f)})`]);
   // --allowedTools is variadic, so it comes last and takes exactly the ten rules.
   assert.deepEqual(args.slice(args.indexOf('--allowedTools') + 1), rules);
   for (const rule of rules) assert.match(rule, /^(Read|Edit)\(\/\/.+\.md\)$/);
@@ -129,7 +131,7 @@ test('command: prompt first, every flag, path-scoped rules, env, cwd, stdin igno
   assert.equal(env.SLATE_CURATOR, '1');
   assert.equal(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1');
   assert.equal(env.SLATE_TEST_INHERITED, 'yes');
-  assert.equal(call.cwd, realpathSync(root));
+  assert.equal(call.cwd, slateOf(real));
   assert.equal(call.stdinRdev, statSync('/dev/null').rdev);
 });
 
@@ -163,7 +165,7 @@ test('prompt: rules, turn, full message, capped answer, five absolute paths', as
   assert.ok(!prompt.includes('ANSWER_TAIL'), 'answer capped');
   assert.ok(prompt.includes('[answer truncated]'));
   const real = realpathSync(dir);
-  for (const f of MEMORY_FILES) assert.ok(prompt.includes(path.join(real, f)), f);
+  for (const f of MEMORY_FILES) assert.ok(prompt.includes(memoryPath(real, f)), f);
 });
 
 test('prompt: a short answer is passed whole, without a truncation note', async () => {

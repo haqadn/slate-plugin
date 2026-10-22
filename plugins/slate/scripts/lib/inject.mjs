@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ITEM_FILES, MEMORY_FILES, RETIRED_LIKE, parseMemoryFile, formatItem } from './items.mjs';
 import { readSession, writeSession, readMemory, pendingTurns } from './session.mjs';
+import { memoryPath, slateOf } from './slate.mjs';
 
 // Nothing here ever puts superseded.md text into output. Retired texts are read only to filter lines out.
 
@@ -43,7 +44,8 @@ const clip = (s, n) => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
 
 export async function rulesText(dir) {
   const text = await fs.readFile(RULES_FILE, 'utf8');
-  return dir === undefined ? text : text.replaceAll('{{dir}}', () => dir);
+  if (dir === undefined) return text;
+  return text.replaceAll('{{slate}}', () => slateOf(dir)).replaceAll('{{session}}', () => dir);
 }
 
 function liveItems(memory) {
@@ -132,7 +134,7 @@ export async function memoryBlock(dir, { afterCompact = false, waiting = false }
   const byFile = Object.fromEntries(sections.map((s) => [s.file, s]));
   const render = () =>
     [head, rules, ...sections.filter((s) => s.body).map((s) => `# ${s.title}\n${s.body}`)].join('\n\n');
-  const where = (s) => path.join(dir, s.file);
+  const where = (s) => memoryPath(dir, s.file);
 
   for (const file of ['facts.md', 'assumptions.md']) {
     if (render().length <= MAX) break;
@@ -246,8 +248,7 @@ export async function changeLine(dir, { waiting = false } = {}) {
       if (gone.length) entries.push(`retired ${gone.join(', ')}`);
     }
     if (more) {
-      const [first, ...rest] = [...hidden];
-      entries.push(`+${more} more (see ${[path.join(dir, first), ...rest].join(', ')})`);
+      entries.push(`+${more} more (see ${[...hidden].map((f) => memoryPath(dir, f)).join(', ')})`);
     }
     session.seen = live;
   } else {

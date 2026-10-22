@@ -2,23 +2,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { MEMORY_FILES } from './items.mjs';
+import { sessionDirs, memoryPath, slateOf } from './slate.mjs';
 
-const TITLES = {
-  'instructions.md': '# Instructions\n',
-  'assumptions.md': '# Assumptions\n',
-  'facts.md': '# Facts\n',
-  'now.md': '',
-  'superseded.md': '# Superseded\n',
-};
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'fish']);
-
-export function projectDir(input) {
-  return process.env.CLAUDE_PROJECT_DIR || input.cwd;
-}
-
-export function sessionDir(root, sessionId) {
-  return path.join(root, '.slate', sessionId);
-}
 
 let tmpSeq = 0;
 export async function atomicWrite(file, text) {
@@ -30,24 +16,6 @@ export async function atomicWrite(file, text) {
     await fs.rm(tmp, { force: true });
     throw e;
   }
-}
-
-export async function initSession(root, sessionId, pid) {
-  const slate = path.join(root, '.slate');
-  const fresh = await fs.mkdir(slate, { recursive: true }); // path if created, else undefined
-  if (fresh !== undefined) await fs.writeFile(path.join(slate, '.gitignore'), '*\n');
-  const dir = sessionDir(root, sessionId);
-  try {
-    await fs.mkdir(dir);
-  } catch (e) {
-    if (e.code === 'EEXIST') return { created: false, dir };
-    throw e;
-  }
-  await fs.mkdir(path.join(dir, 'queue'));
-  await fs.mkdir(path.join(dir, 'reports'));
-  for (const f of MEMORY_FILES) await fs.writeFile(path.join(dir, f), TITLES[f]);
-  await writeSession(dir, { pid, created: new Date().toISOString(), from: null, turn: 0, seen: {} });
-  return { created: true, dir };
 }
 
 export async function readSession(dir) {
@@ -74,19 +42,10 @@ export async function setPid(dir, pid) {
 }
 
 // Several folders can share a pid (/branch keeps it); the most recently written session.json wins.
-export async function findByPid(root, pid) {
-  const slate = path.join(root, '.slate');
-  let names;
-  try {
-    names = await fs.readdir(slate);
-  } catch {
-    return null;
-  }
+export async function findByPid(home, pid) {
   let best = null;
   let bestTime = -Infinity;
-  for (const name of names) {
-    if (name.startsWith('.')) continue;
-    const dir = path.join(slate, name);
+  for (const dir of await sessionDirs(home)) {
     try {
       const s = await readSession(dir);
       if (s.pid !== pid) continue;
@@ -103,17 +62,8 @@ export async function findByPid(root, pid) {
 // Sets pid to null in every folder holding it, except `keep`. A process that switched to another
 // session (in-process /resume) must not leave its pid on an old folder, or a later /clear or
 // /branch would move or copy that folder into the wrong session.
-export async function releasePid(root, pid, keep = null) {
-  const slate = path.join(root, '.slate');
-  let names;
-  try {
-    names = await fs.readdir(slate);
-  } catch {
-    return;
-  }
-  for (const name of names) {
-    if (name.startsWith('.')) continue;
-    const dir = path.join(slate, name);
+export async function releasePid(home, pid, keep = null) {
+  for (const dir of await sessionDirs(home)) {
     if (dir === keep) continue;
     try {
       const s = await readSession(dir);
@@ -290,24 +240,33 @@ export async function readTurn(dir, turn) {
   return { message, answer: answers.join('\n\n') };
 }
 
-// offloads.md: one entry per offload run, appended in a single write. Every return line is quoted
-// with `>`, so return text can never start an entry of its own.
+// <slate>/offloads.md: one entry per offload run, appended in a single write. Every return line is
+// quoted with `>`, so return text can never start an entry of its own. The first entry is linked
+// into place together with the title, so two first entries can't both write it.
 export async function appendOffload(dir, { turn, at, agentId, transcript, text }) {
-  const file = path.join(dir, 'offloads.md');
-  const isNew = await fs.access(file).then(() => false, () => true);
+  const file = path.join(slateOf(dir), 'offloads.md');
   const where = typeof transcript === 'string' && transcript.trim()
     ? transcript.replace(/\s*[\r\n]+\s*/g, ' ').trim()
     : 'none';
   const body = text ? text.split(/\r?\n/).map((l) => (l ? `> ${l}` : '>')).join('\n') : '> (no return text)';
-  const head = isNew ? '# Offloads\n\n' : '';
-  await fs.appendFile(file, `${head}## t${turn} ${at} ${agentId}\ntranscript: ${where}\n\n${body}\n\n`);
+  const entry = `## t${turn}@${path.basename(dir).slice(0, 8)} ${at} ${agentId}\ntranscript: ${where}\n\n${body}\n\n`;
+  const tmp = path.join(slateOf(dir), `.offloads.${process.pid}.${tmpSeq++}.tmp`);
+  try {
+    await fs.writeFile(tmp, `# Offloads\n\n${entry}`);
+    await fs.link(tmp, file);
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    await fs.appendFile(file, entry);
+  } finally {
+    await fs.rm(tmp, { force: true });
+  }
 }
 
 export async function readMemory(dir) {
   const out = {};
   for (const f of MEMORY_FILES) {
     try {
-      out[f] = await fs.readFile(path.join(dir, f), 'utf8');
+      out[f] = await fs.readFile(memoryPath(dir, f), 'utf8');
     } catch (e) {
       if (e.code !== 'ENOENT') throw e;
       out[f] = '';
@@ -320,5 +279,5 @@ export async function writeMemory(dir, files) {
   for (const f of Object.keys(files)) {
     if (!MEMORY_FILES.includes(f)) throw new Error(`not a memory file: ${f}`);
   }
-  for (const [f, text] of Object.entries(files)) await atomicWrite(path.join(dir, f), text);
+  for (const [f, text] of Object.entries(files)) await atomicWrite(memoryPath(dir, f), text);
 }

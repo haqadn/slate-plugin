@@ -7,7 +7,9 @@ import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { handle, curatorWaitMs, HARNESS_PREFIXES, HANDBACK_TOOLS } from '../plugins/slate/scripts/hook.mjs';
-import { initSession, readSession, readTurn, readMemory, sessionDir, appendAnswer } from '../plugins/slate/scripts/lib/session.mjs';
+import { readSession, readTurn, readMemory, appendAnswer } from '../plugins/slate/scripts/lib/session.mjs';
+import { initSession, sessionDir } from './helpers.mjs';
+import { slateOf } from '../plugins/slate/scripts/lib/slate.mjs';
 import { acquire } from '../plugins/slate/scripts/lib/lock.mjs';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-claude.mjs', import.meta.url));
@@ -19,7 +21,7 @@ const COMPACT_LINE = 'Memory below wins where it differs from the summary.';
 const EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PreCompact'];
 
 // Tests must never reach a real claude, nor a real project's .slate/.
-for (const k of ['SLATE_CLAUDE_BIN', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_PROJECT_DIR', 'CLAUDE_PID', 'SLATE_CURATOR',
+for (const k of ['SLATE_CLAUDE_BIN', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_PROJECT_DIR', 'SLATE_HOME', 'CLAUDE_PID', 'SLATE_CURATOR',
   'SLATE_WAIT_MS', 'CLAUDE_PLUGIN_OPTION_CURATORMODEL', 'FAKE_MODE', 'FAKE_RECORD']) delete process.env[k];
 
 const temps = [];
@@ -43,6 +45,7 @@ async function project() {
     SLATE_CLAUDE_BIN: FAKE,
     FAKE_MODE: 'good',
     CLAUDE_PID: String(PID),
+    SLATE_HOME: root,
   };
   return { root, env };
 }
@@ -113,7 +116,7 @@ test('no folder: every event gives null and creates nothing', async () => {
   for (const source of ['startup', 'resume', 'clear', 'compact', 'fork']) {
     assert.equal((await handle('SessionStart', start('sid', root, source), env)).output, null, source);
   }
-  assert.equal(await exists(path.join(root, '.slate')), false);
+  assert.deepEqual(await fs.readdir(root), [], 'nothing created in the slate home');
 });
 
 test('SLATE_CURATOR=1: null for every event, even with a folder, and nothing changes', async () => {
@@ -333,7 +336,7 @@ test('SubagentStop: nothing for ≤800 chars, other agents, no folder, or inside
   assert.equal((await handle('SubagentStop', subStop(id, root), { ...env, SLATE_CURATOR: '1' })).output, null);
   const bare = await project();
   assert.equal((await handle('SubagentStop', subStop('sid', bare.root), bare.env)).output, null);
-  assert.equal(await exists(path.join(bare.root, '.slate')), false);
+  assert.deepEqual(await fs.readdir(bare.root), [], 'nothing created in the slate home');
 });
 
 test('CLI: SubagentStop prints the block JSON', async () => {
@@ -346,10 +349,10 @@ test('CLI: SubagentStop prints the block JSON', async () => {
 
 // --- SubagentStop (offload index) ---
 
-const offloadsOf = (dir) => fs.readFile(path.join(dir, 'offloads.md'), 'utf8').catch((e) => (e.code === 'ENOENT' ? null : Promise.reject(e)));
-const ENTRY_HEAD = /^## t(\d+) (\S+) (\S+)\ntranscript: (.*)\n\n/gm;
+const offloadsOf = (dir) => fs.readFile(path.join(slateOf(dir), 'offloads.md'), 'utf8').catch((e) => (e.code === 'ENOENT' ? null : Promise.reject(e)));
+const ENTRY_HEAD = /^## t(\d+)@(\S+) (\S+) (\S+)\ntranscript: (.*)\n\n/gm;
 const entries = async (dir) => [...((await offloadsOf(dir)) ?? '').matchAll(ENTRY_HEAD)]
-  .map((m) => ({ turn: Number(m[1]), at: m[2], agent: m[3], transcript: m[4] }));
+  .map((m) => ({ turn: Number(m[1]), session: m[2], at: m[3], agent: m[4], transcript: m[5] }));
 
 test('SubagentStop: a short slate:offload return is recorded with turn, agent, transcript and text', async () => {
   const { root, env, dir, id } = await activeSession();
@@ -362,7 +365,7 @@ test('SubagentStop: a short slate:offload return is recorded with turn, agent, t
   const [e, ...rest] = await entries(dir);
   assert.deepEqual(rest, []);
   assert.deepEqual({ ...e, at: undefined }, {
-    turn: 1, at: undefined, agent: 'a9f', transcript: '/home/u/.claude/projects/p/s/subagents/agent-a9f.jsonl',
+    turn: 1, session: id.slice(0, 8), at: undefined, agent: 'a9f', transcript: '/home/u/.claude/projects/p/s/subagents/agent-a9f.jsonl',
   });
   assert.ok(!Number.isNaN(Date.parse(e.at)), e.at);
   assert.ok((await offloadsOf(dir)).includes('\n> Found 3 callers.\n> Report: reports/callers.md\n'));
@@ -387,7 +390,7 @@ test('SubagentStop: other agents, no folder and unsafe agent IDs write no entry'
   assert.equal(await offloadsOf(dir), null);
   const bare = await project();
   await handle('SubagentStop', subStop('sid', bare.root, { last_assistant_message: 'ok' }), bare.env);
-  assert.equal(await exists(path.join(bare.root, '.slate')), false);
+  assert.deepEqual(await fs.readdir(bare.root), [], 'nothing created in the slate home');
 });
 
 test('SubagentStop: no agent_transcript_path is written as none', async () => {
@@ -482,7 +485,7 @@ test('PreToolUse: nothing for other agents, other tools, no message, no folder, 
   assert.equal(await exists(path.join(dir, 'handbacks')), false);
   const bare = await project();
   assert.equal((await handle('PreToolUse', handback('sid', bare.root), bare.env)).output, null);
-  assert.equal(await exists(path.join(bare.root, '.slate')), false);
+  assert.deepEqual(await fs.readdir(bare.root), [], 'nothing created in the slate home');
 });
 
 test('PreToolUse: a bad agent_id is never used as a path; the hand-back is allowed', async () => {
@@ -715,7 +718,7 @@ test('Important 2: /clear mid-curation aborts, moves, notes the missing turn and
   const [hung, drained, ...rest] = await fakeCalls(env.FAKE_RECORD);
   assert.deepEqual(rest, []);
   assert.throws(() => process.kill(hung.pid, 0), { code: 'ESRCH' }, 'the aborted claude is gone');
-  assert.ok(drained.prompt.includes(path.join(realpathSync(dir), 'instructions.md')), 'drained in the new folder');
+  assert.ok(drained.prompt.includes(path.join(slateOf(realpathSync(dir)), 'instructions.md')), 'drained in the new folder');
   assert.notDeepEqual(await readMemory(dir), before);
   assert.equal(JSON.parse(await fs.readFile(path.join(dir, 'curated.json'), 'utf8')).turn, 1);
 
@@ -775,7 +778,9 @@ test('SessionStart fork with a curator mid-edit: aborts it; the parent is restor
   assert.deepEqual(r.spawned, [CURATE, child, '1', 'sonnet']);
   await waitLog(child, 2);
   assert.deepEqual(await logTurns(child), ['t1 aborted', 't1 ok']);
-  assert.deepEqual(await readMemory(parent), before, 'the parent is untouched by the child drain');
+  // The slate's files are shared, so the child's drain shows in the parent; the parent's own now.md doesn't change.
+  assert.equal((await readMemory(parent))['now.md'], before['now.md']);
+  assert.notDeepEqual(await readMemory(parent), before);
 });
 
 test('SessionStart clear: a lock held by a process that is not a curator is never signalled', async () => {
@@ -805,14 +810,60 @@ test('SLATE_WAIT_MS overrides the curator waits, clamped to 25,000', () => {
   for (const bad of ['', '-1', '1.5', 'abc']) assert.equal(curatorWaitMs({ SLATE_WAIT_MS: bad }, 20000), 20000, bad);
 });
 
-test('CLAUDE_PROJECT_DIR wins over the input cwd', async () => {
+test('SLATE_HOME decides where sessions are; CLAUDE_PROJECT_DIR and the input cwd are ignored', async () => {
   const { root, env, dir, id } = await activeSession();
-  env.CLAUDE_PROJECT_DIR = root;
   const elsewhere = await fs.mkdtemp(path.join(os.tmpdir(), 'slate-cwd-'));
   temps.push(elsewhere);
+  env.CLAUDE_PROJECT_DIR = elsewhere;
   const r = await handle('UserPromptSubmit', prompt(id, elsewhere, 'hi'), env);
   assert.ok(ctx(r).startsWith(REMINDER));
   assert.equal((await readSession(dir)).turn, 1);
+  assert.equal(root, env.SLATE_HOME);
+});
+
+test('no hook writes anything under input.cwd', async () => {
+  const { root, env, dir, id } = await activeSession('A');
+  env.SLATE_WAIT_MS = '200';
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'slate-cwd-'));
+  temps.push(cwd);
+  await handle('SessionStart', start(id, cwd, 'resume'), env);
+  await handle('UserPromptSubmit', prompt(id, cwd, 'use pnpm'), env);
+  await handle('Stop', stop(id, cwd, 'ok'), env);
+  await waitLog(dir, 1);
+  await handle('PreCompact', input('PreCompact', id, cwd), env);
+  await handle('SubagentStop', subStop(id, cwd), env);
+  await handle('SessionStart', start('B', cwd, 'clear'), env);
+  await handle('SessionStart', start('C', cwd, 'fork'), env);
+  await handle('SessionStart', start('Z', cwd, 'startup'), env);
+  assert.deepEqual(await fs.readdir(cwd), []);
+  assert.deepEqual(await fs.readdir(path.join(root, 'topic', '.sessions')).then((l) => l.sort()), ['B', 'C']);
+});
+
+test('clear renames within .sessions/, fork copies within it, resume rewrites the pid', async () => {
+  const { root, env, dir: a } = await activeSession('A');
+  const sessions = path.join(root, 'topic', '.sessions');
+  env.CLAUDE_PID = '555';
+  await handle('SessionStart', start('A', root, 'resume'), env);
+  assert.equal((await readSession(a)).pid, 555);
+  await handle('SessionStart', start('F', root, 'fork'), env);
+  assert.deepEqual((await fs.readdir(sessions)).sort(), ['A', 'F']);
+  assert.equal((await readSession(path.join(sessions, 'F'))).from, 'A');
+  assert.equal((await readSession(path.join(sessions, 'F'))).pid, 555);
+  await handle('SessionStart', start('C', root, 'clear'), env);
+  // the fork F holds the newest session.json for the pid, so it is the one renamed
+  assert.deepEqual((await fs.readdir(sessions)).sort(), ['A', 'C']);
+  assert.equal((await readSession(path.join(sessions, 'C'))).from, 'F');
+});
+
+test('a migrated session.json without seen and from still injects and records turns', async () => {
+  const { root, env, dir, id } = await activeSession();
+  await fs.writeFile(path.join(dir, 'session.json'), JSON.stringify({ pid: PID, created: 'x', turn: 12 }));
+  const start1 = await handle('SessionStart', start(id, root, 'startup'), env);
+  assert.ok(ctx(start1).startsWith('# slate memory'));
+  const r = await handle('UserPromptSubmit', prompt(id, root, 'hi'), env);
+  assert.ok(ctx(r).startsWith(REMINDER));
+  assert.equal((await readSession(dir)).turn, 13);
+  assert.match(await fs.readFile(path.join(dir, 'queue', '0013.md'), 'utf8'), /hi/);
 });
 
 // --- CLI ---
