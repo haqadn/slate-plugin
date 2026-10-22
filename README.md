@@ -46,7 +46,7 @@ Edit memory files when no `memory.lock` exists; an edit during a run can be undo
 - At startup, session folders idle for 30 days with no live process are deleted.
 - `/slate:done` deletes the whole slate.
 - Old per-project `.slate/` folders are ignored. Delete them by hand. `node tools/migrate-session.mjs <oldSessionDir> <name>` copies one into a new slate and leaves the source untouched.
-- `node tools/reorganize-slate.mjs <name> [--dry-run]` sorts a slate's facts and assumptions into topic files with one curator-model run. It only regroups, and retires a status a later item replaces. It then checks that every ID is still live or retired with a reason. `--dry-run` prints the plan and changes nothing.
+- `node tools/reorganize-slate.mjs <name> [--dry-run]` sorts a slate's facts and assumptions into topic files with one curator-model run. It only regroups, gives each item left in a key file a home topic, and retires a status a later item replaces. It then checks that every item is still live or retired with a reason. `--dry-run` prints the plan, saves it (`--save <file>` picks where) and changes nothing; `--ops <file>` applies a saved plan without a model run.
 
 ## Permissions
 

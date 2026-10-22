@@ -416,7 +416,12 @@ test('curator-rules.md: wording the curator relies on', async () => {
     'never retire it and add it again',
     'reread the files and decide again',
     'Never cite a report',
+    // Live acceptance (Task 8): with "the topic files this turn touches", the curator never opened
+    // general.md and returned an empty `relevant` for a turn whose answer repeated a fact kept there.
+    'before deciding, read every topic file whose title or summary matches the turn\'s subject, and `topics/general.md`',
+    'every fact and assumption, key or topic, that the message or the answer used or depends on',
   ]) assert.ok(rules.includes(s), s);
+  assert.ok(!rules.includes('the topic files this turn touches'), 'reading topics is not left to a guess');
   for (const s of ['Edit', 'Write', '.slate/', 'rejected']) assert.ok(!rules.includes(s), `no ${s}`);
 });
 

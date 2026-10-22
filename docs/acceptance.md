@@ -482,12 +482,13 @@ All curator children ran `~/.local/bin/claude` (executable `~/.local/share/claud
 
 Same command and setup as the shared-slates runs, on Claude Code **2.1.308**, after topic files and selective curation landed.
 
-**Result: PASS, 31 / 31 (run 2).** The reorganize tool's smoke run against a real model also passed accounting.
+**Result: 31 / 32 on run 3, after review fix round 1.** Run 2 passed 31 / 31 before that round. In run 3, check 3b failed: B answered from the offload summary in `offloads.md` and never opened the report (see "Fix round 1"). The reorganize tool's smoke runs against a real model passed accounting.
 
 | Run | Checks | Cost A / B / resumed A | Changed after the run |
 |---|---|---|---|
 | 1 | 30 / 31 | $0.65 / $0.22 / $0.19 | **Script only:** T3 read the memory block from the transcript, where the harness didn't add it (see below). It now reads the block the hook returned, from stream-json. |
 | 2 | **31 / 31** | $0.72 / $0.20 / $0.22 | The T3 note's wording (informational) now reports whether the block matched the last one already in the transcript. |
+| 3 (fix round 1) | 31 / 32 | $0.69 / $0.20 / $0.20 | none: one rerun was allowed |
 
 Costs are the main sessions only. The reorganize smoke run cost $0.05 (dry run) and $0.02 (real run).
 
@@ -544,6 +545,37 @@ A  21:05:49.425Z t4 ok: attempt 1: applied nothing
 **Not asserted:**
 - **`relevant` was empty in all 16 change lists across both runs.** That includes B's turn 3 ("Which file does it mark !!?"), where F3 names `src/db/pool.rs` as the urgent one. So `usage.json` only gets add-time stamps, and demotion falls back to "oldest added first".
 - The curators put no fact in a key file, the staging host included.
+
+### Fix round 1 (review findings)
+
+**Changes:**
+- **The reorganize tool can apply a reviewed plan.** `--dry-run` saves its op list (`--save <file>`, else a temp file), and `--ops <file>` applies a saved list with no model run. It refuses a list saved for another slate.
+- **Accounting counts lines, not IDs.**
+  - Only retired lines this run added count. An older retired line for the same ID no longer covers a lost item.
+  - Live copies are counted per ID, so a dropped copy or an extra copy fails.
+- **`keep` op, reorganize mode only.** It leaves a key item in place, records its `home` and stamps it. The prompt asks for one per item left in a key file. The tool reports any key item still without a home.
+- **Stricter reorganize retires.** They take only F and A items. The reason must name an item of the same type, numbered higher, that is still live after the apply, whatever the op order.
+- **`curator-rules.md`:** before deciding, the curator reads every topic file whose title or summary matches the turn's subject, plus `topics/general.md`. `relevant` lists every item the message or answer used or depends on.
+- **Live script:** T1 (`relevant` present) is replaced. T1a checks that B's change list for the "!!" turn names every item holding `pool.rs` that was added before its curator ran. T1b checks that `usage.json` counts it. The recorder now saves each run's session, turn and start time.
+
+**Run 3 (`fix1/run3.json`):**
+- 31 / 32 checks passed. 3b failed with "reads: none".
+  - B's agent tried `grep -rn "!!" <slate>/reports/`, which was denied (a known Bash limitation, reported as a note).
+  - It then read `offloads.md`, whose entry for A's offload holds the return text naming `src/db/pool.rs`.
+  - B answered correctly from that, and said so: "per the offload summary in `offloads.md` … that answer is secondhand". It never Read the report.
+  - The product files B's session relies on (`rules.md` and `offload.md`) didn't change in this round. B did read the report in shared-slates run 3 and in this section's runs 1 and 2.
+- **T1a and T1b passed, but trivially.** No item held `pool.rs`: A's curator summarized the scan as F3, which lists categories, not files.
+- **The tightened rules did change behavior.** B's "!!" change list returned `relevant: ["F3"]`, the TODO(perf) topic fact, and `usage.json` shows F3 at count 1. In runs 1 and 2, all 16 change lists had an empty `relevant`. In run 3, 1 of 7 named an ID.
+- T2, T3 and every other check passed. `stg-7.internal` is in `facts.md`, and the topics were `general` and `todo-perf`.
+
+**Smoke run with the new prompt (`fix1/smoke/`):**
+- A fresh copy of the `smoke` slate was planned with `--dry-run --save plan.json` (17 s, $0.051), then applied with `--ops plan.json`, with no model run.
+- The plan had 43 ops: 7 topics, 25 moves, 6 keeps and 5 retires.
+  - The keeps gave every item left in a key file a home: F1, F3 and A1 to `canonical-urls`, and F23, F24 and F25 to `releases`.
+  - The retires named the newest item in each chain: F8 and F9 both by F10, F14 by F15, F21 by F22, and F26 by F27.
+- The dry run left every file's SHA-1 unchanged.
+- The `--ops` run's per-file counts matched the dry run's planned counts exactly: `facts.md` 30 → 5, `assumptions.md` 6 → 1, `superseded.md` 1 → 6, and 7 topic files.
+- Both runs ended with "key items without a home: none" and "accounting: ok, 39 IDs live before; 34 live after, 5 retired with a reason".
 
 ### Reorganize smoke run
 
@@ -646,7 +678,8 @@ Removed after recording these results:
 
 - **Run 1:** `<tmp>/slate-home-dpBSN0`, `<tmp>/slate-acc-em6wVX`, `<tmp>/slate-acc-b-BBXe14` and `<tmp>/slate-probe-lbj5rj`
 - **Run 2:** `<tmp>/slate-home-kwf1Dc`, `<tmp>/slate-acc-vr3jVo`, `<tmp>/slate-acc-b-FDC3fQ` and `<tmp>/slate-probe-Md3pow`
-- `~/.claude/projects/-private-var-folders-…-T-slate-acc-{em6wVX,vr3jVo}` and `…-slate-acc-b-{BBXe14,FDC3fQ}`. Run 1's A transcript also holds the diagnostic resume.
+- **Run 3:** `<tmp>/slate-home-XQ3seT`, `<tmp>/slate-acc-aGygHO`, `<tmp>/slate-acc-b-zTqrLW` and `<tmp>/slate-probe-AmpOOc`
+- `~/.claude/projects/-private-var-folders-…-T-slate-acc-{em6wVX,vr3jVo}` and `…-slate-acc-b-{BBXe14,FDC3fQ}`, plus `…-slate-acc-aGygHO` and `…-slate-acc-b-zTqrLW` from run 3. Run 1's A transcript also holds the diagnostic resume.
 - The smoke-run slate and both runs' results JSON are in the session scratchpad, which is cleared with the session.
 
 Not removed, because they fall outside the cleanup ruling. All are harmless.

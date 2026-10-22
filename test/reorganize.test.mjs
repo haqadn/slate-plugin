@@ -49,7 +49,9 @@ const MOVES = [
   ...[1, 2, 3].map((n) => ({ op: 'move', id: `A${n}`, to: AREAS[(n - 1) % 3] })),
 ];
 const RETIRE_F8 = { op: 'retire', id: 'F8', reason: 'superseded by F9' };
-const FULL = [...TOPIC_OPS, ...MOVES, RETIRE_F8];
+// Every item left in a key file gets a keep with its home topic.
+const KEEPS = [...KEEP].map((id) => ({ op: 'keep', id, home: id[0] === 'F' ? areaOf(Number(id.slice(1))) : AREAS[(Number(id.slice(1)) - 1) % 3] }));
+const FULL = [...TOPIC_OPS, ...MOVES, RETIRE_F8, ...KEEPS];
 
 async function fixture() {
   const root = realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), 'slate-reorg-')));
@@ -145,8 +147,13 @@ test('a run moves items into topics, retires the replaced status, leaves key fil
   assert.match(r.stdout, /^topics\/canonical\.md\s+0\s+9$/m);
   assert.match(r.stdout, /^topics\/sitemap\.md\s+0\s+10$/m);
   assert.match(r.stdout, /^topics\/schema\.md\s+0\s+10$/m);
-  assert.match(r.stdout, /^topics: 3, moves: 29, retires: 1, demoted: 0, rejected: 0$/m);
+  assert.match(r.stdout, /^topics: 3, moves: 29, keeps: 5, retires: 1, demoted: 0, rejected: 0$/m);
+  assert.match(r.stdout, /^key items without a home: none$/m);
   assert.match(r.stdout, /^accounting: ok\b/m);
+  const usage = JSON.parse(await read(fx.slate, 'usage.json'));
+  assert.deepEqual(Object.fromEntries(Object.entries(usage).map(([id, u]) => [id, u.home])),
+    { A4: 'canonical', A5: 'sitemap', F1: 'canonical', F11: 'sitemap', F21: 'schema' });
+  for (const u of Object.values(usage)) assert.ok(Date.parse(u.last) > 0 && u.count === 0, 'kept items are stamped');
   assert.equal(await read(fx.slate, '.sessions/sid/now.md'), 'Goal: ship\n', 'no session file is touched');
   assert.equal(await exists(path.join(fx.slate, 'memory.lock')), false);
 });
@@ -171,7 +178,7 @@ test('command: one read-only run of the curator binary, Read on the key files, s
   assert.equal(flag('--tools'), 'Read');
   for (const f of ['--strict-mcp-config', '--disable-slash-commands', '--no-session-persistence']) assert.ok(args.includes(f), f);
   assert.deepEqual(JSON.parse(flag('--json-schema')), REORGANIZE_SCHEMA);
-  assert.deepEqual(REORGANIZE_SCHEMA.properties.ops.items.oneOf.map((s) => s.properties.op.const), ['topic', 'move', 'retire']);
+  assert.deepEqual(REORGANIZE_SCHEMA.properties.ops.items.oneOf.map((s) => s.properties.op.const), ['topic', 'move', 'retire', 'keep']);
   const real = realpathSync(fx.slate);
   assert.deepEqual(args.slice(args.indexOf('--allowedTools') + 1), [
     ...['instructions.md', 'assumptions.md', 'facts.md', 'superseded.md'].map((f) => `Read(/${path.join(real, f)})`),
@@ -192,14 +199,20 @@ test('command: one read-only run of the curator binary, Read on the key files, s
   assert.match(prompt, /assumptions\.md: 5 items, \d+ chars \(cap 1500\)/);
 });
 
-test('--dry-run prints the op list and the planned counts, and changes no file', async () => {
+test('--dry-run prints the op list and the planned counts, saves the list, and changes no file', async () => {
   const fx = await fixture();
   const before = await snapshot(fx.slate);
   const r = run(fx, [NAME, '--dry-run']);
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(await snapshot(fx.slate), before);
   assert.equal(await exists(path.join(fx.slate, 'topics')), false);
-  assert.deepEqual(await fs.readdir(fx.tmp), [], 'its scratch copy is removed');
+  const saved = /^ops saved to (.+)$/m.exec(r.stdout)?.[1];
+  assert.ok(saved, r.stdout);
+  assert.deepEqual(await fs.readdir(fx.tmp), [path.basename(saved)], 'its scratch copy is removed; the saved list stays');
+  assert.equal(path.dirname(saved), fx.tmp);
+  const plan = JSON.parse(await fs.readFile(saved, 'utf8'));
+  assert.deepEqual(plan.ops, FULL);
+  assert.equal(plan.slate, realpathSync(fx.slate));
   assert.match(r.stdout, /dry run/i);
   assert.match(r.stdout, /^ {2}0 topic canonical "Canonical" — All about canonical\.$/m);
   assert.match(r.stdout, /^ {2}3 move F2 > canonical$/m);
@@ -231,7 +244,8 @@ test('add, replace and now are rejected; the topic, move and retire ops in the s
   const all = Object.values(await snapshot(fx.slate)).join('\n');
   assert.ok(!all.includes('a new fact') && !all.includes('reworded'), 'nothing added');
   assert.match(await read(fx.slate, 'superseded.md'), /\[F8 t8 retired t0@reorg\]/);
-  assert.match(r.stdout, /^topics: 1, moves: 1, retires: 1, demoted: \d+, rejected: 3$/m);
+  assert.match(r.stdout, /^topics: 1, moves: 1, keeps: 0, retires: 1, demoted: \d+, rejected: 3$/m);
+  assert.match(r.stdout, /^key items without a home: F5, F6, ([AF]\d+, )*A5$/m, 'no keep, so no home');
   assert.match(r.stdout, /^accounting: ok\b/m);
 });
 
@@ -251,12 +265,12 @@ test('a retire needs a reason naming the later item that replaces it; others are
   });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, new RegExp('^rejected: 0:empty reason; 1:bad op; 2:no replacement F6; 3:no replacement F9; '
-    + '4:no replacement F5; 5:no replacement F4$', 'm'));
+    + '4:no replacement F5; 5:no replacement F4; 6:no replacement A1$', 'm'));
   const live = (await liveLines(fx.slate)).map((l) => parseItemLine(l).id);
   for (const id of ['F4', 'F5', 'F6', 'F7', 'F9']) assert.ok(live.includes(id), id);
-  assert.ok(!live.includes('F8') && !live.includes('A1'));
+  assert.ok(!live.includes('F8') && live.includes('A1'), 'an assumption is not retired by a fact');
   const retired = parseMemoryFile(await read(fx.slate, 'superseded.md')).retired.map((x) => `${x.id}: ${x.reason}`);
-  assert.deepEqual(retired, ['F31: gone', 'A1: confirmed by F3', 'F8: superseded by F9']);
+  assert.deepEqual(retired, ['F31: gone', 'F8: superseded by F9']);
   assert.match(r.stdout, /^accounting: ok\b/m);
 });
 
@@ -286,11 +300,12 @@ test('a bad name or a missing slate is refused, and nothing is created', async (
   assert.deepEqual(await calls(fx.record), [], 'no model run');
 });
 
+const state = (files, topics = []) => idState({
+  files: { 'instructions.md': '', 'assumptions.md': '', 'facts.md': '', 'superseded.md': '', ...files },
+  topics: topics.map(([slug, text]) => ({ slug, text })),
+});
+
 test('accounting: an ID live before must be live after, or retired in superseded.md with a non-empty reason', () => {
-  const state = (files, topics = []) => idState({
-    files: { 'instructions.md': '', 'assumptions.md': '', 'facts.md': '', 'superseded.md': '', ...files },
-    topics: topics.map(([slug, text]) => ({ slug, text })),
-  });
   const before = state({
     'facts.md': '- [F1 t1] a (x)\n- [F2 t1] b (x)\n- [F3 t1] c (x)\n- [F4 t1] d (x)\n',
     'instructions.md': '- [I1 t1] keep\n',
@@ -299,8 +314,74 @@ test('accounting: an ID live before must be live after, or retired in superseded
     'superseded.md': '- [F2 t1 retired t0@reorg] b (x) (reason: superseded by F5)\n- [F3 t1 retired t0@reorg] c (x) (reason:  )\n',
     'instructions.md': '- [I1 t1] keep\n',
   }, [['misc', '# Misc\n> M.\n- [F1 t1] a (x)\n- [F5 t2] e (x)\n']]);
-  assert.deepEqual(accounting(before, after), { ok: false, lost: ['F3', 'F4'], retired: ['F2'] });
-  assert.deepEqual(accounting(before, before), { ok: true, lost: [], retired: [] });
+  assert.deepEqual(accounting(before, after), { ok: false, lost: ['F3', 'F4'], duplicated: [], retired: ['F2'] });
+  assert.deepEqual(accounting(before, before), { ok: true, lost: [], duplicated: [], retired: [] });
+});
+
+test('accounting: only a retired line this run added counts; an old one for the same ID does not', () => {
+  const old = '- [F2 t1 retired t3] b (x) (reason: an older copy)\n';
+  const before = state({ 'facts.md': '- [F1 t1] a (x)\n- [F2 t4] b (x)\n', 'superseded.md': old });
+  const dropped = state({ 'facts.md': '- [F1 t1] a (x)\n', 'superseded.md': old });
+  assert.deepEqual(accounting(before, dropped), { ok: false, lost: ['F2'], duplicated: [], retired: [] });
+  const retired = state({ 'facts.md': '- [F1 t1] a (x)\n', 'superseded.md': `${old}- [F2 t4 retired t0@reorg] b (x) (reason: by F9)\n` });
+  assert.deepEqual(accounting(before, retired), { ok: true, lost: [], duplicated: [], retired: ['F2'] });
+  const noReason = state({ 'facts.md': '- [F1 t1] a (x)\n', 'superseded.md': `${old}- [F2 t4 retired t0@reorg] b (x) (reason: )\n` });
+  assert.deepEqual(accounting(before, noReason).lost, ['F2']);
+});
+
+test('accounting: live lines are counted per ID; a dropped copy or an extra copy fails', () => {
+  const twice = state({ 'facts.md': '- [F1 t1] a (x)\n- [F1 t1] a (x)\n' });
+  const once = state({ 'facts.md': '- [F1 t1] a (x)\n' });
+  assert.deepEqual(accounting(twice, once), { ok: false, lost: ['F1'], duplicated: [], retired: [] });
+  assert.deepEqual(accounting(twice, twice).ok, true);
+  const moved = state({ 'facts.md': '- [F1 t1] a (x)\n' }, [['misc', '# Misc\n> M.\n- [F1 t1] a (x)\n']]);
+  assert.deepEqual(accounting(once, moved), { ok: false, lost: [], duplicated: ['F1'], retired: [] });
+  const fresh = state({ 'facts.md': '- [F1 t1] a (x)\n- [F9 t0] new (x)\n- [F9 t0] new (x)\n' });
+  assert.deepEqual(accounting(once, fresh), { ok: false, lost: [], duplicated: ['F9'], retired: [] });
+  const adopted = state({ 'facts.md': '- [F1 t1] a (x)\n- [F9 t0] new (x)\n' });
+  assert.deepEqual(accounting(once, adopted).ok, true, 'a new ID once is fine');
+});
+
+test('--ops applies a saved list exactly, with no model run, even with no model binary', async () => {
+  const fx = await fixture();
+  const dry = run(fx, [NAME, '--dry-run', '--save', path.join(fx.root, 'plan.json')]);
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.match(dry.stdout, new RegExp(`^ops saved to ${path.join(fx.root, 'plan.json').replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}$`, 'm'));
+  assert.equal((await calls(fx.record)).length, 1);
+
+  // The model would now plan something else, and there is no binary to run it anyway.
+  const r = run(fx, [NAME, '--ops', path.join(fx.root, 'plan.json')], {
+    ops: [{ op: 'move', id: 'F2', to: 'general' }], env: { SLATE_CLAUDE_BIN: path.join(fx.root, 'no-such-claude') },
+  });
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  assert.equal((await calls(fx.record)).length, 1, 'no model run');
+  assert.match(r.stdout, /^ops \(38\) from .*plan\.json/m);
+  assert.match(r.stdout, /^topics: 3, moves: 29, keeps: 5, retires: 1, demoted: 0, rejected: 0$/m);
+  assert.match(r.stdout, /^accounting: ok\b/m);
+  assert.deepEqual(ids(await read(fx.slate, 'facts.md')), ['F1', 'F11', 'F21']);
+  assert.equal(await exists(path.join(fx.slate, 'topics', 'general.md')), false);
+
+  // The dry run printed the same counts it now applied.
+  const table = (out) => out.split('\n').filter((l) => /^(topics\/)?[a-z-]+\.md\s/.test(l)).join('\n');
+  assert.equal(table(r.stdout), table(dry.stdout));
+});
+
+test('--ops refuses a list saved for another slate, and a file that holds no list', async () => {
+  const fx = await fixture();
+  const other = path.join(fx.root, 'other.json');
+  await fs.writeFile(other, JSON.stringify({ slate: '/somewhere/else', ops: FULL }));
+  const before = await snapshot(fx.slate);
+  let r = run(fx, [NAME, '--ops', other]);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /planned for \/somewhere\/else/);
+  await fs.writeFile(other, '{"nope": 1}');
+  r = run(fx, [NAME, '--ops', other]);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /no op list/);
+  r = run(fx, [NAME, '--ops', path.join(fx.root, 'missing.json')]);
+  assert.notEqual(r.status, 0);
+  assert.deepEqual(await snapshot(fx.slate), before);
+  assert.deepEqual(await calls(fx.record), []);
 });
 
 test('reorganize-rules.md: the rules the reorganize pass relies on', async () => {
@@ -311,6 +392,9 @@ test('reorganize-rules.md: the rules the reorganize pass relies on', async () =>
   assert.match(rules, /Retire only an item a later item explicitly replaces/);
   assert.match(rules, /reason names the replacing ID/);
   assert.match(rules, /Never reword/);
-  for (const op of ['topic', 'move', 'retire']) assert.match(rules, new RegExp(`^\\| \`${op}\` \\|`, 'm'), op);
+  for (const op of ['topic', 'move', 'retire', 'keep']) assert.match(rules, new RegExp(`^\\| \`${op}\` \\|`, 'm'), op);
+  assert.match(rules, /For every F and A item you leave in a key file, return a `keep`/);
+  assert.match(rules, /an item of the same type that stays live/);
+  assert.match(rules, /Instructions are never retired here/);
   assert.doesNotMatch(rules, /^\| `(add|replace|now)` \|/m);
 });

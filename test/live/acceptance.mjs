@@ -14,7 +14,7 @@
 // so B's curators overlap A's.
 // A throwaway probe plugin is loaded alongside slate to record what SubagentStop and PreToolUse
 // hooks receive. The curator runs the real binary through a recorder (SLATE_CLAUDE_BIN) that keeps
-// each change list, so the run can check that every one carried `relevant`. Once everything has
+// each change list, so the run can check what B's "!!" turn marked relevant. Once everything has
 // settled, A is resumed for one more short turn, a session started after the run, to check that its
 // memory block lists the topics.
 // Env: SLATE_LIVE_CLAUDE (main-session binary; default CLAUDE_CODE_EXECPATH, else `claude`),
@@ -542,8 +542,9 @@ if (i.hook_event_name === 'PreToolUse') {
 }
 
 // The curator's binary, for the run: it runs the real one with the same args and stdout, and saves
-// that stdout (the `--output-format json` result) to <root>/curator-outputs/<pid>.json. It lives in
-// the curator's process group, so a kill of the group kills both.
+// that stdout (the `--output-format json` result) to <root>/curator-outputs/<pid>.json, with when the
+// run started and ended and the session and turn its prompt names. It lives in the curator's process
+// group, so a kill of the group kills both.
 export function buildRecorder(root, realBin) {
   const dir = path.join(root, 'curator-outputs');
   fs.mkdirSync(dir, { recursive: true });
@@ -551,19 +552,25 @@ export function buildRecorder(root, realBin) {
   fs.writeFileSync(file, `#!/usr/bin/env node
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
-const child = spawn(${JSON.stringify(realBin)}, process.argv.slice(2), { stdio: ['inherit', 'pipe', 'inherit'] });
+const started = new Date().toISOString();
+const args = process.argv.slice(2);
+const prompt = args[args.indexOf('-p') + 1] ?? '';
+const turn = Number(/^Current turn: (\\d+)$/m.exec(prompt)?.[1] ?? NaN);
+const session = /\\/\\.sessions\\/([^/\\n]+)\\/now\\.md$/m.exec(prompt)?.[1] ?? null;
+const child = spawn(${JSON.stringify(realBin)}, args, { stdio: ['inherit', 'pipe', 'inherit'] });
 let out = '';
 child.stdout.setEncoding('utf8');
 child.stdout.on('data', (d) => { out += d; process.stdout.write(d); });
 child.on('close', (code, signal) => {
-  fs.writeFileSync(${JSON.stringify(dir)} + '/' + process.pid + '.json', JSON.stringify({ at: new Date().toISOString(), code, signal, stdout: out }));
+  fs.writeFileSync(${JSON.stringify(dir)} + '/' + process.pid + '.json', JSON.stringify({ started, at: new Date().toISOString(), session, turn, code, signal, stdout: out }));
   process.exitCode = code ?? 1;
 });
 `, { mode: 0o755 });
   return { bin: file, dir };
 }
 
-// Each recorded curator run: when it ended, its exit and its change list (structured_output), if any.
+// Each recorded curator run: when it started and ended, its session and turn, its exit and its
+// change list (structured_output), if any.
 export function curatorOutputs(dir) {
   return listDir(dir).filter((f) => f.endsWith('.json')).map((f) => {
     const r = JSON.parse(readText(path.join(dir, f)));
@@ -571,8 +578,33 @@ export function curatorOutputs(dir) {
     try {
       list = JSON.parse(r.stdout)?.structured_output ?? null;
     } catch {}
-    return { file: f, at: r.at, code: r.code, list };
+    return { file: f, started: r.started, at: r.at, session: r.session, turn: r.turn, code: r.code, list };
   }).sort((a, b) => a.at.localeCompare(b.at));
+}
+
+// Items (live or retired) whose text holds `needle`: ID → text.
+export function itemsHolding(texts, needle) {
+  const out = new Map();
+  for (const t of texts) {
+    const p = parseMemoryFile(t ?? '');
+    for (const x of [...p.items, ...p.retired]) if (x.text.includes(needle)) out.set(x.id, x.text);
+  }
+  return out;
+}
+
+// For one turn's change lists: the items holding the needle that were added (per curator.log)
+// before each list's curator run started, and which of them the lists named in `relevant`.
+export function relevanceFor(lists, holding, addedAt) {
+  const norm = (id) => String(id).trim().replace(/^([IAF])0*(\d+)$/, '$1$2');
+  const known = new Set();
+  const named = new Set();
+  for (const o of lists) {
+    const before = [...holding.keys()].filter((id) => (addedAt.get(id) ?? Infinity) < Date.parse(o.started));
+    before.forEach((id) => known.add(id));
+    const rel = new Set((o.list?.relevant ?? []).map(norm));
+    before.filter((id) => rel.has(id)).forEach((id) => named.add(id));
+  }
+  return { known: [...known], named: [...named], missing: [...known].filter((id) => !named.has(id)) };
 }
 
 // Each slate:offload stop the probe saw, whether it was over the limit and whether it was sent back,
@@ -1027,9 +1059,14 @@ async function main() {
   // the model to the end (ok, partial, retry); usage.json against the F and A items added.
   const outputs = curatorOutputs(recorder.dir);
   const lists = outputs.filter((o) => Array.isArray(o.list?.ops));
-  const modelRuns = [A, B].reduce((n, s) => n + s.logLines.filter((l) => ['ok', 'partial', 'retry'].includes(l.status)).length, 0);
-  const withRelevant = lists.filter((o) => Array.isArray(o.list.relevant));
-  const relevantIds = [...new Set(withRelevant.flatMap((o) => o.list.relevant))];
+  const relevantIds = [...new Set(lists.flatMap((o) => o.list.relevant ?? []))];
+  // B's "!!" turn: its answer names the file the report marks "!!", src/db/pool.rs. Its slate turn is
+  // its index in B.turns, since the link turn isn't one.
+  const bangTurn = B.turns.findIndex((t) => t.prompt === B_PROMPTS[2]);
+  const bangLists = lists.filter((o) => o.session === B.id && o.turn === bangTurn);
+  const addedAt = new Map([A, B].flatMap((s) => s.logLines.flatMap((l) => l.adds.map((id) => [id, l.at]))));
+  const holding = itemsHolding([...SHARED_FILES.map((f) => mem[f]), ...Object.values(topics)], 'pool.rs');
+  const bang = relevanceFor(bangLists, holding, addedAt);
   const usageText = readText(path.join(slate, 'usage.json'));
   let usage = null;
   try {
@@ -1038,6 +1075,7 @@ async function main() {
   const liveIds = new Set(ids.filter((x) => !x.retired).map((x) => x.id));
   const addedFA = [...new Set(added.map((x) => x.id).filter((id) => /^[FA]/.test(id) && liveIds.has(id)))];
   const notInUsage = addedFA.filter((id) => !usage || !(id in usage));
+  const uncounted = bang.known.filter((id) => liveIds.has(id) && !(usage?.[id]?.count >= 1));
   const SHAPE = ['agent_type', 'last_assistant_message', 'stop_hook_active', 'session_id', 'agent_id'];
   const offloadStops = [...A.offloadStops, ...B.offloadStops];
   const noChange = (s) => s.userTurns.filter((n) => !s.a.hookContext.some((h) => h.turn === n && h.event === 'UserPromptSubmit' && h.text.includes(REMINDER)));
@@ -1117,9 +1155,12 @@ async function main() {
       both((s) => `${s.queue.join(', ') || 'empty'} (newest turn ${s.slateTurns})`)],
     ['every slate:offload hand-back over 800 chars was denied exactly once', [A, B].every((s) => s.hb.every((h) => h.ok)),
       `${[A, B].flatMap((s) => s.hb.map((h) => `${s.name} ${h.id.slice(0, 6)}: ${h.calls.map((c) => `${c.chars ?? '?'} chars ${c.denied ? 'denied' : c.error ? 'error' : 'ok'}`).join(' → ')}`)).join('; ') || 'no hand-backs'}; probe saw ${preToolUses.filter((x) => HANDBACK_TOOLS.includes(x.tool_name)).length} hand-back PreToolUse(s)`],
-    ['T1. every curator change list carried `relevant` (one recorded list per ok, partial or retry log line)',
-      lists.length > 0 && lists.length === modelRuns && withRelevant.length === lists.length,
-      `${lists.length} change list(s) recorded (${outputs.length} run(s)), ${modelRuns} ok/partial/retry log line(s); ${withRelevant.length} with relevant, ${withRelevant.filter((o) => o.list.relevant.length).length} non-empty; IDs marked relevant: ${relevantIds.join(', ') || 'none'}`],
+    ['T1a. B\'s change list for the "!!" turn names, in `relevant`, every item holding pool.rs added before its curator ran',
+      bangLists.length > 0 && bang.missing.length === 0,
+      `B slate turn ${bangTurn}: ${bangLists.length} change list(s), relevant ${bangLists.map((o) => JSON.stringify(o.list.relevant)).join(' ') || 'none'}; items holding pool.rs: ${[...holding].map(([id, t]) => `${id} (${t.slice(0, 60)}…)`).join('; ') || 'none'}; added before: ${bang.known.join(', ') || 'none (nothing to name)'}; missing ${bang.missing.join(', ') || 'none'}; all change lists: ${lists.length}, ${lists.filter((o) => (o.list.relevant ?? []).length).length} with relevant IDs (${relevantIds.join(', ') || 'none'})`],
+    ['T1b. usage.json counts that item as relevant (count ≥ 1)',
+      bang.known.length === 0 || uncounted.length === 0,
+      `${bang.known.map((id) => `${id}: ${JSON.stringify(usage?.[id] ?? null)}`).join('; ') || 'no item to count'}`],
     ['T2. usage.json exists and holds every F and A item added that is still live',
       usage !== null && addedFA.length > 0 && notInUsage.length === 0,
       `usage.json ${usage === null ? 'missing or unreadable' : `holds ${Object.keys(usage).join(', ') || 'nothing'}`}; live F/A added: ${addedFA.join(', ') || 'none'}; missing: ${notInUsage.join(', ') || 'none'}`],

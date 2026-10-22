@@ -732,7 +732,7 @@ test('reorganize: dir is the slate folder; only topic, move and retire apply, an
   assert.ok(ERROR_KINDS.includes('op not allowed') && ERROR_KINDS.includes('no replacement'));
 });
 
-test('reorganize: a retire must name the item that replaces it, live when the apply began and later if of the same type', async () => {
+test('reorganize: a retire names a later item of the same type that is still live after the apply', async () => {
   const facts = '# Facts\n- [F2 t1] Node 24 (package.json)\n- [F3 t2] PR #1 in review (user)\n- [F4 t3] PR #1 approved (user)\n'
     + '- [F5 t4] PR #1 merged (user)\n';
   const { dir, before } = await slate({ ...BASE, 'facts.md': facts });
@@ -741,22 +741,87 @@ test('reorganize: a retire must name the item that replaces it, live when the ap
     { op: 'retire', id: 'F2', reason: 'no longer true' }, // names nothing
     { op: 'retire', id: 'F2', reason: 'replaced by F2' }, // itself
     { op: 'retire', id: 'F2', reason: 'see F9' }, // not live
-    { op: 'retire', id: 'F2', reason: 'see A9' }, // retired before the apply
-    { op: 'retire', id: 'A1', reason: 'confirmed by F2' }, // another type: any live item
+    { op: 'retire', id: 'F2', reason: 'see A9' }, // retired before the apply, and another type
+    { op: 'retire', id: 'A1', reason: 'confirmed by F2' }, // another type
+    { op: 'retire', id: 'F3', reason: 'superseded by F4' }, // F4 is retired below: not live after the apply
     { op: 'retire', id: 'F4', reason: 'superseded by F5 (merged)' },
-    { op: 'retire', id: 'F3', reason: 'superseded by F4' }, // F4 retired just now, but live when the apply began
     { op: 'retire', id: 'F2', reason: '' },
+    { op: 'retire', id: 'I1', reason: 'superseded by I2' }, // instructions are never retired here
   ], { ...REORG, lenient: true });
   assert.deepEqual(r.errors, ['0:no replacement F3', '1:no replacement F2', '2:no replacement F2', '3:no replacement F2',
-    '4:no replacement F2', '8:empty reason']);
-  assert.deepEqual(r.applied, ['5:retire A1', '6:retire F4', '7:retire F3']);
+    '4:no replacement F2', '5:no replacement A1', '6:no replacement F3', '8:empty reason', '9:instruction retire I1']);
+  assert.deepEqual(r.applied, ['7:retire F4']);
   for (const t of r.errors) assert.match(t, SAFE_TOKEN, t);
   const now = await readMemory(dir);
-  assert.equal(now['facts.md'], '# Facts\n- [F2 t1] Node 24 (package.json)\n- [F5 t4] PR #1 merged (user)\n');
+  assert.equal(now['facts.md'], '# Facts\n- [F2 t1] Node 24 (package.json)\n- [F3 t2] PR #1 in review (user)\n'
+    + '- [F5 t4] PR #1 merged (user)\n');
+  assert.equal(now['instructions.md'], before['instructions.md']);
+  assert.equal(now['assumptions.md'], before['assumptions.md']);
   assert.equal(now['superseded.md'], `${before['superseded.md']}`
-    + '- [A1 t2 retired t0@reorg] CI runs on push (reason: confirmed by F2)\n'
-    + '- [F4 t3 retired t0@reorg] PR #1 approved (user) (reason: superseded by F5 (merged))\n'
-    + '- [F3 t2 retired t0@reorg] PR #1 in review (user) (reason: superseded by F4)\n');
+    + '- [F4 t3 retired t0@reorg] PR #1 approved (user) (reason: superseded by F5 (merged))\n');
+  assert.ok(ERROR_KINDS.includes('instruction retire'));
+});
+
+test('reorganize: whether a replacement stays live does not depend on op order, and a rejected retire leaves it live', async () => {
+  const facts = '# Facts\n- [F3 t2] PR #1 in review (user)\n- [F4 t3] PR #1 approved (user)\n- [F5 t4] PR #1 merged (user)\n'
+    + '- [F6 t5] PR #1 reverted (user)\n';
+  // F3 names F4 and F4 names F5: F4 goes, so F3 stays, in either order.
+  for (const order of [[0, 1], [1, 0]]) {
+    const { dir } = await slate({ ...BASE, 'facts.md': facts });
+    const ops = [{ op: 'retire', id: 'F3', reason: 'superseded by F4' }, { op: 'retire', id: 'F4', reason: 'superseded by F5' }];
+    const r = await applyChanges(slateOf(dir), order.map((i) => ops[i]), { ...REORG, lenient: true });
+    assert.deepEqual(r.applied, [`${order.indexOf(1)}:retire F4`], `order ${order}`);
+    assert.deepEqual(r.errors, [`${order.indexOf(0)}:no replacement F3`], `order ${order}`);
+  }
+  // F5's own retire is rejected (it names no item), so F5 stays live and F4 may name it; F6 names F99.
+  const { dir } = await slate({ ...BASE, 'facts.md': facts });
+  const r = await applyChanges(slateOf(dir), [
+    { op: 'retire', id: 'F4', reason: 'superseded by F5' },
+    { op: 'retire', id: 'F5', reason: 'undone' },
+    { op: 'retire', id: 'F3', reason: 'superseded by F5 and F6' },
+  ], { ...REORG, lenient: true });
+  assert.deepEqual(r.applied, ['0:retire F4', '2:retire F3']);
+  assert.deepEqual(r.errors, ['1:no replacement F5']);
+});
+
+test('reorganize: keep stamps a key item and records its home; the caps then demote unkept items first', async () => {
+  const lines = [itemLine('F1', 1000), itemLine('F2', 1000), itemLine('F3', 1100)];
+  const { dir } = await slate({ ...BASE, 'facts.md': `# Facts\n${lines.join('\n')}\n` });
+  await writeTopic(dir, 'build', BUILD);
+  const r = await applyChanges(slateOf(dir), [
+    { op: 'keep', id: 'F1', home: 'build' },
+    { op: 'topic', slug: 'seo', title: 'SEO', summary: 'Search.' },
+    { op: 'keep', id: 'F3', home: 'seo' },
+    { op: 'keep', id: 'A1', home: 'general' },
+  ], { ...REORG, lenient: true, now: T2 });
+  assert.deepEqual(r, {
+    applied: ['1:topic seo', '0:keep F1>build', '2:keep F3>seo', '3:keep A1>general'], skipped: [], errors: [], demoted: ['F2>general'],
+  });
+  assert.equal((await readMemory(dir))['facts.md'], `# Facts\n${lines[0]}\n${lines[2]}\n`);
+  assert.deepEqual(await readUsage(dir), { A1: use(T2, 0, 'general'), F1: use(T2, 0, 'build'), F3: use(T2, 0, 'seo') });
+});
+
+test('reorganize: keep is rejected for a topic item, an instruction, a gone item, a missing topic, and outside reorganize mode', async () => {
+  const { dir, before } = await slate();
+  await writeTopic(dir, 'build', `${BUILD}- [F20 t1] uses vite (vite.config.ts)\n`);
+  const ops = [
+    { op: 'keep', id: 'F20', home: 'build' },
+    { op: 'keep', id: 'I1', home: 'build' },
+    { op: 'keep', id: 'F99', home: 'build' },
+    { op: 'keep', id: 'F2', home: 'nowhere' },
+    { op: 'keep', id: 'F2', home: 'Bad Slug' },
+    { op: 'keep', id: 'F2' },
+  ];
+  const r = await applyChanges(slateOf(dir), ops, { ...REORG, lenient: true });
+  assert.deepEqual(r.errors, ['0:not key F20', '1:not key I1', '2:stale F99', '3:missing topic', '4:bad slug', '5:bad op']);
+  assert.deepEqual(r.applied, []);
+  for (const t of r.errors) assert.match(t, SAFE_TOKEN, t);
+  assert.equal(await exists(usagePath(dir)), false);
+  assert.ok(ERROR_KINDS.includes('not key'));
+
+  const normal = await applyChanges(dir, [{ op: 'keep', id: 'F2', home: 'build' }], { ...OPTS, lenient: true });
+  assert.deepEqual(normal, { applied: [], skipped: [], errors: ['0:bad op'], demoted: [] });
+  assert.deepEqual(await readMemory(dir), before);
 });
 
 test('reorganize: outside it, a retire\'s reason is free and every op is allowed', async () => {
@@ -765,12 +830,19 @@ test('reorganize: outside it, a retire\'s reason is free and every op is allowed
   assert.deepEqual(r.applied, ['0:retire F2', '1:now']);
 });
 
-test('REORGANIZE_SCHEMA: ops of topic, move and retire only; no relevant', () => {
+test('REORGANIZE_SCHEMA: ops of topic, move, retire and keep only; no relevant; CHANGE_SCHEMA has no keep', () => {
   assert.deepEqual(REORGANIZE_SCHEMA.required, ['ops']);
   assert.deepEqual(Object.keys(REORGANIZE_SCHEMA.properties), ['ops']);
   assert.equal(REORGANIZE_SCHEMA.additionalProperties, false);
   const shapes = REORGANIZE_SCHEMA.properties.ops.items.oneOf;
-  assert.deepEqual(shapes.map((s) => s.properties.op.const), ['topic', 'move', 'retire']);
+  assert.deepEqual(shapes.map((s) => s.properties.op.const), ['topic', 'move', 'retire', 'keep']);
   const same = (op) => CHANGE_SCHEMA.properties.ops.items.oneOf.find((s) => s.properties.op.const === op);
-  for (const s of shapes) assert.deepEqual(s, same(s.properties.op.const));
+  for (const s of shapes.slice(0, 3)) assert.deepEqual(s, same(s.properties.op.const));
+  assert.deepEqual(shapes[3], {
+    type: 'object',
+    properties: { op: { const: 'keep' }, id: { type: 'string' }, home: { type: 'string' } },
+    required: ['op', 'id', 'home'],
+    additionalProperties: false,
+  });
+  assert.equal(same('keep'), undefined);
 });

@@ -39,7 +39,7 @@ const REPORT = /(?:^|[^\w.-])reports\/|\.slate/;
 export const ERROR_KINDS = ['bad op', 'bad id', 'empty text', 'multi-line text', 'tag in text', 'no source',
   'report source', 'empty reason', 'multi-line reason', 'now too long', 'tag in now', 'bad slug', 'empty title',
   'multi-line title', 'empty summary', 'multi-line summary', 'missing topic', 'no home', 'instruction move',
-  'op not allowed', 'no replacement'];
+  'op not allowed', 'no replacement', 'instruction retire', 'not key'];
 
 const STRING = { type: 'string' };
 function shape(op, fields) {
@@ -79,13 +79,16 @@ export const CHANGE_SCHEMA = {
 };
 
 // The one-off reorganize pass (tools/reorganize-slate.mjs) regroups items and retires replaced
-// ones; it never adds or rewords.
-const REORGANIZE_OPS = ['topic', 'move', 'retire'];
+// ones; it never adds or rewords. Its own `keep` leaves an item in its key file with a home topic.
+const REORGANIZE_OPS = ['topic', 'move', 'retire', 'keep'];
 const shapeOf = (op) => CHANGE_SCHEMA.properties.ops.items.oneOf.find((s) => s.properties.op.const === op);
 export const REORGANIZE_SCHEMA = {
   type: 'object',
   properties: {
-    ops: { type: 'array', items: { oneOf: REORGANIZE_OPS.map(shapeOf) } },
+    ops: {
+      type: 'array',
+      items: { oneOf: [...['topic', 'move', 'retire'].map(shapeOf), shape('keep', { id: STRING, home: STRING })] },
+    },
   },
   required: ['ops'],
   additionalProperties: false,
@@ -203,8 +206,9 @@ const formatUsage = (usage) => `${JSON.stringify(Object.fromEntries(Object.entri
 // nothing is written. Lenient: invalid ops are dropped, and a stale replace still adds its new
 // item, so a user's instruction is never silently lost. Returned tokens carry op index, kind, IDs
 // and slugs only; `demoted` lists `<ID>><slug>` for each item a cap moved out of its key file.
-// `reorganize`: `dir` is the slate folder (no session, so no now.md); only topic, move and retire
-// ops apply, and a retire's reason must name the item that replaces it.
+// `reorganize`: `dir` is the slate folder (no session, so no now.md); only topic, move, retire and
+// keep ops apply. A retire takes only a fact or assumption, and its reason must name a later item of
+// the same type that stays live. A keep records a key item's home and stamps it.
 export async function applyChanges(dir, ops, {
   turn, sessionId, lenient = false, relevant = [], now = new Date(), reorganize = false,
 }) {
@@ -297,11 +301,30 @@ export async function applyChanges(dir, ops, {
       append(to, line);
     };
 
-    // Reorganize mode: a retire's reason names the item that replaces it, live when this apply began
-    // and, if of the same type, added after it.
-    const startIds = new Set(live().map((x) => x.item.id));
-    const replaced = (reason, id) => (reason.match(/\b[IAF]\d+\b/g) ?? []).map(parseId).some((r) => r !== id
-      && startIds.has(r) && (r[0] !== id[0] || Number(r.slice(1)) > Number(id.slice(1))));
+    // Reorganize mode: a retire's reason names an item of the same type, numbered higher, that is
+    // still live after this apply. Only retires take items away here, and a replacement is numbered
+    // above what it replaces, so deciding from the highest target down settles each replacement's
+    // own retire first, whatever the op order. `settled` holds the indexes of the retires that go.
+    const kept = new Set(); // IDs a keep stamps
+    const settled = new Set();
+    if (reorganize) {
+      const startIds = new Set(live().map((x) => x.item.id));
+      const num = (id) => Number(id.slice(1));
+      const goes = new Set();
+      const retires = ops.map((o, i) => ({ o, i }))
+        .filter(({ o }) => o?.op === 'retire' && isString(o.id, o.reason) && !lineError(o.reason, 'reason'))
+        .map((x) => ({ ...x, id: parseId(x.o.id) }))
+        .filter(({ id }) => id && TOPIC_TYPES.includes(id[0]) && startIds.has(id))
+        .sort((a, b) => num(b.id) - num(a.id) || a.i - b.i);
+      for (const { o, i, id } of retires) {
+        if (goes.has(id)) continue; // a second retire of it finds it gone
+        const names = (o.reason.match(/\b[IAF]\d+\b/g) ?? []).map(parseId);
+        if (names.some((r) => r[0] === id[0] && num(r) > num(id) && startIds.has(r) && !goes.has(r))) {
+          goes.add(id);
+          settled.add(i);
+        }
+      }
+    }
 
     const handle = (o, i) => {
       const fail = (kind, id) => errors.push(`${i}:${kind}${id ? ` ${id}` : ''}`);
@@ -338,6 +361,7 @@ export async function applyChanges(dir, ops, {
         if (!id) return fail('bad id');
         const bad = (replace && textError(id[0], o.text, slatePaths)) || lineError(o.reason, 'reason');
         if (bad) return fail(bad);
+        if (reorganize && id[0] === 'I') return fail('instruction retire', id);
         const target = find(id);
         if (!target) {
           fail('stale', id);
@@ -347,7 +371,7 @@ export async function applyChanges(dir, ops, {
           }
           return;
         }
-        if (reorganize && !replaced(o.reason, id)) return fail('no replacement', id);
+        if (reorganize && !settled.has(i)) return fail('no replacement', id);
         retire(target, o.reason);
         // The replacement takes the old item's place: its file and its usage.
         const added = replace && add(i, id[0], o.text, target.where === KEY ? null : target.where);
@@ -379,6 +403,19 @@ export async function applyChanges(dir, ops, {
         if (bad) return fail(bad);
         mem['now.md'] = { ...load(o.text === '' || o.text.endsWith('\n') ? o.text : `${o.text}\n`), changed: true };
         applied.push(`${i}:now`);
+      } else if (o.op === 'keep' && reorganize) {
+        if (!isString(o.id, o.home)) return fail('bad op');
+        const id = parseId(o.id);
+        if (!id) return fail('bad id');
+        const bad = topicError(o.home);
+        if (bad) return fail(bad);
+        if (id[0] === 'I') return fail('not key', id);
+        const target = find(id);
+        if (!target) return fail('stale', id);
+        if (target.file !== keyFile(id[0])) return fail('not key', id);
+        usage[id] = { ...usage[id], home: o.home };
+        kept.add(id);
+        applied.push(`${i}:keep ${id}>${o.home}`);
       } else {
         fail('bad op');
       }
@@ -396,7 +433,8 @@ export async function applyChanges(dir, ops, {
     for (const id of named) {
       if (tracked.has(id)) usage[id] = { ...usage[id], last: stamp, count: (usage[id]?.count ?? 0) + 1 };
     }
-    for (const id of fresh) {
+    // Kept items are stamped too, but stay demotable: the caps still hold.
+    for (const id of [...fresh, ...kept]) {
       if (tracked.has(id)) usage[id] = { ...usage[id], last: stamp, count: usage[id]?.count ?? 0 };
     }
     for (const id of Object.keys(usage)) if (!tracked.has(id)) delete usage[id];

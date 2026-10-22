@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 // One-off: sort a slate's facts and assumptions into topic files with one model run.
-// Usage: node tools/reorganize-slate.mjs <name> [--dry-run]   (honors SLATE_HOME)
+// Usage: node tools/reorganize-slate.mjs <name> [--dry-run] [--save <file>] [--ops <file>]
+// (honors SLATE_HOME)
 // The curator binary, resolved and run with the env as curate.mjs does, reads the key files,
-// superseded.md and the topic files, and returns only topic, move and retire ops. applyChanges
+// superseded.md and the topic files, and returns only topic, move, retire and keep ops. applyChanges
 // applies them in reorganize mode, leniently: any other op, and any retire whose reason doesn't name
-// its replacement, is dropped. Then the key-file caps apply. --dry-run applies to a scratch copy to
-// show the plan, and changes nothing. Last, the accounting: every ID live before must be live after,
-// or retired in superseded.md with a reason. The tool exits 1 if it isn't.
+// its replacement, is dropped. Then the key-file caps apply.
+// --dry-run applies to a scratch copy to show the plan, changes nothing, and saves the op list (to
+// --save <file>, else a temp file). --ops <file> applies a saved list with no model run. Last, the
+// accounting: every live line before is live after, or retired by this run with a reason, and no ID
+// gains a copy. The tool exits 1 if not.
 import fs from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import os from 'node:os';
@@ -50,24 +53,38 @@ export async function readState(slate) {
   return { files, topics: await readTopics(slate), usage: await readText(path.join(slate, USAGE)) };
 }
 
-// Live IDs, each with its file, and retired IDs with their reasons.
+const bump = (map, id) => map.set(id, (map.get(id) ?? 0) + 1);
+
+// Per ID: how many live lines carry it (item and topic files), and how many retired lines with a
+// non-empty reason superseded.md holds for it.
 export function idState({ files, topics }) {
   const live = new Map();
-  for (const f of ITEM_NAMES) for (const x of parseMemoryFile(files[f]).items) live.set(x.id, f);
-  for (const t of topics) for (const x of parseMemoryFile(t.text).items) live.set(x.id, `topics/${t.slug}.md`);
   const retired = new Map();
-  for (const x of parseMemoryFile(files['superseded.md']).retired) {
-    if (!retired.get(x.id)?.trim()) retired.set(x.id, x.reason);
-  }
+  for (const f of ITEM_NAMES) for (const x of parseMemoryFile(files[f]).items) bump(live, x.id);
+  for (const t of topics) for (const x of parseMemoryFile(t.text).items) bump(live, x.id);
+  for (const x of parseMemoryFile(files['superseded.md']).retired) if (x.reason.trim()) bump(retired, x.id);
   return { live, retired };
 }
 
-// Every ID live before is live after, or retired with a non-empty reason.
+const byId = (a, b) => a[0].localeCompare(b[0]) || Number(a.slice(1)) - Number(b.slice(1));
+
+// Each live line before is live after or retired by this run with a reason: its live lines plus the
+// retired lines this run added match what it had. More means an extra copy; a new ID appears once.
+// A retired line from before the run never accounts for an item.
 export function accounting(before, after) {
-  const gone = [...before.live.keys()].filter((id) => !after.live.has(id));
-  const retired = gone.filter((id) => after.retired.get(id)?.trim());
-  const lost = gone.filter((id) => !retired.includes(id));
-  return { ok: lost.length === 0, lost, retired };
+  const lost = [];
+  const duplicated = [];
+  const retired = [];
+  for (const id of new Set([...before.live.keys(), ...after.live.keys()])) {
+    const was = before.live.get(id) ?? 0;
+    const live = after.live.get(id) ?? 0;
+    const added = Math.max(0, (after.retired.get(id) ?? 0) - (before.retired.get(id) ?? 0));
+    if (was === 0 ? live > 1 : live + added > was) duplicated.push(id);
+    else if (live + added < was) lost.push(id);
+    else if (live < was) retired.push(id);
+  }
+  [lost, duplicated, retired].forEach((list) => list.sort(byId));
+  return { ok: lost.length === 0 && duplicated.length === 0, lost, duplicated, retired };
 }
 
 // Items per file: live items in the item and topic files, retired ones in superseded.md.
@@ -151,7 +168,7 @@ function report(before, after, r, dry) {
   for (const n of names) console.log(`${n.padEnd(width)}  ${cell(b[n])}  ${cell(a[n])}`);
 
   const n = (kind) => r.applied.filter((t) => new RegExp(`^\\d+:${kind} `).test(t)).length;
-  console.log(`\ntopics: ${n('topic')}, moves: ${n('move')}, retires: ${n('retire')}, `
+  console.log(`\ntopics: ${n('topic')}, moves: ${n('move')}, keeps: ${n('keep')}, retires: ${n('retire')}, `
     + `demoted: ${r.demoted.length}, rejected: ${r.errors.length}`);
   if (r.errors.length) console.log(`rejected: ${r.errors.join('; ')}`);
   if (r.skipped.length) console.log(`skipped: ${r.skipped.join('; ')}`);
@@ -161,6 +178,13 @@ function report(before, after, r, dry) {
     return `${f} ${c} / ${cap}${c > cap ? ' (OVER)' : ''}`;
   });
   console.log(`key file chars: ${sizes.join(', ')}`);
+  let usage = {};
+  try {
+    usage = JSON.parse(after.usage || '{}') ?? {};
+  } catch {}
+  const homeless = Object.keys(CAPS).flatMap((f) => parseMemoryFile(after.files[f]).items.map((x) => x.id))
+    .filter((id) => typeof usage[id]?.home !== 'string');
+  console.log(`key items without a home: ${homeless.join(', ') || 'none'}`);
 
   const [was, now] = [idState(before), idState(after)];
   const acc = accounting(was, now);
@@ -168,26 +192,49 @@ function report(before, after, r, dry) {
     console.log(`accounting: ok, ${was.live.size} IDs live before; ${now.live.size} live after, `
       + `${acc.retired.length} retired with a reason`);
   } else {
-    console.log(`accounting: FAILED, neither live nor retired with a reason: ${acc.lost.join(', ')}`);
+    console.log(`accounting: FAILED; neither live nor retired by this run with a reason: ${acc.lost.join(', ') || 'none'}; `
+      + `more copies than before: ${acc.duplicated.join(', ') || 'none'}`);
   }
   return acc.ok;
 }
 
-async function main(argv) {
-  const dry = argv.includes('--dry-run');
-  const rest = argv.filter((a) => a !== '--dry-run');
-  if (rest.length !== 1) fail('usage: reorganize-slate.mjs <name> [--dry-run]');
-  const [name] = rest;
-  if (!validName(name)) fail(`invalid name ${JSON.stringify(name)}: use a-z0-9 and single hyphens, at most 64 characters`);
-  const slate = slateDir(slateHome(), name);
-  if (!(await fs.stat(slate).catch(() => null))?.isDirectory()) fail(`no slate at ${slate}`);
-  const real = realpathSync(slate);
-  const before = await readState(real);
+const USAGE_LINE = 'usage: reorganize-slate.mjs <name> [--dry-run] [--save <file>] [--ops <file>]';
+
+function parseArgs(argv) {
+  const out = { dry: false, save: null, ops: null, names: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--dry-run') out.dry = true;
+    else if (a === '--save' || a === '--ops') {
+      if (i + 1 >= argv.length) fail(USAGE_LINE);
+      out[a.slice(2)] = path.resolve(argv[++i]);
+    } else if (a.startsWith('--')) fail(USAGE_LINE);
+    else out.names.push(a);
+  }
+  if (out.names.length !== 1 || (out.ops && out.save)) fail(USAGE_LINE);
+  return out;
+}
+
+// The op list from a file --dry-run or --save wrote: `{ slate, at, model, ops }`.
+async function loadOps(file, real) {
+  let saved;
+  try {
+    saved = JSON.parse(await fs.readFile(file, 'utf8'));
+  } catch (e) {
+    fail(`can't read ${file} (${e.message})`);
+  }
+  if (!Array.isArray(saved?.ops)) fail(`no op list in ${file}`);
+  if (typeof saved.slate === 'string' && saved.slate !== real) {
+    fail(`the ops in ${file} were planned for ${saved.slate}, not ${real}`);
+  }
+  return saved;
+}
+
+// One model run; the op list, or the tool exits with nothing changed.
+async function plan(real, before) {
   const prompt = buildPrompt(await fs.readFile(RULES_FILE, 'utf8'), real, before);
   const bin = resolveClaudeBin();
-  console.log(`reorganize ${real}${dry ? ' (dry run: the plan is applied to a scratch copy; the slate is unchanged)' : ''}`);
   console.log(`model ${MODEL}, via ${bin}`);
-
   // Ctrl-C or SIGTERM kills the model run, which is in its own process group.
   const ac = new AbortController();
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => ac.abort());
@@ -203,14 +250,35 @@ async function main(argv) {
     cost = JSON.parse(run.stdout).total_cost_usd ?? null;
   } catch {}
   console.log(`model run: ${Math.round((Date.now() - started) / 1000)} s${cost === null ? '' : `, $${cost}`}`);
-  console.log(`\nops (${changes.ops.length}):`);
-  changes.ops.forEach((o, i) => console.log(describe(o, i)));
+  return changes.ops;
+}
 
-  const scratch = dry ? await scratchCopy(name, before) : null;
+async function main(argv) {
+  const args = parseArgs(argv);
+  const [name] = args.names;
+  if (!validName(name)) fail(`invalid name ${JSON.stringify(name)}: use a-z0-9 and single hyphens, at most 64 characters`);
+  const slate = slateDir(slateHome(), name);
+  if (!(await fs.stat(slate).catch(() => null))?.isDirectory()) fail(`no slate at ${slate}`);
+  const real = realpathSync(slate);
+  const saved = args.ops ? await loadOps(args.ops, real) : null;
+  const before = await readState(real);
+  console.log(`reorganize ${real}${args.dry ? ' (dry run: the plan is applied to a scratch copy; the slate is unchanged)' : ''}`);
+
+  const ops = saved ? saved.ops : await plan(real, before);
+  console.log(`\nops (${ops.length})${saved ? ` from ${args.ops}${saved.at ? `, planned ${saved.at}` : ''}` : ''}:`);
+  ops.forEach((o, i) => console.log(describe(o, i)));
+  const saveTo = !saved && (args.save ?? (args.dry
+    ? path.join(os.tmpdir(), `slate-reorganize-${name}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`) : null));
+  if (saveTo) {
+    await fs.writeFile(saveTo, `${JSON.stringify({ slate: real, at: new Date().toISOString(), model: MODEL, ops }, null, 2)}\n`);
+    console.log(`ops saved to ${saveTo}`);
+  }
+
+  const scratch = args.dry ? await scratchCopy(name, before) : null;
   try {
     const target = scratch ? scratch.slate : real;
-    const r = await applyChanges(target, changes.ops, APPLY);
-    if (!report(before, await readState(target), r, dry)) process.exitCode = 1;
+    const r = await applyChanges(target, ops, APPLY);
+    if (!report(before, await readState(target), r, args.dry)) process.exitCode = 1;
   } catch (e) {
     // applyChanges writes nothing before it has checked every op, and each file atomically.
     console.error(`reorganize: apply failed (${e.message})`);
