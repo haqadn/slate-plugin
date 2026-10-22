@@ -18,7 +18,6 @@ Slate memory is tied to one session, in the project's `.slate/<session_id>/`. Wo
 - A session linked to several slates at once.
 - Syncing slates across machines.
 - Migrating old `.slate/` folders in general. One folder is migrated (see Migration).
-- Splitting facts into topic files. Facts over the injection cap already go in as a path.
 
 ## Anti-goals
 
@@ -138,6 +137,41 @@ Same events as today. "Find the folder by process ID" now searches `.sessions/` 
 - Leave the old folder for the user to delete.
 - A script or by hand: the builder's call. It is not a user command.
 
+## Topic files and selective curation
+
+Added 2026-10-22. The migrated jetpack-seo slate has 251 facts (72 KB, about 7× the 10k injection cap) and 29 assumptions (6.8 KB). So facts are never injected, and many are status snapshots that go stale.
+
+**Layout**
+- `<slate>/topics/<slug>.md` holds F and A items in the usual line format and ID numbering. The first line is `# <Title>`, the second `> <one-line summary>`, then items. Slugs follow the slate-name rule.
+- `facts.md` and `assumptions.md` hold only key items: those most sessions need on most turns.
+- `<slate>/usage.json` holds, per live F and A ID, the last time it was marked relevant, a count, and its home topic. Only the apply script writes it, under `memory.lock`.
+- Instructions never go in topics. They are always injected.
+
+**Curator**
+- A higher bar. A fact is lasting project knowledge. A status ("PR X still in review") goes in its topic as a dated line and is replaced when it changes. It never goes in a key file.
+- New operations:
+  - `topic` (slug, title, summary): create a topic, or update its title or summary.
+  - `move` (ID, to: a slug or `key`): relocate an item without changing its ID or text.
+  - `add` gains an optional `topic`. An add without a topic goes to the key file and must name a home topic (`home`).
+- The change list gains `relevant`: the IDs of the facts and assumptions relevant to this turn's message and answer.
+- Promoting a topic item to key is the curator's call (`move` to `key`).
+
+**Apply script**
+- It records each `relevant` ID's time and count, and gives each new or added item its time on adding.
+- Caps: `facts.md` 3,000 chars and `assumptions.md` 1,500 chars, item lines only. When an apply would leave a key file over its cap, the script moves the least recently relevant key items to their home topics until it fits. Ties go to the lower count, then the lower ID. Items with no usage record count as oldest. Items added or promoted in the same list are not moved. A key item without a home topic goes to `general` (title "General").
+- Demotions are logged in `curator.log`, but they aren't warnings.
+
+**What sessions see**
+- Memory block: rules, instructions, `now.md`, key facts, key assumptions, then a topic index. The index has one line per topic: title, summary, item count and path. The script builds it from the topic files.
+- Change line: key-file changes as today. Topic adds are summarized as `+N in <slug>`. A move is not a change.
+- Rules and the offload brief: read the topic files the task needs, and name relevant topic paths in a brief.
+
+**Reorganizing an existing slate**
+- A one-off command runs the model once over a slate. It returns only `topic`, `move` and `retire` operations. A retire is allowed only when a later fact explicitly replaces the item, and it needs a reason.
+- The apply script enforces this, then the caps.
+- Every ID live before stays live in some file, or is in `superseded.md` with a reason.
+- It runs on jetpack-seo right after migration.
+
 ## Rules and agent text
 
 - `rules.md`: shared files under the slate path, `now.md` under the session path. The brief names the shared files plus this session's `now.md`. Reports go to `<slate>/reports/`. The budget may grow; keep it as small as the content allows.
@@ -179,4 +213,6 @@ The return cap, queue recording and drain order, hand-back handling, the injecti
 - `/slate:done` deletes the slate, and refuses while a peer is live.
 - Session folders idle for 30 days are swept.
 - jetpack-seo is migrated, and resuming that session loads its memory from `~/slate/jetpack-seo/`.
+- Facts and assumptions split into key files and topic files. Key files stay under their caps by demoting the least recently relevant items. The memory block shows the topic index.
+- jetpack-seo is reorganized into topics, with every pre-reorganization ID accounted for.
 - `npm test` passes, the live acceptance run passes, and the specs, README, `rules.md` and `offload.md` are updated.

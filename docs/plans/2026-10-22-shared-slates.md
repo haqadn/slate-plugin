@@ -271,3 +271,106 @@ Everything that finds or reads a session moves to `~/slate/`. After this task, a
 - [ ] **Step 5:** Commit: `Migration tool, README and docs for shared slates`.
 
 The real migration of jetpack-seo runs after the branch is reviewed, from the controller session, not in this task.
+
+---
+
+### Task 7: Topic files, relevance tracking and key-file caps
+
+Spec section: "Topic files and selective curation" (added 2026-10-22).
+
+**Files:**
+- Modify: `plugins/slate/scripts/lib/apply.mjs` (new ops, `relevant`, usage, caps), `plugins/slate/scripts/lib/slate.mjs` (`listTopics`), `plugins/slate/scripts/lib/inject.mjs` (topic index, `+N in <slug>`), `plugins/slate/scripts/curate.mjs` (prompt lists topics; Read rule for `topics/`), `plugins/slate/curator-rules.md`, `plugins/slate/rules.md`, `plugins/slate/agents/offload.md`, `README.md`, `test/fixtures/fake-claude.mjs`
+- Test: `test/apply.test.mjs`, `test/slate.test.mjs`, `test/inject.test.mjs`, `test/curate.test.mjs`, `test/packaging.test.mjs`
+
+**Interfaces:**
+- Topic file `<slate>/topics/<slug>.md`: line 1 `# <Title>`, line 2 `> <summary>`, then item lines. A slug matches the slate-name rule.
+- `listTopics(slate) → Promise<Array<{ slug, title, summary, count, path }>>`, sorted by slug. `count` is live items.
+- `CHANGE_SCHEMA` becomes `{ ops: Op[], relevant: string[] }`. New and changed ops (`oneOf`, `additionalProperties: false`):
+  - `{ op: 'add', type, text, topic }`: into a topic
+  - `{ op: 'add', type, text, home }`: into the key file, with a home topic
+  - `{ op: 'topic', slug, title, summary }`
+  - `{ op: 'move', id, to }`: `to` is a slug or `'key'`
+- `applyChanges(dir, ops, { turn, sessionId, lenient = false, relevant = [], now = new Date() }) → { applied, skipped, errors, demoted }`. `demoted` holds tokens like `F12>canonical`.
+- `usage.json`: `{ "<ID>": { "last": "<ISO>", "count": <n>, "home": "<slug>" } }`. It is written only by `applyChanges`, under `memory.lock`, with `atomicWrite`. An entry for an ID that is no longer live is dropped.
+- Exported constants `FACTS_CAP = 3000` and `ASSUMPTIONS_CAP = 1500`: the total chars of item lines in `facts.md` and `assumptions.md`.
+
+**Behavior:**
+- **Live IDs:** lookup for retire, replace and move covers the key files and every topic file. The next ID covers those plus `superseded.md`. Plain bullets in topic files are adopted, as in key files.
+- **Validation errors** (add to the existing list):
+  - a bad slug
+  - `topic` missing its title or summary, or a multi-line summary
+  - `add` to a topic that doesn't exist and isn't created by a `topic` op in the same list
+  - a key `add` without `home`
+  - `home` or `move.to` naming a missing topic (except `general`, which is created on demand with title "General" and summary "Items without a more specific topic.")
+  - `move` of an I item
+- **Order:** `topic` ops first, then the rest in order. Then record `relevant` (unknown or non-live IDs are ignored) and stamp added or promoted items with `now`. Then enforce the caps.
+- **Caps:** while a key file is over its cap, move its least recently relevant item to its home topic (or `general`). Ties go to the lower count, then the lower ID. No usage entry counts as oldest. Items added or promoted in this list are never moved. Demotion never fails the apply.
+- **Curator:**
+  - Its prompt lists the key-file paths and the topic index (slug, title, summary, count, path), and it may Read `topics/` (allow rule `Read(/<real slate>/topics/**)`).
+  - `curator.log` `ok` lines append `demoted <tokens>` when any happened. Demotions are not warnings.
+  - `curator-rules.md` gains the higher bar from the spec:
+    - lasting knowledge only
+    - status as a dated line in its topic, replaced when it changes, never in a key file
+    - key means needed by most sessions on most turns
+    - every key add names a home topic
+    - always return `relevant`
+    - use `move` to promote or reorganize, never retire-and-re-add
+- **Memory block:** after assumptions, a `# Topics` section with one line per topic: `- <title> — <summary> (<count>) <path>`. If over budget, this section shrinks before facts and assumptions do.
+- **Change line:** adds into topics are summarized as `+N in <slug>`, at most 3 slugs, then `+M more`. Moves produce no entry. A promoted item shows as `+<ID> …` once, as a key item.
+- **Rules and agents:** `rules.md` says details live in topic files, to read the ones the task needs, and to name relevant topic paths in an offload brief. Keep it ≤ 1,700 chars with a 120-char session path. `offload.md` says to read the topic files named in the brief.
+- **README:** add topics, `usage.json` and the caps to the layout and notes.
+
+- [ ] **Step 1: Failing tests**
+  - Topic file round-trip through `listTopics`.
+  - `topic` creates and updates. `add` with `topic` lands in the topic file. A key `add` records `home` in `usage.json`.
+  - `move` key→topic and topic→key keep the line byte-identical.
+  - `retire` and `replace` of a topic item work. The next ID counts topic files.
+  - Every new validation error. A plain bullet in a topic file is adopted.
+  - `relevant` updates `last` and `count`; unknown IDs are ignored.
+  - Caps: adding past 3,000 chars demotes the least recently relevant key fact to its home. On a tie the lower count goes. Same-list adds are never demoted. A key item with no home goes to `general`, which is created. `assumptions.md` obeys 1,500.
+  - Concurrency: the existing 6 × 30 test, still all landed. Add a variant where every add carries `relevant` and some go to topics.
+  - `memoryBlock` shows the `# Topics` index. `changeLine` shows `+2 in canonical`, and nothing for a move.
+  - The curator (fake `claude`) passes `relevant` through and logs `demoted`. The args include the `topics/` Read rule.
+  - `rules.md` budget and packaging wording.
+- [ ] **Step 2:** Run `npm test`; the new tests fail.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Run `npm test`; all pass.
+- [ ] **Step 5:** Commit: `Topic files, relevance tracking and key-file caps`.
+
+---
+
+### Task 8: Reorganize command and live rerun
+
+**Files:**
+- Create: `tools/reorganize-slate.mjs`, `test/reorganize.test.mjs`, a reorganize prompt (e.g. `plugins/slate/reorganize-rules.md`)
+- Modify: `test/live/acceptance.mjs` (new checks), `docs/acceptance.md`, `README.md` (one line on the tool)
+
+**Interfaces:**
+- `node tools/reorganize-slate.mjs <name> [--dry-run]`, honoring `SLATE_HOME`.
+  - Runs the curator binary once (same resolution and env as `curate.mjs`), with Read on the slate's memory and topic files and a schema that allows only `topic`, `move` and `retire`.
+  - Applies through `applyChanges` in a mode that rejects any other op, with lenient handling, then the caps.
+  - `--dry-run` prints the op list and the planned per-file counts, and changes nothing.
+- **Accounting check**, run after the apply: every ID live before is live after (in any file), or is in `superseded.md` with a non-empty reason. The tool prints per-file item counts before and after, the number of topics, moves and retires. It exits non-zero if accounting fails, which should be impossible by construction.
+- **Prompt rules:**
+  - Group items into topics a reader would look for.
+  - Keep in key files only what most sessions need on most turns, within the caps.
+  - Retire only an item a later item explicitly replaces (status superseded by a newer status or outcome), with a reason naming the replacing ID.
+  - Never reword.
+
+- [ ] **Step 1: Failing tests** (fake `claude`):
+  - A fixture slate with 30 facts and 5 assumptions: after the run, items are moved into topics, key files are under their caps, and accounting passes.
+  - `--dry-run` changes no file.
+  - An `add` or `replace` in the model output is rejected, and the valid ops still apply.
+  - A retire without a reason is rejected.
+- [ ] **Step 2:** Run `npm test`; the new tests fail.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Run `npm test`; all pass.
+- [ ] **Step 5:** Live rerun. Add checks to `test/live/acceptance.mjs`:
+  - every curator change list carried `relevant`
+  - `usage.json` exists and holds the IDs added
+  - the memory block of a session started after the run shows `# Topics` whenever a topic exists
+
+  Run once live (default flags, `SLATE_HOME` temp, worktree plugin only). All checks pass. Record in `docs/acceptance.md`.
+- [ ] **Step 6:** Commit: `Reorganize command; live rerun with topics`.
+
+The real reorganization of jetpack-seo runs from the controller after the final review: migrate, dry-run, run, verify accounting.
