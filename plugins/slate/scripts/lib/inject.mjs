@@ -15,27 +15,14 @@ const MAX_WARNINGS = 5;
 const WARNING_CHARS = 200; // before the "(see …curator.log)" tail
 // Change-line order: as in the memory block (instructions, facts, assumptions).
 const TYPE_ORDER = ['I', 'F', 'A'];
-const LOG_LINE = /^\S+ (t\d+) (restored|error)(?::(.*))?$/;
-// Violation kinds from check.mjs messages. A warning echoes only these fixed labels, plus the ID
-// of an `${id} <kind>` message, and only from text outside quotes.
-const ID_KINDS = [
-  ['reworded', 'reworded'],
-  ['deleted', 'deleted'],
-  ['retired at t\\d+', 'wrong retire turn'],
-  ['retired without reason', 'no retire reason'],
-  ['retired line outside superseded\\.md', 'retired line misplaced'],
-  ['live item in superseded\\.md', 'live item in superseded.md'],
-  ['duplicated', 'duplicated'],
-  ['not above previous max', 'ID not above max'],
-  ['tagged t\\d+', 'wrong turn tag'],
-].map(([p, label]) => [new RegExp(`(?<![\\w-])([IAF]\\d+) ${p}(?!\\w)`, 'g'), (m) => `${m[1]} ${label}`]);
-const FIXED_KINDS = [
-  [/superseded\.md lost line/g, () => 'superseded line lost'],
-  [/plain line lost/g, () => 'plain line lost'],
-  [/heading lost/g, () => 'heading lost'],
-  [/malformed item line/g, () => 'malformed line'],
-  [/\b(instructions|assumptions|facts|now|superseded)\.md missing\b/g, (m) => `${m[1]}.md missing`],
-  [/\bnow\.md has \d+ lines/g, () => 'now.md too long'],
+const LOG_LINE = /^\S+ (t\d+) (partial|error)(?::(.*))?$/;
+// Error kinds of apply.mjs tokens (`<op index>:<kind>[ <ID>]`). A warning echoes only these fixed
+// labels, plus a stale token's ID, and only from text outside quotes.
+const ERROR_KINDS = ['bad op', 'bad id', 'empty text', 'multi-line text', 'tag in text', 'no source',
+  'report source', 'empty reason', 'multi-line reason', 'now too long', 'tag in now'];
+const KINDS = [
+  [/(?<![\w-])\d+:stale ([IAF]\d+)(?!\w)/g, (m) => `stale ${m[1]}`],
+  ...ERROR_KINDS.map((k) => [new RegExp(`(?<![\\w-])\\d+:${k}(?![\\w-])`, 'g'), () => k]),
 ];
 const QUOTES = new Map([['"', '"'], ["'", "'"], ['`', '`'], ['\u201c', '\u201d'], ['\u201d', '\u201d'],
   ['\u2018', '\u2019'], ['\u2019', '\u2019']]);
@@ -183,19 +170,19 @@ function outsideQuotes(s) {
   return out;
 }
 
-// One warning line from known-safe tokens only: turn, status, violation kinds (with their IDs).
+// One warning line from known-safe tokens only: turn, status, error kinds (with their IDs).
 // Free text from the log is never echoed; it can quote superseded.md in any form.
 function warningLine(turn, status, detail, log) {
   const text = outsideQuotes(detail);
   const found = [];
-  for (const [re, label] of [...ID_KINDS, ...FIXED_KINDS]) {
+  for (const [re, label] of KINDS) {
     for (const m of text.matchAll(re)) found.push([m.index, label(m)]);
   }
   const what = [...new Set(found.sort((a, b) => a[0] - b[0]).map(([, l]) => l))].join(', ');
   return `slate warning: ${clip(`${turn} ${status}${what ? `: ${what}` : ''}`, WARNING_CHARS)} (see ${log})`;
 }
 
-// curator.log lines `<ISO> t<N> <status>: <detail>` not yet shown, restored/error only.
+// curator.log lines `<ISO> t<N> <status>: <detail>` not yet shown, partial/error only.
 // Only complete lines are consumed; session.logSeen holds the byte offset already read.
 async function newWarnings(dir, session) {
   const log = path.join(dir, 'curator.log');
@@ -223,7 +210,7 @@ export async function changeLine(dir, { waiting = false } = {}) {
   const session = await readSession(dir);
   const entries = [];
 
-  // While the curator runs, memory files hold unchecked edits that may be restored: diff later.
+  // While the curator runs, memory is about to change: diff later.
   if (!waiting) {
     const items = liveItems(await readMemory(dir));
     const live = seenOf(items);

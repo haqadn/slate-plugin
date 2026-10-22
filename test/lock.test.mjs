@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { acquire, waitFree } from '../plugins/slate/scripts/lib/lock.mjs';
+import { acquire, waitFree, lockHolder } from '../plugins/slate/scripts/lib/lock.mjs';
 
 const temps = [];
 async function tmp() {
@@ -49,4 +49,21 @@ test('waitFree: false on timeout while held, true once released, true when dead'
   assert.equal(await waitFree(dir, 2000), true);
   await fs.writeFile(lockFile(dir), '999999\n');
   assert.equal(await waitFree(dir, 100), true);
+});
+
+test('a named lock is a separate file; waitFree and lockHolder take the same name', async () => {
+  const dir = await tmp();
+  const memory = await acquire(dir, 'memory.lock');
+  assert.equal(typeof memory, 'function');
+  assert.equal((await fs.readFile(path.join(dir, 'memory.lock'), 'utf8')).trim(), String(process.pid));
+  assert.equal(await lockHolder(dir, 'memory.lock'), process.pid);
+  assert.equal(await lockHolder(dir), null, 'curator.lock is untouched');
+  assert.equal(await waitFree(dir, 0), true);
+  assert.equal(await waitFree(dir, 0, 'memory.lock'), false);
+  assert.equal(await acquire(dir, 'memory.lock'), null);
+  const curator = await acquire(dir);
+  assert.equal(typeof curator, 'function', 'the default curator.lock is still free');
+  await memory();
+  assert.equal(await waitFree(dir, 0, 'memory.lock'), true);
+  await curator();
 });

@@ -674,7 +674,7 @@ test('Important 1: a session start in another process never touches folders of o
   assert.equal((await readSession(a)).pid, PID);
 });
 
-// A real detached curator (fake-claude `hang`) that has edited memory and is still running.
+// A real detached curator whose claude (fake-claude `hang`) is still running.
 async function curatorMidEdit(id) {
   const s = await activeSession(id);
   s.env.FAKE_MODE = 'hang';
@@ -683,12 +683,12 @@ async function curatorMidEdit(id) {
   s.before = await readMemory(s.dir);
   await handle('UserPromptSubmit', prompt(id, s.root, 'use pnpm'), s.env);
   await handle('Stop', stop(id, s.root, 'ok, pnpm'), s.env);
-  await until(async () => (await readMemory(s.dir))['instructions.md'].includes('fake item'));
+  await until(async () => (await fakeCalls(s.env.FAKE_RECORD).catch(() => [])).length === 1);
   return s;
 }
 
 async function assertAborted(dir, before, record) {
-  assert.deepEqual(await readMemory(dir), before, 'no unchecked edit');
+  assert.deepEqual(await readMemory(dir), before, 'nothing applied');
   assert.deepEqual(await logTurns(dir), ['t1 aborted']);
   assert.match((await logLines(dir))[0], / t1 aborted: requeued$/);
   assert.equal(await exists(lockOf(dir)), false);
@@ -709,7 +709,7 @@ test('Important 2: /clear mid-curation aborts, moves, notes the missing turn and
   const dir = sessionDir(root, 'new');
   assert.equal(await exists(old), false);
   assert.ok(ctx(r).startsWith(`# slate memory\n${lagNote(dir, 1)}\n`), ctx(r).slice(0, 400));
-  assert.ok(!ctx(r).includes('fake item'), 'the block was built from the restored memory');
+  assert.ok(!ctx(r).includes('fake item'), 'the block was built before any change was applied');
   assert.deepEqual(r.spawned, [CURATE, dir, '1', 'sonnet']);
 
   await waitLog(dir, 2);
@@ -767,7 +767,7 @@ test('M2: SessionStart while a curator still holds the lock says memory is still
   }
 });
 
-test('SessionStart fork with a curator mid-edit: aborts it; the parent is restored, the copy notes and drains the turn', async () => {
+test('SessionStart fork with a curator mid-run: aborts it; the parent is unchanged, the copy notes and drains the turn', async () => {
   const { root, env, dir: parent, before } = await curatorMidEdit('parent');
   env.FAKE_MODE = 'good';
   const r = await handle('SessionStart', start('child', root, 'fork'), env);

@@ -16,7 +16,7 @@ import { memoryBlock, changeLine } from './lib/inject.mjs';
 const CURATE = fileURLToPath(new URL('./curate.mjs', import.meta.url));
 const START_WAIT_MS = 20000; // SessionStart, and clear before aborting a curator
 const FORK_WAIT_MS = 5000; // fork before aborting a curator
-const ABORT_WAIT_MS = 5000; // for an aborted curator to undo its edit and release
+const ABORT_WAIT_MS = 5000; // for an aborted curator to log and release
 const PROMPT_WAIT_MS = 20000;
 const COMPACT_WAIT_MS = 60000;
 const MAX_WAIT_MS = 25000;
@@ -52,8 +52,8 @@ function isCurator(pid) {
 }
 
 // Before a folder is moved or copied, its curator must be gone: once the folder moves, the
-// curator's restore and log would target the old path and an unchecked edit would be kept.
-// Wait; then SIGTERM the holder if it is a curator (it undoes its edit and releases); wait again.
+// curator's apply and log would target the old path.
+// Wait; then SIGTERM the holder if it is a curator (it applies nothing and releases); wait again.
 async function settle(dir, waitMs) {
   if (await waitFree(dir, waitMs)) return;
   const pid = await lockHolder(dir);
@@ -112,8 +112,8 @@ async function sessionStart(input, home, dir, env) {
   const free = await waitFree(dir, curatorWaitMs(env, START_WAIT_MS));
   const output = context('SessionStart', await memoryBlock(dir, { afterCompact: source === 'compact', waiting: !free }));
   // Turns left uncurated, e.g. by a curator aborted above before the move or copy: drain them now
-  // rather than at the next Stop. Only after the block, so it never reads a curator's unchecked
-  // edit; and only when the lock is free, since a holder rechecks the queue after its release.
+  // rather than at the next Stop. Only after the block, so the block is read before that curator
+  // changes memory; and only when the lock is free, since a holder rechecks the queue after its release.
   const pending = free ? await pendingTurns(dir) : null;
   return pending ? { output, spawned: spawnCurator(dir, pending.to, env) } : { output };
 }
@@ -126,7 +126,7 @@ async function userPromptSubmit(input, dir, env) {
   }
   if (isHarness(prompt)) {
     // E.g. a background agent finished; the answer that follows continues the current turn. Don't
-    // wait, but don't diff memory a running curator may still restore either.
+    // wait, but don't diff memory a running curator is about to change either.
     await setKind(dir, 'notification');
     const waiting = !(await waitFree(dir, 0));
     return { output: context('UserPromptSubmit', await changeLine(dir, { waiting })) };

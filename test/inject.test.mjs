@@ -82,14 +82,17 @@ test('core: no superseded text reaches either builder', async () => {
     '# Superseded\n- [I3 t1 retired t2] ZZ-RETIRED-ZZ use npm (reason: user switched to pnpm)\n' +
     'ZZ-RETIRED-ZZ stray plain line\n');
 
-  // a curator.log warning quoting a superseded.md line
+  // curator.log warnings: one quoting a superseded.md line in its error text
   await write(dir, 'curator.log',
-    '2026-10-07T10:00:00.000Z t2 restored: superseded.md lost line: "- [I3 t1 retired t2] ZZ-RETIRED-ZZ use npm (reason: x)"; I9 deleted\n');
+    '2026-10-07T10:00:00.000Z t2 error: exit 1: "- [I3 t1 retired t2] ZZ-RETIRED-ZZ use npm (reason: x)"\n' +
+    '2026-10-07T10:00:01.000Z t3 partial: 0:stale I9; 1:no source; applied 2:add I4\n');
 
   const line = await changeLine(dir, { waiting: false });
   assert.ok(!line.includes('ZZ-RETIRED-ZZ'), line);
   assert.ok(line.includes('retired I3'), line);
-  assert.ok(line.includes(`slate warning: t2 restored: superseded line lost, I9 deleted (see ${path.join(dir, 'curator.log')})`), line);
+  const log = path.join(dir, 'curator.log');
+  assert.ok(line.includes(`slate warning: t2 error (see ${log})`), line);
+  assert.ok(line.includes(`slate warning: t3 partial: stale I9, no source (see ${log})`), line);
 
   for (const afterCompact of [false, true]) {
     const block = await memoryBlock(dir, { afterCompact });
@@ -166,31 +169,30 @@ test('core: an item whose text carries a retired tag is shown by ID only', async
   assert.ok(!(await memoryBlock(dir, { afterCompact: false })).includes('ZZ-RETIRED-ZZ'));
 });
 
-test('core: warnings echo only status, IDs and violation kinds, never log text', async () => {
+test('core: warnings echo only status, IDs and error kinds, never log text', async () => {
   const dir = await session();
   const log = path.join(dir, 'curator.log');
   await write(dir, 'curator.log', [
-    't1 restored: superseded.md lost line: "- [I3 t1 retired t2] ZZ-RETIRED-ZZ unbalanced',
-    't2 restored: I4 reworded from ZZ-RETIRED-ZZ use npm to use pnpm',
-    "t3 restored: plain line lost: 'ZZ-RETIRED-ZZ single'",
-    't4 restored: heading lost: \u201cZZ-RETIRED-ZZ curly\u201d; F2 duplicated',
+    't1 partial: 0:stale I3; 1:bad id; 2:empty text; applied 3:add I4',
+    't2 partial: 0:multi-line text; 1:tag in text; 2:no source; 3:report source',
+    't3 partial: 0:empty reason; 1:multi-line reason; 2:now too long; 3:tag in now; 4:bad op',
+    't4 error: exit 1: "- [I3 t1 retired t2] ZZ-RETIRED-ZZ unbalanced',
     't5 error: ZZ-RETIRED-ZZ claude exited 1',
   ].map((l) => `2026-10-07T10:00:00.000Z ${l}\n`).join(''));
   const out = await changeLine(dir, { waiting: false });
   assert.ok(!out.includes('ZZ-RETIRED-ZZ'), out);
   for (const w of [
-    't1 restored: superseded line lost',
-    't2 restored: I4 reworded',
-    't3 restored: plain line lost',
-    't4 restored: heading lost, F2 duplicated',
+    't1 partial: stale I3, bad id, empty text',
+    't2 partial: multi-line text, tag in text, no source, report source',
+    't3 partial: empty reason, multi-line reason, now too long, tag in now, bad op',
+    't4 error',
     't5 error',
   ]) assert.ok(out.split('\n').includes(`slate warning: ${w} (see ${log})`), `${w}\n${out}`);
 
   // IDs and kinds inside quotes are never picked up
-  await append(dir, 'curator.log', '2026-10-07T10:00:00.000Z t6 restored: plain line lost: "print on A4 paper, F1 style"; ' +
-    'heading lost: "deleted and I7 reworded"; I2 duplicated\n');
+  await append(dir, 'curator.log', '2026-10-07T10:00:00.000Z t6 error: exit 1: "0:stale I7 and 1:no source"; 2:stale I2\n');
   assert.equal(await changeLine(dir, { waiting: false }),
-    `${REMINDER}\nslate warning: t6 restored: plain line lost, heading lost, I2 duplicated (see ${log})`);
+    `${REMINDER}\nslate warning: t6 error: stale I2 (see ${log})`);
 });
 
 // --- memoryBlock ---
@@ -357,17 +359,22 @@ test('changeLine: waiting says memory is still updating and defers the diff', as
   assert.equal(await changeLine(dir, { waiting: false }), `${REMINDER}\nslate: +I1 Use pnpm`);
 });
 
-test('changeLine: curator.log restored/error lines show once, other statuses never', async () => {
+test('changeLine: curator.log partial/error lines show once, other statuses never', async () => {
   const dir = await session();
   await write(dir, 'curator.log',
-    '2026-10-07T10:00:00.000Z t1 ok: kept\n' +
-    '2026-10-07T10:01:00.000Z t2 restored: I3 deleted\n' +
+    '2026-10-07T10:00:00.000Z t1 ok: attempt 1: applied 0:add I1\n' +
+    '2026-10-07T10:01:00.000Z t2 retry: 0:stale I3\n' +
+    '2026-10-07T10:01:01.000Z t2 partial: 0:stale I3; applied nothing\n' +
+    '2026-10-07T10:01:30.000Z t2 restored: I5 deleted\n' +
+    '2026-10-07T10:01:40.000Z t2 aborted: requeued\n' +
     '2026-10-07T10:02:00.000Z t3 error: claude exited 1\n');
   const first = await changeLine(dir, { waiting: false });
   const log = path.join(dir, 'curator.log');
-  assert.ok(first.includes(`slate warning: t2 restored: I3 deleted (see ${log})`), first);
-  assert.ok(first.includes(`slate warning: t3 error (see ${log})`), first);
-  assert.ok(!first.includes('kept') && !first.includes('exited'), first);
+  assert.equal(first, [
+    REMINDER,
+    `slate warning: t2 partial: stale I3 (see ${log})`,
+    `slate warning: t3 error (see ${log})`,
+  ].join('\n'));
   assert.ok(!first.includes('2026-10-07T'), 'timestamps dropped');
   assert.equal(await changeLine(dir, { waiting: false }), REMINDER);
 
@@ -376,12 +383,12 @@ test('changeLine: curator.log restored/error lines show once, other statuses nev
   assert.equal(await changeLine(dir, { waiting: false }), REMINDER);
 
   // a partial line waits until it is complete
-  await append(dir, 'curator.log', '2026-10-07T10:03:00.000Z t4 rest');
+  await append(dir, 'curator.log', '2026-10-07T10:03:00.000Z t4 part');
   assert.equal(await changeLine(dir, { waiting: true }), `${REMINDER}\nslate: memory still updating`);
-  await append(dir, 'curator.log', 'ored: F1 reworded\n');
+  await append(dir, 'curator.log', 'ial: 0:stale F1\n');
   const later = await changeLine(dir, { waiting: false });
-  assert.ok(later.includes(`slate warning: t4 restored: F1 reworded (see ${log})`), later);
-  assert.ok(!later.includes('t2 restored'), later);
+  assert.ok(later.includes(`slate warning: t4 partial: stale F1 (see ${log})`), later);
+  assert.ok(!later.includes('t2 partial'), later);
   assert.equal(await changeLine(dir, { waiting: false }), REMINDER);
 });
 

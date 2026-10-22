@@ -2,10 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 const STALE_UNPARSED_MS = 5000;
-
-function lockPath(dir) {
-  return path.join(dir, 'curator.lock');
-}
+// A session's curator.lock serialises its curators; a slate's memory.lock, its memory writes.
+const CURATOR_LOCK = 'curator.lock';
 
 function alive(pid) {
   try {
@@ -32,8 +30,8 @@ async function state(file) {
   return Date.now() - st.mtimeMs > STALE_UNPARSED_MS ? 'free' : 'held';
 }
 
-export async function acquire(dir) {
-  const file = lockPath(dir);
+export async function acquire(dir, name = CURATOR_LOCK) {
+  const file = path.join(dir, name);
   const mine = `${process.pid}\n`;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -60,17 +58,17 @@ export async function acquire(dir) {
 }
 
 // The pid written in the lock file, or null when there is no lock or no readable pid.
-export async function lockHolder(dir) {
+export async function lockHolder(dir, name = CURATOR_LOCK) {
   try {
-    const pid = Number.parseInt((await fs.readFile(lockPath(dir), 'utf8')).trim(), 10);
+    const pid = Number.parseInt((await fs.readFile(path.join(dir, name), 'utf8')).trim(), 10);
     return Number.isInteger(pid) && pid > 0 ? pid : null;
   } catch {
     return null;
   }
 }
 
-export async function waitFree(dir, ms) {
-  const file = lockPath(dir);
+export async function waitFree(dir, ms, name = CURATOR_LOCK) {
+  const file = path.join(dir, name);
   const deadline = Date.now() + ms;
   for (;;) {
     if ((await state(file)) === 'free') return true;
