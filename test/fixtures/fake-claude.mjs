@@ -8,6 +8,7 @@
 //   invalid-then-good
 //   stale            first call: another session retires I1 (adding I4 "use bun") just after the
 //                    read, and the list replaces I1; later calls replace the live "use bun" item
+//   ops              the op list in the JSON file $FAKE_OPS, as is (the reorganize tool's tests)
 //   fail | garbage | no-structured   exit 1 | print non-JSON | a result without structured_output
 //   sleep | hang     wait $FAKE_SLEEP_MS (default 3000 | 20000), then good
 //   orphan           leave a process holding stderr open, then good
@@ -68,6 +69,9 @@ switch (mode) {
     break;
   case 'relevant':
     reply([{ op: 'add', type: 'F', text: `fake fact ${turn} (user)`, home: 'general' }], ['F1', 'F99']);
+    break;
+  case 'ops':
+    reply(JSON.parse(fs.readFileSync(process.env.FAKE_OPS, 'utf8')));
     break;
   case 'invalid':
     reply(INVALID);

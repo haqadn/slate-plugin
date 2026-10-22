@@ -6,7 +6,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { applyChanges, CHANGE_SCHEMA, FACTS_CAP, ASSUMPTIONS_CAP } from '../plugins/slate/scripts/lib/apply.mjs';
+import {
+  applyChanges, CHANGE_SCHEMA, REORGANIZE_SCHEMA, FACTS_CAP, ASSUMPTIONS_CAP, ERROR_KINDS,
+} from '../plugins/slate/scripts/lib/apply.mjs';
 import { createSession, slateOf } from '../plugins/slate/scripts/lib/slate.mjs';
 import { readMemory, writeMemory } from '../plugins/slate/scripts/lib/session.mjs';
 import { acquire } from '../plugins/slate/scripts/lib/lock.mjs';
@@ -696,4 +698,79 @@ test('Review Focus 2: six processes adding to key files and topics with relevant
     const left = (await fs.readdir(d)).filter((n) => n.includes('.lock') || n.endsWith('.tmp'));
     assert.deepEqual(left, [], `no lock, claim or temp file left in ${d}`);
   }
+});
+
+// --- reorganize mode ---
+
+const REORG = { turn: 0, sessionId: 'reorg', reorganize: true };
+
+test('reorganize: dir is the slate folder; only topic, move and retire apply, any other op is "op not allowed"', async () => {
+  const { dir, before } = await slate();
+  const ops = [
+    { op: 'add', type: 'I', text: 'never force-push' },
+    { op: 'replace', id: 'F2', text: 'Node 26 (package.json)', reason: 'upgraded' },
+    { op: 'now', text: 'Goal: something else' },
+    { op: 'topic', slug: 'build', title: 'Build', summary: 'How it builds.' },
+    { op: 'move', id: 'F2', to: 'build' },
+    { op: 'frobnicate' },
+  ];
+  const errors = ['0:op not allowed', '1:op not allowed', '2:op not allowed', '5:op not allowed'];
+  const strict = await applyChanges(slateOf(dir), ops, REORG);
+  assert.deepEqual(strict, { applied: [], skipped: [], errors, demoted: [] });
+  assert.deepEqual(await readMemory(dir), before);
+  assert.equal(await exists(path.join(slateOf(dir), 'topics')), false);
+
+  const r = await applyChanges(slateOf(dir), ops, { ...REORG, lenient: true });
+  assert.deepEqual(r, { applied: ['3:topic build', '4:move F2>build'], skipped: [], errors, demoted: [] });
+  for (const t of r.errors) assert.match(t, SAFE_TOKEN, t);
+  const now = await readMemory(dir);
+  assert.equal(now['facts.md'], '# Facts\n');
+  assert.equal(now['instructions.md'], before['instructions.md']);
+  assert.equal(now['now.md'], before['now.md'], "a session's now.md is never read or written");
+  assert.equal(await readTopic(dir, 'build'), '# Build\n> How it builds.\n- [F2 t1] Node 24 (package.json)\n');
+  assert.equal(await exists(path.join(slateOf(dir), 'now.md')), false);
+  assert.ok(ERROR_KINDS.includes('op not allowed') && ERROR_KINDS.includes('no replacement'));
+});
+
+test('reorganize: a retire must name the item that replaces it, live when the apply began and later if of the same type', async () => {
+  const facts = '# Facts\n- [F2 t1] Node 24 (package.json)\n- [F3 t2] PR #1 in review (user)\n- [F4 t3] PR #1 approved (user)\n'
+    + '- [F5 t4] PR #1 merged (user)\n';
+  const { dir, before } = await slate({ ...BASE, 'facts.md': facts });
+  const r = await applyChanges(slateOf(dir), [
+    { op: 'retire', id: 'F3', reason: 'superseded by F2' }, // older
+    { op: 'retire', id: 'F2', reason: 'no longer true' }, // names nothing
+    { op: 'retire', id: 'F2', reason: 'replaced by F2' }, // itself
+    { op: 'retire', id: 'F2', reason: 'see F9' }, // not live
+    { op: 'retire', id: 'F2', reason: 'see A9' }, // retired before the apply
+    { op: 'retire', id: 'A1', reason: 'confirmed by F2' }, // another type: any live item
+    { op: 'retire', id: 'F4', reason: 'superseded by F5 (merged)' },
+    { op: 'retire', id: 'F3', reason: 'superseded by F4' }, // F4 retired just now, but live when the apply began
+    { op: 'retire', id: 'F2', reason: '' },
+  ], { ...REORG, lenient: true });
+  assert.deepEqual(r.errors, ['0:no replacement F3', '1:no replacement F2', '2:no replacement F2', '3:no replacement F2',
+    '4:no replacement F2', '8:empty reason']);
+  assert.deepEqual(r.applied, ['5:retire A1', '6:retire F4', '7:retire F3']);
+  for (const t of r.errors) assert.match(t, SAFE_TOKEN, t);
+  const now = await readMemory(dir);
+  assert.equal(now['facts.md'], '# Facts\n- [F2 t1] Node 24 (package.json)\n- [F5 t4] PR #1 merged (user)\n');
+  assert.equal(now['superseded.md'], `${before['superseded.md']}`
+    + '- [A1 t2 retired t0@reorg] CI runs on push (reason: confirmed by F2)\n'
+    + '- [F4 t3 retired t0@reorg] PR #1 approved (user) (reason: superseded by F5 (merged))\n'
+    + '- [F3 t2 retired t0@reorg] PR #1 in review (user) (reason: superseded by F4)\n');
+});
+
+test('reorganize: outside it, a retire\'s reason is free and every op is allowed', async () => {
+  const { dir } = await slate();
+  const r = await applyChanges(dir, [{ op: 'retire', id: 'F2', reason: 'no longer true' }, { op: 'now', text: 'Goal: x' }], OPTS);
+  assert.deepEqual(r.applied, ['0:retire F2', '1:now']);
+});
+
+test('REORGANIZE_SCHEMA: ops of topic, move and retire only; no relevant', () => {
+  assert.deepEqual(REORGANIZE_SCHEMA.required, ['ops']);
+  assert.deepEqual(Object.keys(REORGANIZE_SCHEMA.properties), ['ops']);
+  assert.equal(REORGANIZE_SCHEMA.additionalProperties, false);
+  const shapes = REORGANIZE_SCHEMA.properties.ops.items.oneOf;
+  assert.deepEqual(shapes.map((s) => s.properties.op.const), ['topic', 'move', 'retire']);
+  const same = (op) => CHANGE_SCHEMA.properties.ops.items.oneOf.find((s) => s.properties.op.const === op);
+  for (const s of shapes) assert.deepEqual(s, same(s.properties.op.const));
 });

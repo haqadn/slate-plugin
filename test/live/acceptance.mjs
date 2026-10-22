@@ -13,7 +13,10 @@
 // then three short turns in one long-lived stream-json session, each started on one of A's events
 // so B's curators overlap A's.
 // A throwaway probe plugin is loaded alongside slate to record what SubagentStop and PreToolUse
-// hooks receive.
+// hooks receive. The curator runs the real binary through a recorder (SLATE_CLAUDE_BIN) that keeps
+// each change list, so the run can check that every one carried `relevant`. Once everything has
+// settled, A is resumed for one more short turn, a session started after the run, to check that its
+// memory block lists the topics.
 // Env: SLATE_LIVE_CLAUDE (main-session binary; default CLAUDE_CODE_EXECPATH, else `claude`),
 //      SLATE_LIVE_MODEL (main-session model; default sonnet). The curator uses its own default.
 // It leaves the temp folders and ~/.claude/projects/<slug>/ folders in place and prints them;
@@ -82,9 +85,13 @@ function claudeBin() {
 
 // The parent session's CLAUDE_* / terminal-integration vars must not reach the sessions under test.
 // SLATE_HOME reaches the hooks, the skill's commands and the curator through the session's env.
-function cleanEnv(home) {
+function cleanEnv(home, curatorBin) {
   const keep = ['HOME', 'USER', 'LOGNAME', 'PATH', 'SHELL', 'TERM', 'LANG', 'TMPDIR'];
-  return { ...Object.fromEntries(keep.filter((k) => process.env[k]).map((k) => [k, process.env[k]])), SLATE_HOME: home };
+  return {
+    ...Object.fromEntries(keep.filter((k) => process.env[k]).map((k) => [k, process.env[k]])),
+    SLATE_HOME: home,
+    ...(curatorBin && { SLATE_CLAUDE_BIN: curatorBin }),
+  };
 }
 
 // --- fake repo -------------------------------------------------------------------------------
@@ -242,6 +249,25 @@ async function until(pred, ms, every = 500) {
     await sleep(every);
   }
   return false;
+}
+
+// stream-json (--verbose): the additionalContext each `event` hook returned, from its hook_response.
+export function hookContexts(stdout, event) {
+  const out = [];
+  for (const line of String(stdout).split('\n')) {
+    let m;
+    try {
+      m = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (m?.type !== 'system' || m.subtype !== 'hook_response' || m.hook_event !== event) continue;
+    try {
+      const ctx = JSON.parse(m.output)?.hookSpecificOutput?.additionalContext;
+      if (typeof ctx === 'string') out.push(ctx);
+    } catch {}
+  }
+  return out;
 }
 
 // stream-json: the init message (plugins, permission mode) and the final result message.
@@ -515,6 +541,40 @@ if (i.hook_event_name === 'PreToolUse') {
   return { stops: path.join(root, 'subagent-stop.jsonl'), preToolUse: path.join(root, 'pre-tool-use.jsonl') };
 }
 
+// The curator's binary, for the run: it runs the real one with the same args and stdout, and saves
+// that stdout (the `--output-format json` result) to <root>/curator-outputs/<pid>.json. It lives in
+// the curator's process group, so a kill of the group kills both.
+export function buildRecorder(root, realBin) {
+  const dir = path.join(root, 'curator-outputs');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(root, 'record-claude.mjs');
+  fs.writeFileSync(file, `#!/usr/bin/env node
+import fs from 'node:fs';
+import { spawn } from 'node:child_process';
+const child = spawn(${JSON.stringify(realBin)}, process.argv.slice(2), { stdio: ['inherit', 'pipe', 'inherit'] });
+let out = '';
+child.stdout.setEncoding('utf8');
+child.stdout.on('data', (d) => { out += d; process.stdout.write(d); });
+child.on('close', (code, signal) => {
+  fs.writeFileSync(${JSON.stringify(dir)} + '/' + process.pid + '.json', JSON.stringify({ at: new Date().toISOString(), code, signal, stdout: out }));
+  process.exitCode = code ?? 1;
+});
+`, { mode: 0o755 });
+  return { bin: file, dir };
+}
+
+// Each recorded curator run: when it ended, its exit and its change list (structured_output), if any.
+export function curatorOutputs(dir) {
+  return listDir(dir).filter((f) => f.endsWith('.json')).map((f) => {
+    const r = JSON.parse(readText(path.join(dir, f)));
+    let list = null;
+    try {
+      list = JSON.parse(r.stdout)?.structured_output ?? null;
+    } catch {}
+    return { file: f, at: r.at, code: r.code, list };
+  }).sort((a, b) => a.at.localeCompare(b.at));
+}
+
 // Each slate:offload stop the probe saw, whether it was over the limit and whether it was sent back,
 // plus how many times each agent was sent back. A send-back is persisted in the agent's transcript
 // as one hook_blocking_error attachment (its text also appears in a "Stop hook feedback" message,
@@ -574,16 +634,22 @@ export function curatorLog(text) {
   });
 }
 
-// Every item and retired line in the slate's shared files: id → where it is and who added it.
-export function memoryIds(mem) {
+// Every item and retired line in the slate's shared files and topic files: id → where it is and
+// who added it.
+export function memoryIds(mem, topics = {}) {
   const out = [];
-  for (const f of SHARED_FILES) {
-    const p = parseMemoryFile(mem[f] ?? '');
+  const files = [...SHARED_FILES.map((f) => [f, mem[f]]), ...Object.entries(topics).map(([slug, t]) => [`topics/${slug}.md`, t])];
+  for (const [f, text] of files) {
+    const p = parseMemoryFile(text ?? '');
     for (const x of p.items) out.push({ id: x.id, file: f, session: x.session, turn: x.turn, retired: false });
     for (const x of p.retired) out.push({ id: x.id, file: f, session: x.session, turn: x.turn, retired: true });
   }
   return out;
 }
+
+// topics/<slug>.md texts by slug.
+const topicTexts = (slate) => Object.fromEntries(listDir(path.join(slate, 'topics')).filter((f) => f.endsWith('.md'))
+  .map((f) => [f.slice(0, -3), readText(path.join(slate, 'topics', f)) ?? '']));
 
 // Denials sorted for check 3c. A Read, Write or Edit denied on a slate path fails the run: the
 // permission hook should have allowed it. Any other tool denied there (Bash, since Claude Code
@@ -663,7 +729,10 @@ async function main() {
   const bin = claudeBin();
   const tmp = (prefix) => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   const home = tmp('slate-home-');
-  const env = cleanEnv(home);
+  const probeDir = tmp('slate-probe-');
+  const probeLogs = buildProbe(probeDir);
+  const recorder = buildRecorder(probeDir, bin);
+  const env = cleanEnv(home, recorder.bin);
   const version = (await run(bin, ['--version'], { cwd: os.tmpdir(), env, timeoutMs: 30_000 })).stdout.trim();
   const projectA = tmp('slate-acc-');
   const fileCount = buildRepo(projectA);
@@ -673,8 +742,6 @@ async function main() {
   const reportsDir = path.join(slate, 'reports');
   const userSlate = path.join(os.homedir(), 'slate');
   const before = { A: snapshot(projectA), B: snapshot(projectB), userSlate: snapshot(userSlate), userSlateExists: exists(userSlate) };
-  const probeDir = tmp('slate-probe-');
-  const probeLogs = buildProbe(probeDir);
   const out = outArg >= 0 ? path.resolve(argv[outArg + 1]) : path.join(os.tmpdir(), `slate-acc-results-${randomUUID()}.json`);
 
   const session = (name, cwd, prompts) => {
@@ -850,7 +917,8 @@ async function main() {
 
   // --- assertions ---
   const mem = Object.fromEntries(SHARED_FILES.map((f) => [f, readText(path.join(slate, f))]));
-  const live = ITEM_FILES.map((f) => mem[f] ?? '').join('\n');
+  const topics = topicTexts(slate);
+  const live = [...ITEM_FILES.map((f) => mem[f] ?? ''), ...Object.values(topics)].join('\n');
   const probes = (readText(probeLogs.stops) ?? '').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   const preToolUses = (readText(probeLogs.preToolUse) ?? '').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   const offloadsText = readText(path.join(slate, 'offloads.md'));
@@ -915,7 +983,7 @@ async function main() {
   const overlaps = aRuns.flatMap((x) => bRuns.map((y) => ({ a: x, b: y, ms: Math.min(x.end, y.end) - Math.max(x.start, y.start) })))
     .filter((o) => o.ms > 0 && o.a.log.length && o.b.log.length);
   const fmtRun = (r) => `${iso(r.start).slice(11, 21)}–${iso(r.end).slice(11, 21)} (${r.log.join(', ') || 'no log line'})`;
-  const ids = memoryIds(mem);
+  const ids = memoryIds(mem, topics);
   const idCounts = ids.reduce((m, x) => m.set(x.id, (m.get(x.id) ?? 0) + 1), new Map());
   const dupIds = [...idCounts].filter(([, n]) => n > 1).map(([id]) => id);
   const added = [A, B].flatMap((s) => s.logLines.flatMap((l) => l.adds.map((id) => ({ id, session: s.id.slice(0, 8), by: s.name, turn: l.turn }))));
@@ -949,8 +1017,27 @@ async function main() {
   const bigNotes = [A, B].flatMap((s) => s.a.notifications.filter((n) => n.chars > MAIN_THREAD_MAX));
   const lateAgents = [...A.a.agentCalls.filter((c) => c.turn >= 4), ...B.a.agentCalls.filter((c) => c.turn >= 4)];
   const npmAgents = lateAgents.filter((c) => NPM_CMD.test(JSON.stringify(c.input)));
-  const npmRules = [['instructions.md', mem['instructions.md']], ['assumptions.md', mem['assumptions.md']], ['A now.md', A.now], ['B now.md', B.now]]
+  const topicAssumptions = Object.entries(topics).map(([slug, t]) => [`topics/${slug}.md (A items)`,
+    parseMemoryFile(t).items.filter((x) => x.type === 'A').map((x) => x.text).join('\n')]);
+  const npmRules = [['instructions.md', mem['instructions.md']], ['assumptions.md', mem['assumptions.md']], ...topicAssumptions,
+    ['A now.md', A.now], ['B now.md', B.now]]
     .filter(([, t]) => NPM.test(t ?? '')).map(([f]) => f);
+
+  // Relevance and usage: every change list the recorder kept, one per curator log line that ran
+  // the model to the end (ok, partial, retry); usage.json against the F and A items added.
+  const outputs = curatorOutputs(recorder.dir);
+  const lists = outputs.filter((o) => Array.isArray(o.list?.ops));
+  const modelRuns = [A, B].reduce((n, s) => n + s.logLines.filter((l) => ['ok', 'partial', 'retry'].includes(l.status)).length, 0);
+  const withRelevant = lists.filter((o) => Array.isArray(o.list.relevant));
+  const relevantIds = [...new Set(withRelevant.flatMap((o) => o.list.relevant))];
+  const usageText = readText(path.join(slate, 'usage.json'));
+  let usage = null;
+  try {
+    usage = usageText === null ? null : JSON.parse(usageText);
+  } catch {}
+  const liveIds = new Set(ids.filter((x) => !x.retired).map((x) => x.id));
+  const addedFA = [...new Set(added.map((x) => x.id).filter((id) => /^[FA]/.test(id) && liveIds.has(id)))];
+  const notInUsage = addedFA.filter((id) => !usage || !(id in usage));
   const SHAPE = ['agent_type', 'last_assistant_message', 'stop_hook_active', 'session_id', 'agent_id'];
   const offloadStops = [...A.offloadStops, ...B.offloadStops];
   const noChange = (s) => s.userTurns.filter((n) => !s.a.hookContext.some((h) => h.turn === n && h.event === 'UserPromptSubmit' && h.text.includes(REMINDER)));
@@ -1003,10 +1090,12 @@ async function main() {
       both((s) => s.a.notifications.map((n) => `t${n.turn} ${n.kind} ${n.chars} chars (result ${n.resultChars})`).join(', ') || 'none')],
     ['no Agent brief from turn 4 on (A or B) contains an npm command', npmAgents.length === 0,
       `${lateAgents.length} Agent call(s) from turn 4 on, ${npmAgents.length} with ${NPM_CMD}`],
-    ['no npm in instructions.md, assumptions.md or either now.md (facts exempt)', npmRules.length === 0, npmRules.join(', ') || 'none match'],
+    ['no npm in instructions.md, assumptions.md, topic assumptions or either now.md (facts exempt)', npmRules.length === 0, npmRules.join(', ') || 'none match'],
     ['superseded.md matches /\\bnpm\\b/', NPM.test(mem['superseded.md'] ?? ''), ''],
     ['A turn-5 answer contains pnpm', /pnpm/.test(turns5), JSON.stringify(turns5)],
-    ['stg-7.internal is in live memory', live.includes('stg-7.internal'), ITEM_FILES.filter((f) => (mem[f] ?? '').includes('stg-7.internal')).join(', ') || 'absent'],
+    ['stg-7.internal is in live memory', live.includes('stg-7.internal'),
+      [...ITEM_FILES.filter((f) => (mem[f] ?? '').includes('stg-7.internal')),
+        ...Object.keys(topics).filter((slug) => topics[slug].includes('stg-7.internal')).map((slug) => `topics/${slug}.md`)].join(', ') || 'absent'],
     ['curator.log has no line matching /\\b(partial|error)\\b/i (both sessions)', badLog.length === 0, badLog.join(' | ')],
     ['every user turn got the slate change line', noChange(A).length === 0 && noChange(B).length === 0,
       both((s) => (noChange(s).length ? `missing on turn(s) ${noChange(s).join(', ')}` : `turns ${s.userTurns.join(', ')}`))],
@@ -1028,7 +1117,52 @@ async function main() {
       both((s) => `${s.queue.join(', ') || 'empty'} (newest turn ${s.slateTurns})`)],
     ['every slate:offload hand-back over 800 chars was denied exactly once', [A, B].every((s) => s.hb.every((h) => h.ok)),
       `${[A, B].flatMap((s) => s.hb.map((h) => `${s.name} ${h.id.slice(0, 6)}: ${h.calls.map((c) => `${c.chars ?? '?'} chars ${c.denied ? 'denied' : c.error ? 'error' : 'ok'}`).join(' → ')}`)).join('; ') || 'no hand-backs'}; probe saw ${preToolUses.filter((x) => HANDBACK_TOOLS.includes(x.tool_name)).length} hand-back PreToolUse(s)`],
+    ['T1. every curator change list carried `relevant` (one recorded list per ok, partial or retry log line)',
+      lists.length > 0 && lists.length === modelRuns && withRelevant.length === lists.length,
+      `${lists.length} change list(s) recorded (${outputs.length} run(s)), ${modelRuns} ok/partial/retry log line(s); ${withRelevant.length} with relevant, ${withRelevant.filter((o) => o.list.relevant.length).length} non-empty; IDs marked relevant: ${relevantIds.join(', ') || 'none'}`],
+    ['T2. usage.json exists and holds every F and A item added that is still live',
+      usage !== null && addedFA.length > 0 && notInUsage.length === 0,
+      `usage.json ${usage === null ? 'missing or unreadable' : `holds ${Object.keys(usage).join(', ') || 'nothing'}`}; live F/A added: ${addedFA.join(', ') || 'none'}; missing: ${notInUsage.join(', ') || 'none'}`],
   ].map(([name, pass, detail, soft]) => ({ name, pass: Boolean(pass), detail, soft: Boolean(soft) }));
+
+  // T3: a session started after the run. A, resumed for one short turn: the memory block its
+  // SessionStart hook returned (stream-json hook_response) has `# Topics` and each topic's slug
+  // when a topic exists, and no such section when none does. The transcript is no source for it:
+  // 2.1.308 doesn't add a SessionStart block identical to the last one already in the resumed
+  // transcript (the model has it from there), and nothing changes memory between A's turn 5 and
+  // this run. Whether it was added, and whether it matched, is reported as a note.
+  const startedAfter = await (async () => {
+    const lines = lineCount(A.transcript());
+    const sessionStart = (list) => list.filter((e) => e.type === 'attachment' && e.attachment?.type === 'hook_additional_context'
+      && e.attachment.hookEvent === 'SessionStart').map((e) => (e.attachment.content ?? []).join('\n'));
+    const r = await run(bin, ['-p', 'Reply with only: ok', '--resume', A.id, ...common], { cwd: A.cwd, env, timeoutMs: TURN_TIMEOUT_MS });
+    const { init, result } = parseStream(r.stdout);
+    const all = entries(A.transcript());
+    const block = hookContexts(r.stdout, 'SessionStart').find((t) => t.startsWith('# slate memory')) ?? null;
+    const w = await waitCurator(A.dir);
+    return {
+      exit: r.code, guard: pluginGuard(init), result: result?.result ?? null, costUsd: result?.total_cost_usd ?? null,
+      wallSec: secs(r.ms), curatorOk: w.ok, block,
+      kept: sessionStart(all.slice(lines)).some((t) => t.startsWith('# slate memory')),
+      sameAsLast: block !== null && sessionStart(all.slice(0, lines)).at(-1) === block,
+    };
+  })();
+  const slugsAfter = Object.keys(topicTexts(slate));
+  const blockTopics = /^# Topics$/m.test(startedAfter.block ?? '');
+  checks.push({
+    name: 'T3. the memory block of a session started after the run shows # Topics whenever a topic exists',
+    pass: startedAfter.guard.ok && startedAfter.block !== null
+      && (slugsAfter.length ? blockTopics && slugsAfter.every((slug) => startedAfter.block.includes(slug)) : !blockTopics),
+    detail: `topics: ${slugsAfter.join(', ') || 'none'}; # Topics in the block: ${blockTopics}; resumed A: exit ${startedAfter.exit}, ${startedAfter.guard.ok ? 'guard ok' : startedAfter.guard.why}, block ${startedAfter.block === null ? 'MISSING' : `${startedAfter.block.length} chars`}; reply ${JSON.stringify(startedAfter.result)}`,
+    soft: false,
+  });
+  checks.push({
+    name: 'note: the harness kept that SessionStart block in the transcript (not asserted)',
+    pass: true,
+    detail: `kept ${startedAfter.kept}; identical to the last SessionStart block already in the transcript: ${startedAfter.sameAsLast}`,
+    soft: true,
+  });
+  console.log(`started after the run: A resumed, ${startedAfter.wallSec}s, $${startedAfter.costUsd}, curator ${startedAfter.curatorOk ? 'settled' : 'NOT settled'}`);
 
   // A streamed session reports a running total; each -p run reports its own.
   const costs = Object.fromEntries([A, B].map((s) => [s.name, Math.round((s.turns.reduce((n, t) => n + (t.costUsd ?? 0), 0)
@@ -1045,14 +1179,15 @@ async function main() {
     claude: { bin, version }, model: MODEL, home, slate, fileCount, aborted: ctx.aborted, costUsd: costs,
     checks, A: sessionResults(A), B: sessionResults(B),
     bReads, reportWrites, cwdChanges, userSlateChanges,
-    memory: mem, ids, added, offloads: offloadsText,
+    memory: mem, topics, usage, ids, added, offloads: offloadsText,
+    curatorOutputs: outputs, startedAfter: { ...startedAfter, topics: slugsAfter },
     subagentStops: probes, curatorChildren: children,
     reports: Object.fromEntries(reports.map((f) => [f, readText(path.join(reportsDir, f))])),
   };
   fs.writeFileSync(out, `${JSON.stringify(results, null, 2)}\n`);
 
   const { passed, total } = printChecks(checks);
-  console.log(`\n${passed}/${total} checks passed; cost A $${costs.A}, B $${costs.B} (curators not included)`);
+  console.log(`\n${passed}/${total} checks passed; cost A $${costs.A}, B $${costs.B}, A resumed after $${startedAfter.costUsd} (curators not included)`);
   console.log(`results: ${out}`);
   console.log(`left in place: ${home}\n               ${projectA}\n               ${projectB}\n               ${probeDir}`);
   console.log(`               ${path.dirname(A.tp)}\n               ${path.dirname(B.tp)}`);

@@ -10,7 +10,7 @@ import path from 'node:path';
 import {
   ITEM_FILES, MEMORY_FILES, RETIRED_LIKE, parseItemLine, parseMemoryFile, formatItem, formatRetired,
 } from './items.mjs';
-import { readMemory, atomicWrite } from './session.mjs';
+import { atomicWrite } from './session.mjs';
 import { acquire } from './lock.mjs';
 import { memoryPath, slateOf, readTopics, topicPath, validTopic } from './slate.mjs';
 
@@ -38,7 +38,8 @@ const REPORT = /(?:^|[^\w.-])reports\/|\.slate/;
 // Kinds of error token (`<op index>:<kind>`), besides `stale <ID>`. A warning echoes only these.
 export const ERROR_KINDS = ['bad op', 'bad id', 'empty text', 'multi-line text', 'tag in text', 'no source',
   'report source', 'empty reason', 'multi-line reason', 'now too long', 'tag in now', 'bad slug', 'empty title',
-  'multi-line title', 'empty summary', 'multi-line summary', 'missing topic', 'no home', 'instruction move'];
+  'multi-line title', 'empty summary', 'multi-line summary', 'missing topic', 'no home', 'instruction move',
+  'op not allowed', 'no replacement'];
 
 const STRING = { type: 'string' };
 function shape(op, fields) {
@@ -74,6 +75,19 @@ export const CHANGE_SCHEMA = {
     relevant: { type: 'array', items: STRING },
   },
   required: ['ops', 'relevant'],
+  additionalProperties: false,
+};
+
+// The one-off reorganize pass (tools/reorganize-slate.mjs) regroups items and retires replaced
+// ones; it never adds or rewords.
+const REORGANIZE_OPS = ['topic', 'move', 'retire'];
+const shapeOf = (op) => CHANGE_SCHEMA.properties.ops.items.oneOf.find((s) => s.properties.op.const === op);
+export const REORGANIZE_SCHEMA = {
+  type: 'object',
+  properties: {
+    ops: { type: 'array', items: { oneOf: REORGANIZE_OPS.map(shapeOf) } },
+  },
+  required: ['ops'],
   additionalProperties: false,
 };
 
@@ -189,8 +203,10 @@ const formatUsage = (usage) => `${JSON.stringify(Object.fromEntries(Object.entri
 // nothing is written. Lenient: invalid ops are dropped, and a stale replace still adds its new
 // item, so a user's instruction is never silently lost. Returned tokens carry op index, kind, IDs
 // and slugs only; `demoted` lists `<ID>><slug>` for each item a cap moved out of its key file.
+// `reorganize`: `dir` is the slate folder (no session, so no now.md); only topic, move and retire
+// ops apply, and a retire's reason must name the item that replaces it.
 export async function applyChanges(dir, ops, {
-  turn, sessionId, lenient = false, relevant = [], now = new Date(),
+  turn, sessionId, lenient = false, relevant = [], now = new Date(), reorganize = false,
 }) {
   if (!Array.isArray(ops)) throw new TypeError('ops is not a list');
   if (!Number.isInteger(turn) || turn < 0) throw new TypeError(`bad turn: ${turn}`);
@@ -198,10 +214,12 @@ export async function applyChanges(dir, ops, {
   if (!SESSION8.test(session)) throw new TypeError('bad session ID');
   const stamp = now.toISOString();
   await fs.access(dir); // a deleted slate throws here; nothing below creates a folder
-  const slate = slateOf(dir);
+  const slate = reorganize ? dir : slateOf(dir);
+  const fileOf = (f) => (reorganize ? path.join(slate, f) : memoryPath(dir, f));
   const release = await lockMemory(slate);
   try {
-    const text = await readMemory(dir);
+    const text = {};
+    for (const f of MEMORY_FILES) text[f] = reorganize && f === 'now.md' ? '' : await readText(fileOf(f));
     const mem = Object.fromEntries(MEMORY_FILES.map((f) => [f, load(text[f])]));
     const found = await readTopics(slate);
     const topics = new Map(found.map((t) => [t.slug, load(t.text)]));
@@ -279,9 +297,16 @@ export async function applyChanges(dir, ops, {
       append(to, line);
     };
 
+    // Reorganize mode: a retire's reason names the item that replaces it, live when this apply began
+    // and, if of the same type, added after it.
+    const startIds = new Set(live().map((x) => x.item.id));
+    const replaced = (reason, id) => (reason.match(/\b[IAF]\d+\b/g) ?? []).map(parseId).some((r) => r !== id
+      && startIds.has(r) && (r[0] !== id[0] || Number(r.slice(1)) > Number(id.slice(1))));
+
     const handle = (o, i) => {
       const fail = (kind, id) => errors.push(`${i}:${kind}${id ? ` ${id}` : ''}`);
       if (o === null || typeof o !== 'object') return fail('bad op');
+      if (reorganize && !REORGANIZE_OPS.includes(o.op)) return fail('op not allowed');
       if (o.op === 'topic') {
         if (!isString(o.slug, o.title, o.summary)) return fail('bad op');
         if (!validTopic(o.slug)) return fail('bad slug');
@@ -322,6 +347,7 @@ export async function applyChanges(dir, ops, {
           }
           return;
         }
+        if (reorganize && !replaced(o.reason, id)) return fail('no replacement', id);
         retire(target, o.reason);
         // The replacement takes the old item's place: its file and its usage.
         const added = replace && add(i, id[0], o.text, target.where === KEY ? null : target.where);
@@ -408,7 +434,7 @@ export async function applyChanges(dir, ops, {
     // Topic files first, so a demotion cut short by a crash leaves its item in two files, not none.
     for (const [slug, file] of changedTopics) await atomicWrite(topicPath(slate, slug), file.lines.join('\n'));
     for (const f of MEMORY_FILES) {
-      if (mem[f].changed) await atomicWrite(memoryPath(dir, f), mem[f].lines.join('\n'));
+      if (mem[f].changed) await atomicWrite(fileOf(f), mem[f].lines.join('\n'));
     }
     const usageAfter = formatUsage(usage);
     if (usageAfter !== usageBefore && (usageBefore !== '' || Object.keys(usage).length)) {

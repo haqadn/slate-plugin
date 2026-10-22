@@ -478,6 +478,120 @@ A  19:47:32.535Z t4 ok: attempt 1: applied nothing
 
 All curator children ran `~/.local/bin/claude` (executable `~/.local/share/claude/versions/2.1.308`) with `-p … --model sonnet --json-schema`.
 
+## Topics rerun and reorganize smoke run (2026-10-22, Task 8)
+
+Same command and setup as the shared-slates runs, on Claude Code **2.1.308**, after topic files and selective curation landed.
+
+**Result: PASS, 31 / 31 (run 2).** The reorganize tool's smoke run against a real model also passed accounting.
+
+| Run | Checks | Cost A / B / resumed A | Changed after the run |
+|---|---|---|---|
+| 1 | 30 / 31 | $0.65 / $0.22 / $0.19 | **Script only:** T3 read the memory block from the transcript, where the harness didn't add it (see below). It now reads the block the hook returned, from stream-json. |
+| 2 | **31 / 31** | $0.72 / $0.20 / $0.22 | The T3 note's wording (informational) now reports whether the block matched the last one already in the transcript. |
+
+Costs are the main sessions only. The reorganize smoke run cost $0.05 (dry run) and $0.02 (real run).
+
+### What changed in the script
+
+- **Curator recorder.** `SLATE_CLAUDE_BIN` points at a small recorder in the probe folder. It runs the real binary with the same args and saves each `--output-format json` result. So the curator children `ps` sees are the recorder (`node …/record-claude.mjs -p … --json-schema`), and the real binary is their child.
+- **Topic files count as memory.** Check 2b, the `stg-7.internal` check and the npm check now read `topics/*.md` too. Before this, a curator's topic add would have shown as "missing" in 2b.
+- **A session started after the run.** Once everything settles, A is resumed for one more turn (`Reply with only: ok`). T3 checks the memory block its SessionStart hook returned.
+
+### New checks (run 2)
+
+| # | Check | Result | Evidence |
+|---|---|---|---|
+| T1 | Every curator change list carried `relevant` | PASS | 8 change lists recorded, one per `ok` log line (8). All 8 had `relevant`; all 8 were empty. |
+| T2 | `usage.json` exists and holds every F and A item added that's still live | PASS | It holds F1, F2 and F3, the three facts the curators added. |
+| T3 | The memory block of a session started after the run shows `# Topics` whenever a topic exists | PASS | Topics `general` and `releases` existed. The resumed session's block had `# Topics` and both topic paths. |
+| note | The harness kept that block in the transcript (not asserted) | kept: no | The block was identical to the one from A's turn 5. See below. |
+
+Every check from the shared-slates runs passed again in both runs. The only exception is T3 in run 1.
+
+### Why T3 failed in run 1
+
+- The hook did its job. A one-off diagnostic resume of A (about $0.21) showed SessionStart's `hook_response` in stream-json with the full memory block.
+- Claude Code 2.1.308 doesn't add a SessionStart context identical to the last one already in a resumed transcript. That's harmless, since the model already has that text from the earlier turn.
+- Across both runs, 9 resumes had SessionStart output. The 3 that weren't added (run 1's post-run resume, the diagnostic, and run 2's) were each byte-identical to the previous block. The 6 that were added each differed from the previous one.
+- An early guess, that a changed MCP tool list (`deferred_tools_delta`) caused it, didn't hold: run 2's turns 2 and 3 had that delta and kept their blocks.
+
+### Run 2: memory and logs
+
+```
+# Instructions
+- [I1 t1@1a2dbc42] Release branches are always named release/<version>
+- [I3 t3@d0646227] Use pnpm for all package-manager commands
+
+# Superseded
+- [I2 t1@d0646227 retired t3@d0646227] Always give package-manager commands using npm (reason: user switched project to pnpm)
+```
+
+`facts.md` and `assumptions.md` have no items. Every fact went to a topic:
+- `topics/general.md`: F2 (the staging host) and F3 (a summary of the TODO(perf) scan)
+- `topics/releases.md`: F1 (`2026-10-22: the current release branch is release/2.4 (user)`)
+
+```
+A  21:04:29.876Z t1 ok: attempt 1: applied 0:add I2, 1:add F2>general
+B  21:04:24.233Z t1 ok: attempt 1: applied 1:topic releases, 0:add I1, 2:add F1>releases
+A  21:04:45.725Z t2 ok: attempt 1: applied 0:now
+A  21:05:17.585Z t2 ok: attempt 1: applied 0:add F3>general, 1:now      (continuation: the agent's result)
+A  21:05:34.747Z t3 ok: attempt 1: applied 0:replace I2 I3
+B  21:05:34.850Z t2 ok: attempt 1: applied nothing
+B  21:05:46.407Z t3 ok: attempt 1: applied nothing
+A  21:05:49.425Z t4 ok: attempt 1: applied nothing
+```
+
+**Not asserted:**
+- **`relevant` was empty in all 16 change lists across both runs.** That includes B's turn 3 ("Which file does it mark !!?"), where F3 names `src/db/pool.rs` as the urgent one. So `usage.json` only gets add-time stamps, and demotion falls back to "oldest added first".
+- The curators put no fact in a key file, the staging host included.
+
+### Reorganize smoke run
+
+This checks the reorganize schema and prompt against a real model before the controller runs them on jetpack-seo.
+
+- **Command:** `node tools/reorganize-slate.mjs smoke --dry-run`, then the same without `--dry-run`. `SLATE_HOME` was a temp folder in the session scratchpad.
+- **Slate:** `smoke`, built like a migrated slate, with every item in a key file and old-style `[F3 t4]` tags:
+  - 30 facts on an SEO project, 2,877 chars of item lines
+  - 6 assumptions and 3 instructions
+  - 5 dated statuses that a later fact replaces: PR #101 in review → comments → merged; Rich Results warnings → fixed; a flag rollout; a moved release date
+- **Model:** sonnet, through `CLAUDE_CODE_EXECPATH` (`~/.local/share/claude/versions/2.1.308`).
+
+| | Dry run | Real run |
+|---|---|---|
+| Model run | 15 s, $0.049 | 18 s, $0.021 |
+| Ops | 39: 7 topics, 27 moves, 5 retires | 38: 7 topics, 26 moves, 5 retires |
+| Rejected ops | 0 | 0 |
+| Demoted by the caps | 0 | 0 |
+| Slate files after | unchanged (same SHA-1 for every file) | changed as below |
+
+The two model runs differed by one item: the dry run moved F23 (the release cadence) to `releases`, and the real run kept it in `facts.md`.
+
+Real run, per file:
+
+```
+file                       before  after
+instructions.md                 3       3
+facts.md                       30       5
+assumptions.md                  6       0
+superseded.md                   1       6
+topics/canonical-urls.md        0       3
+topics/hreflang.md              0       3
+topics/performance.md           0       4
+topics/releases.md              0       2
+topics/robots-indexing.md       0       4
+topics/sitemaps.md              0       6
+topics/structured-data.md       0       4
+
+topics: 7, moves: 26, retires: 5, demoted: 0, rejected: 0
+key file chars: facts.md 445 / 3000, assumptions.md 0 / 1500
+accounting: ok, 39 IDs live before; 34 live after, 5 retired with a reason
+```
+
+- **Retires:** F8 by F9, F9 by F10, F14 by F15, F21 by F22 and F26 by F27. Each is tagged `retired t0@reorg`, and each reason names the replacing ID. No item was retired for any other reason.
+- **Key facts left:** F1 and F3 (canonical rules), F23 (release cadence), F24 (`pnpm test:seo`) and F25 (changelog location).
+- **Text unchanged:** a separate script compared every original item line with the result. All 34 live lines match byte for byte, and the 5 retired ones appear verbatim in `superseded.md`.
+- No session file changed. No `usage.json` was written, since no item was added, promoted or marked relevant.
+
 ## Earlier rounds
 
 **Round 0:** 5 turns and 8 checks, all passed. The review then found two gaps:
@@ -527,6 +641,13 @@ Removed after recording these results:
 - **Run 3:** `<tmp>/slate-home-F0LVBs`, `<tmp>/slate-acc-FWaFq2`, `<tmp>/slate-acc-b-f05W0q` and `<tmp>/slate-probe-SQMjxs`
 - `~/.claude/projects/-private-var-folders-…-T-slate-acc-{UQjnE4,223Gzw,FWaFq2}` and `…-slate-acc-b-{RyqUdK,xQ0beI,f05W0q}`
 - `~/.claude/projects/-private-tmp-claude-<uid>-…-scratchpad-live-streamprobe-cwd`, from the stream-json probe. The Bash probes kept no transcript.
+
+**Topics rerun (2026-10-22, Task 8): left in place** for the same reason. Remove by hand:
+
+- **Run 1:** `<tmp>/slate-home-dpBSN0`, `<tmp>/slate-acc-em6wVX`, `<tmp>/slate-acc-b-BBXe14` and `<tmp>/slate-probe-lbj5rj`
+- **Run 2:** `<tmp>/slate-home-kwf1Dc`, `<tmp>/slate-acc-vr3jVo`, `<tmp>/slate-acc-b-FDC3fQ` and `<tmp>/slate-probe-Md3pow`
+- `~/.claude/projects/-private-var-folders-…-T-slate-acc-{em6wVX,vr3jVo}` and `…-slate-acc-b-{BBXe14,FDC3fQ}`. Run 1's A transcript also holds the diagnostic resume.
+- The smoke-run slate and both runs' results JSON are in the session scratchpad, which is cleared with the session.
 
 Not removed, because they fall outside the cleanup ruling. All are harmless.
 

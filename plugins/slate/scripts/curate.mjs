@@ -39,7 +39,7 @@ export const CURATOR_ENV_DENY = [
   'CLAUDE_CODE_SSE_PORT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_ENV_FILE', 'CLAUDE_EFFORT',
 ];
 
-function curatorEnv(env) {
+export function curatorEnv(env) {
   const out = { ...env };
   for (const k of CURATOR_ENV_DENY) delete out[k];
   out.SLATE_CURATOR = '1';
@@ -74,7 +74,7 @@ function cap(text, max, note) {
 }
 
 // The topic index: one line per topic with its slug, title, summary, item count and path.
-const topicLine = (t) => `- ${t.slug}: ${t.title}${t.summary ? ` — ${t.summary}` : ''} (${t.count} items) ${t.path}`;
+export const topicLine = (t) => `- ${t.slug}: ${t.title}${t.summary ? ` — ${t.summary}` : ''} (${t.count} items) ${t.path}`;
 const topicLines = (topics) => (topics.length ? ['Topics:', ...topics.map(topicLine)] : ['Topics: none yet.']);
 
 function buildPrompt({ rules, turn, real, topics, message, answer }) {
@@ -140,7 +140,7 @@ function killGroup(child) {
 
 // Resolves `{ error, stdout }`: error is null on success, ABORTED once `signal` fires, else a
 // one-line detail. Never rejects.
-function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
+export function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
   return new Promise((resolve) => {
     let child;
     let timer;
@@ -213,7 +213,7 @@ function runClaude(bin, args, { cwd, env, timeoutMs, signal }) {
 
 // The change list from `--output-format json`: the result's top-level structured_output, with its
 // ops and the IDs relevant to the turn.
-function parseChanges(stdout) {
+export function parseChanges(stdout) {
   try {
     const out = JSON.parse(stdout)?.structured_output;
     if (!Array.isArray(out?.ops)) return null;
