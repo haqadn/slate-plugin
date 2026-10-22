@@ -45,7 +45,7 @@ Edit memory files when no `memory.lock` exists; an edit during a run can be undo
 
 - At startup, session folders idle for 30 days with no live process are deleted.
 - `/slate:done` deletes the whole slate.
-- Old per-project `.slate/` folders are ignored. Delete them by hand. `node tools/migrate-session.mjs <oldSessionDir> <name>` copies one into a new slate and leaves the source untouched.
+- Old per-project `.slate/` folders are ignored. Delete them by hand. `node tools/migrate-session.mjs <oldSessionDir> <name>` copies one into a new slate and leaves the source untouched. It points `offloads.md`'s report paths at the slate's `reports/`.
 - `node tools/reorganize-slate.mjs <name> [--dry-run]` sorts a slate's facts and assumptions into topic files with one curator-model run. It only regroups, gives each item left in a key file a home topic, and retires a status a later item replaces. It then checks that every item is still live or retired with a reason. `--dry-run` prints the plan, saves it (`--save <file>` picks where) and changes nothing; `--ops <file>` applies a saved plan without a model run.
 
 ## Permissions
@@ -55,5 +55,6 @@ Reads in the linked slate and writes under `reports/` are allowed without a prom
 ## Notes
 
 - When `facts.md` or `assumptions.md` goes over its cap, the curator's apply step moves the least recently relevant items to their home topics (`general` if none) until it fits, and logs them as `demoted` in `curator.log`.
+- `SLATE_HOME` (default `~/slate`) must be on a filesystem with hard links: locks are linked into place.
 - Turn files escape exact marker lines with a leading backslash.
 - The curator finds `claude` through `CLAUDE_CODE_EXECPATH` and runs with `--setting-sources ""`: OAuth login works; `apiKeyHelper` auth can't reach it.
