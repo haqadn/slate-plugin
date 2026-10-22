@@ -1,6 +1,6 @@
 # slate plugin — design
 
-Amended by [offload index and turn queue](2026-10-13-offload-index-design.md).
+Amended by [offload index and turn queue](2026-10-13-offload-index-design.md) and [shared slates](2026-10-22-shared-slates-design.md).
 
 A Claude Code plugin that keeps the main thread small. It offloads high-context turns to subagents and keeps instructions, facts and focus in curated per-session files. Those files survive `/clear` and compaction.
 

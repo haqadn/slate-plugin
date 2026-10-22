@@ -69,5 +69,6 @@ test('agent frontmatter', async () => {
   assert.match(link, /reply with one line saying so, and nothing else: don't restate the rules/);
   assert.equal(await exists(`${PLUGIN}skills/init`), false, 'the init skill is gone');
   assert.equal(await exists(`${PLUGIN}scripts/init.mjs`), false);
-  assert.match(agent, /transcript.*Grep.*offset and limit/i, 'a transcript can exceed Read\'s limit and Bash may be denied');
+  assert.match(agent, /transcript[^\n]*Read with offset and limit/i, 'a transcript can exceed Read\'s limit');
+  assert.doesNotMatch(agent, /with the Grep tool/i, '2.1.308 has no Grep tool');
 });

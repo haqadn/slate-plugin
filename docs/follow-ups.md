@@ -16,7 +16,8 @@ These were found in review and left out of v1. They are ordered by impact.
 | 10 | Rare races: two processes taking over a dead lock at once; a copy that isn't atomic; `initSession` not crash-safe. | Harden them as needed. |
 | 11 | Probe leftovers outside the repo: `~/.claude/session-env/*` dirs, `~/.claude/plugins/data/slate-inline`, probe entries in `~/.claude.json`, and older `slate-*` temp dirs in `$TMPDIR` from earlier test runs. | Delete them by hand if you want. |
 | 12 | A lone `\r` or U+2028 in an offload return isn't split into a quoted line, so a Markdown viewer can show a fake `## t…` entry header. The `offloads.md` parser isn't fooled. | Split return text on `\r\n`, `\r`, `\n`, U+2028 and U+2029. |
-| 13 | Two offloads finishing at once, as the very first entries, write the `# Offloads` title twice. Both entries land whole. | Write the title with `flag: 'wx'`, then append. |
 | 14 | If another plugin's SubagentStop hook blocks a stop slate let through, slate writes two entries for that agent. Not seen live. | Let a later entry for the same agent win, or skip a repeat. |
 | 15 | The live check finds offload agents through SubagentStop events, so an offload whose SubagentStop never fired goes unchecked. | Take the agent IDs from the main transcript's Agent calls. |
 | 16 | A background offload that finishes after `/clear` may report the old session ID, so its entry would be lost. Not verified. | Probe it; if so, find the folder by agent ID or process ID. |
+| 17 | Claude Code 2.1.308 has no Grep/Glob tool, so an agent searching the slate with shell commands may get a permission prompt. Recorded in `docs/acceptance.md`. | Add `~/slate` to `permissions.additionalDirectories` (README), or re-check on a newer Claude Code. |
+| 18 | The migration tool counts items by tag shape and does not validate content. | Run the real migration, then check `/slate:link` output and `curator.log`. |
