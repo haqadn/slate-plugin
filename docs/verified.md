@@ -324,3 +324,20 @@ Also removed: `/private/tmp/claude-501/-private-var-folders-yn-n1h-qdds3g57ndq63
 - Empty dirs, one per probe session: `~/.claude/session-env/a8e9c986-5031-436e-9595-4dc68a3bea01`, `…/5b712beb-b3d8-41b1-84ae-805e27079c2d`, `…/61939fdf-1c38-4022-8355-7b1360fc9fb1`, `…/d35ea1e3-7b26-4ed0-886a-0a8ade1c8104`.
 - The empty dir `~/.claude/plugins/data/slate-inline`. This is `CLAUDE_PLUGIN_DATA` for `--plugin-dir`, and development will reuse it.
 - The project entry for `…/slateprobe.xGT66O/proj` in `~/.claude.json`. It was left alone rather than edit that file.
+
+## 10. PreToolUse `allow` for paths outside the project (shared slates)
+
+**Probe** (Claude Code 2.1.308, 2026-10-22). cwd was a fresh `proj/`; the target folder `slate/topic/` was a sibling, outside it. Runs used `env -i` and `--setting-sources ""`. The model was asked to Read `slate/topic/facts.md`, Write `slate/topic/reports/main.md`, and have a `general-purpose` subagent Write `reports/sub.md`.
+
+**Observed**
+
+| Run | Hook | Result |
+|---|---|---|
+| `-p`, no plugin | none | all three denied |
+| `-p`, probe plugin | PreToolUse on `Read\|Write\|Edit\|Grep\|Glob` returning `permissionDecision: "allow"` for paths under `slate/` | all three succeeded |
+| interactive (pty), probe plugin | same | all three succeeded, no permission prompt shown |
+
+- The subagent's Write reached the hook with its `agent_id` set.
+- The hook saw the path exactly as the model wrote it (`/private/tmp/...` here); match both the realpath and the symlinked form.
+
+**Chosen mechanism.** A PreToolUse hook allows reads inside the linked slate and writes under its `reports/`.
