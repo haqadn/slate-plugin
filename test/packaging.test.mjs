@@ -47,6 +47,16 @@ test('agent frontmatter', async () => {
   assert.match(agent, /hand-back tool.*600|600.*hand-back tool/i, 'the return limit also covers a hand-back message');
   assert.match(agent, /\.jsonl.*transcript|transcript.*\.jsonl/i, 'a past run is reachable through its transcript path');
   assert.match(agent, /never overwrite an existing report/i);
+  for (const name of ['link', 'done']) {
+    const skill = await fs.readFile(`${PLUGIN}skills/${name}/SKILL.md`, 'utf8');
+    const front = skill.split('\n---')[0];
+    assert.match(front, new RegExp(`^name: ${name}$`, 'm'));
+    assert.match(front, /^description: .+/m);
+    assert.match(front, /^disable-model-invocation: true$/m);
+    assert.match(front, /^allowed-tools: Bash\(node:\*\)$/m);
+    assert.ok(skill.includes('!`node "${CLAUDE_PLUGIN_ROOT}/scripts/slate.mjs" list "${CLAUDE_SESSION_ID}"`'), name);
+    assert.ok(skill.includes('AskUserQuestion'), name);
+  }
   assert.equal(await exists(`${PLUGIN}skills/init`), false, 'the init skill is gone');
   assert.equal(await exists(`${PLUGIN}scripts/init.mjs`), false);
   assert.match(agent, /transcript.*Grep.*offset and limit/i, 'a transcript can exceed Read\'s limit and Bash may be denied');

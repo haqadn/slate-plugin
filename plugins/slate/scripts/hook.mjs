@@ -54,7 +54,7 @@ function isCurator(pid) {
 // Before a folder is moved or copied, its curator must be gone: once the folder moves, the
 // curator's apply and log would target the old path.
 // Wait; then SIGTERM the holder if it is a curator (it applies nothing and releases); wait again.
-async function settle(dir, waitMs) {
+export async function settle(dir, waitMs) {
   if (await waitFree(dir, waitMs)) return;
   const pid = await lockHolder(dir);
   if (pid && isCurator(pid)) {
@@ -66,7 +66,7 @@ async function settle(dir, waitMs) {
 }
 
 // CLAUDE_PID from the given env, else claudePid()'s own lookup (process env, then the ancestors).
-function currentPid(env) {
+export function currentPid(env) {
   const n = Number(env.CLAUDE_PID);
   return Number.isInteger(n) && n > 0 ? n : claudePid();
 }
@@ -137,7 +137,7 @@ async function userPromptSubmit(input, dir, env) {
   return { output: context('UserPromptSubmit', await changeLine(dir, { waiting })) };
 }
 
-function spawnCurator(dir, turn, env) {
+export function spawnCurator(dir, turn, env) {
   const model = env.CLAUDE_PLUGIN_OPTION_CURATORMODEL || 'sonnet';
   const args = [CURATE, dir, String(turn), model];
   const child = spawn(process.execPath, args, { detached: true, stdio: 'ignore', env });

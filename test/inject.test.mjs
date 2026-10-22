@@ -37,7 +37,8 @@ test('rules.md carries the main-thread rules', async () => {
   const raw = await fs.readFile(new URL('../plugins/slate/rules.md', import.meta.url), 'utf8');
   for (const s of ['lead with the answer', 'offload', 'slate:offload', 'read-only', 'CLAUDE.md', 'AGENTS.md',
     '{{slate}}/instructions.md', '{{session}}/now.md', '{{slate}}/reports/<slug>.md', 'a slug no other report uses',
-    'superseded.md', 'Return ≤10 lines', 'instead of doing it yourself', 'when unsure, offload',
+    'Slate-folder files: superseded.md', 'Go longer when the task needs it.',
+    'Keep conversation, decisions, small targeted reads here.', 'Return ≤10 lines', 'instead of doing it yourself', 'when unsure, offload',
     'memory still updating', 'slate warning', 'Task line', 'replaces', 'offloads.md', 'transcript path']) {
     assert.ok(raw.includes(s), `rules.md lacks ${JSON.stringify(s)}`);
   }

@@ -51,11 +51,19 @@ export async function createSlate(home, name) {
   if (!validName(name)) throw new Error(`invalid slate name: ${JSON.stringify(name)}`);
   const dir = slateDir(home, name);
   await fs.mkdir(home, { recursive: true });
-  if (!(await mkdirNew(dir))) return { created: false, dir };
-  for (const f of SHARED) await fs.writeFile(path.join(dir, f), TITLES[f]);
-  await fs.mkdir(path.join(dir, 'reports'));
-  await fs.mkdir(path.join(dir, '.sessions'));
-  return { created: true, dir };
+  const created = await mkdirNew(dir);
+  // Every call fills in what is missing, so a slate left half-made by a crash is repaired, and
+  // two sessions creating the same slate at once both find it whole.
+  for (const f of SHARED) {
+    try {
+      await fs.writeFile(path.join(dir, f), TITLES[f], { flag: 'wx' });
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+    }
+  }
+  await fs.mkdir(path.join(dir, 'reports'), { recursive: true });
+  await fs.mkdir(path.join(dir, '.sessions'), { recursive: true });
+  return { created, dir };
 }
 
 export async function createSession(slate, sessionId, pid) {

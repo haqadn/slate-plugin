@@ -123,3 +123,19 @@ test('listSlates: newest session activity first; folder mtime when there are no 
   assert.ok(Math.abs(list[1].lastUsed - t(30000).getTime()) < 2000);
   assert.deepEqual(await listSlates(path.join(home, 'missing')), []);
 });
+
+test('createSlate repairs a partial slate and tolerates callers at once', async () => {
+  const home = await tmp();
+  const partial = path.join(home, 'half');
+  await fs.mkdir(partial); // a crash after the folder, before the rest
+  await fs.writeFile(path.join(partial, 'facts.md'), '# Facts\n- [F1 t1] keep\n');
+  assert.deepEqual(await createSlate(home, 'half'), { created: false, dir: partial });
+  assert.ok((await fs.stat(path.join(partial, 'reports'))).isDirectory());
+  assert.ok((await fs.stat(path.join(partial, '.sessions'))).isDirectory());
+  assert.equal(await fs.readFile(path.join(partial, 'instructions.md'), 'utf8'), '# Instructions\n');
+  assert.equal(await fs.readFile(path.join(partial, 'facts.md'), 'utf8'), '# Facts\n- [F1 t1] keep\n');
+
+  const all = await Promise.all(Array.from({ length: 6 }, () => createSlate(home, 'race')));
+  assert.equal(all.filter((r) => r.created).length, 1);
+  assert.ok((await fs.stat(path.join(home, 'race', '.sessions'))).isDirectory());
+});
