@@ -1061,3 +1061,11 @@ test('SessionStart startup never sweeps its own session', async () => {
   await handle('SessionStart', start(id, root, 'startup'), env);
   assert.equal(await exists(dir), true);
 });
+
+test('PreToolUse access: Glob with an escaping pattern, and a padded outside path, get no decision', async () => {
+  const { root, env, id } = await activeSession();
+  const slate = path.join(root, 'topic');
+  assert.deepEqual(await verdict(env, access(id, root, 'Glob', { pattern: '*.md', path: slate })), ALLOW);
+  assert.equal(await verdict(env, access(id, root, 'Glob', { pattern: '/etc/*', path: slate })), null);
+  assert.equal(await verdict(env, access(id, root, 'Read', { file_path: ' /etc/passwd' })), null);
+});

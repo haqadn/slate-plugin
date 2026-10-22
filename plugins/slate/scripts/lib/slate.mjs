@@ -190,11 +190,21 @@ export function slateAccess(toolName, toolInput, sessionDir) {
   const key = toolName === 'Read' || writes ? 'file_path' : toolName === 'Grep' || toolName === 'Glob' ? 'path' : null;
   const given = key && toolInput?.[key];
   if (typeof given !== 'string' || given === '') return null;
+  // Claude Code trims the path; a relative one would resolve against this process's cwd, not its own.
+  const trimmed = given.trim();
+  if (!path.isAbsolute(trimmed)) return null;
+  // Glob searches from an absolute pattern's own folder and ignores `path`; `~` and `..` leave it too.
+  if (toolName === 'Glob') {
+    const pattern = toolInput.pattern;
+    if (typeof pattern === 'string' && (path.isAbsolute(pattern) || pattern.trim().startsWith('~')
+      || pattern.split(/[\\/]/).includes('..'))) return null;
+  }
   const slate = slateOf(sessionDir);
-  const target = path.resolve(given);
+  const target = path.resolve(trimmed);
   const real = realish(target);
   if (real === null) return null;
-  const base = writes ? path.join(slate, 'reports') : slate;
-  const roots = [path.resolve(base), realish(path.resolve(base))].filter(Boolean);
+  // Resolve the slate, then append reports: a `reports` that is itself a symlink stays outside.
+  const realSlate = realish(slate);
+  const roots = [slate, realSlate].filter(Boolean).map((r) => (writes ? path.join(r, 'reports') : r));
   return roots.some((r) => under(real, r)) ? 'allow' : null;
 }

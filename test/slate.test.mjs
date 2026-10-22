@@ -189,3 +189,42 @@ test('slateAccess: unit checks', async () => {
   assert.equal(slateAccess('Glob', { path: 5 }, dir), null);
   assert.equal(slateAccess('Bash', { file_path: slate }, dir), null);
 });
+
+test('slateAccess: Glob patterns that leave the path folder get no decision', async () => {
+  const home = await tmp();
+  const dir = await aged(home, 's', 0);
+  const slate = slateOf(dir);
+  assert.equal(slateAccess('Glob', { pattern: '*.md', path: slate }, dir), 'allow');
+  assert.equal(slateAccess('Glob', { pattern: '**/*.md', path: slate }, dir), 'allow');
+  for (const pattern of ['/etc/*', `${os.homedir()}/.ssh/*`, '~/.ssh/*', '~', '../*', 'a/../../*', '..\\x']) {
+    assert.equal(slateAccess('Glob', { pattern, path: slate }, dir), null, pattern);
+  }
+});
+
+test('slateAccess: reports/ as a symlink to an outside folder is not a write root', async () => {
+  const home = await tmp();
+  const dir = await aged(home, 's', 0);
+  const slate = slateOf(dir);
+  const outside = await tmp();
+  await fs.rm(path.join(slate, 'reports'), { recursive: true });
+  await fs.symlink(outside, path.join(slate, 'reports'));
+  assert.equal(slateAccess('Write', { file_path: path.join(outside, 'x.md') }, dir), null);
+  assert.equal(slateAccess('Write', { file_path: path.join(slate, 'reports', 'x.md') }, dir), null);
+  assert.equal(slateAccess('Read', { file_path: path.join(slate, 'reports', 'x.md') }, dir), null);
+});
+
+test('slateAccess: paths are trimmed and must be absolute', async () => {
+  const home = await tmp();
+  const dir = await aged(home, 's', 0);
+  const slate = slateOf(dir);
+  const was = process.cwd();
+  process.chdir(slate);
+  try {
+    assert.equal(slateAccess('Read', { file_path: ' /etc/passwd' }, dir), null);
+    assert.equal(slateAccess('Read', { file_path: 'facts.md' }, dir), null);
+    assert.equal(slateAccess('Read', { file_path: ' ' + path.join(slate, 'facts.md') + ' ' }, dir), 'allow');
+    assert.equal(slateAccess('Read', { file_path: ' ' + path.join(slate, '..', 'x') + '\n' }, dir), null);
+  } finally {
+    process.chdir(was);
+  }
+});
