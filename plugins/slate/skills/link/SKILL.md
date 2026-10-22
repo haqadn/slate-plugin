@@ -15,6 +15,6 @@ Pick the slate name:
 Then run `node "${CLAUDE_PLUGIN_ROOT}/scripts/slate.mjs" link "${CLAUDE_SESSION_ID}" '<name>'` with Bash. Pass the name as typed, in single quotes (double quotes would expand `$(…)` or backticks before the CLI validates the name).
 
 The first line of its output is the status:
-- `linked`, `already-linked` or `switched`: reply with one line saying so, then follow the slate rules printed after it for the rest of this session.
+- `linked`, `already-linked` or `switched`: reply with one line saying so, and nothing else: don't restate the rules. Follow the slate rules printed after it for the rest of this session.
 - `confirm-create <name>` (maybe with `closest <existing>`): ask yes/no with AskUserQuestion whether to create a new slate with that name, naming the closest existing slate when there is one. On yes, rerun the same command with `--create` added.
 - `error …`: tell the user the message and ask for another name.

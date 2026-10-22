@@ -327,6 +327,153 @@ A Python `pty` script ran at 120×40 in a fresh temp dir with `--plugin-dir <rep
   - Bash `grep` was denied under `acceptEdits`, and the agent didn't try the Grep tool.
   - It answered correctly and wrote its report.
 
+## Shared slates (2026-10-22)
+
+`node test/live/acceptance.mjs --live --out <results.json>` on branch `feat/shared-slates`, with Claude Code **2.1.308**.
+
+**Result: 27 / 28 (run 3).** Every check passes except 3c. B's offload agent ran Bash `grep` on the slate's `reports/` once, and the default mode denied it. The agent then found the report through `offloads.md` and read it. Closing 3c needs a ruling: see "Open: Bash on slate paths" below.
+
+| Run | Checks | Cost A / B | Changed after the run |
+|---|---|---|---|
+| 1 | 23 / 27 | $0.60 / $0.42 | **Product:** offload.md and rules.md now keep Bash off slate paths and send readers to `offloads.md` for reports. **Script:** check 1 is now timed from the transcript, and the substitution check reads only the skill message. |
+| 2 | 23 / 27 | $0.70 / $0.51 | **Product:** offload.md drops the "check the report path first" step, and the link reply is one line that doesn't restate the rules. **Script:** B became one long-lived session, and check 3 was split into 3a–3c. |
+| 3 | **27 / 28** | $0.71 / $0.22 | Recorded below. |
+
+Costs are the main sessions only; curator runs aren't captured.
+
+### Setup
+
+- **SLATE_HOME** is a fresh `<tmp>/slate-home-*`. The script pre-creates the slate `accept` with `createSlate`.
+- **Both sessions** run with `--plugin-dir <repo>/plugins/slate --plugin-dir <probe> --model sonnet --setting-sources project,local --output-format stream-json --verbose`.
+  - There's no `--permission-mode`, so both run in the default mode.
+  - Env is limited to `HOME USER LOGNAME PATH SHELL TERM LANG TMPDIR`, plus `SLATE_HOME`.
+- **Guard:** each turn's stream-json `init` must list exactly one `slate` plugin, at this checkout's path, and `permissionMode: default`; otherwise the run stops. All 9 turns passed, so the installed plugin (old code, in the main checkout) never loaded.
+- **A** works in `<tmp>/slate-acc-*`, the 200-file fake repo. Each turn is its own `-p` run (`--resume` after the first), and the script waits for A's curator between turns.
+- **B** works in `<tmp>/slate-acc-b-*`, which holds only a README.
+  - `/slate:link accept` runs in its own `-p`. Turns 2–4 then run in one long-lived `-p --input-format stream-json --resume` session.
+  - Like an interactive peer, B gets no SessionStart between turns, so each change line shows what A changed since B's last prompt.
+  - Run 2 resumed B on every turn. SessionStart then re-injected memory that already had A's pnpm item, so the change line was rightly empty.
+  - A streamed turn ends once its result is in, every agent it launched has stopped (per the probe), a later result has followed any such stop, and stdout has been quiet for 3 s.
+
+| # | A | B, and when it starts |
+|---|---|---|
+| 1 | `/slate:link accept` | `/slate:link accept`, at the same time |
+| 2 | `For this project, always give package-manager commands using npm. Also: the staging host is stg-7.internal.` | `For this topic, release branches are always named release/<version>; the current one is release/2.4. Reply in one line.`, when A's turn 2 ends |
+| 3 | `Find every file that mentions "TODO(perf)" and summarize the patterns.` | `Another session on this slate wrote a TODO(perf) report. Which file does it mark "!!"? Reply in one line.`, when A's turn 3 ends |
+| 4 | `Change of plan: this project uses pnpm now.` | `Which package manager does this topic use? Reply in one line.`, once A's turn 4 is curated |
+| 5 | `What command installs lodash? Reply with only the command.` | |
+
+A's old turn 6, which wrote `CONTRIBUTING.md`, is gone because it wrote into the project and check 4 forbids that. Old checks 5 and 9 went with it.
+
+### Checks (run 3)
+
+| # | Check | Result | Evidence |
+|---|---|---|---|
+| G | Every turn: one slate plugin (this checkout's), default mode | PASS | 9 of 9 turns |
+| L1 | `/slate:link accept` linked each session by its own ID and replied in one line | PASS | `.sessions/` holds exactly A and B. Both replied "Linked to slate \`accept\`." |
+| L2 | The skill text has `${CLAUDE_SESSION_ID}`, `${CLAUDE_PLUGIN_ROOT}` and `$ARGUMENTS` substituted, and its Bash link call ran | PASS | The skill message reads ``it is `accept` `` and `node "<repo>/plugins/slate/scripts/slate.mjs" link "<own id>" '<name>'`. The call returned `linked`, with no permission denial. |
+| 1 | After A's pnpm turn is curated, B's next UserPromptSubmit output has `+I` with pnpm | PASS | A logged `t3 ok … replace I1 I3` at 19:47:20.871. B's turn 4 at 19:47:21.991 got `slate: +I3 For this project, always give package-manager commands using pnpm. · retired I1`. B answered "pnpm …". |
+| 2a | A's and B's curators overlapped | PASS | 3 pairs overlapped, the longest by 3.9 s: A t3 ran 19:47:11.2–20.5 and B t2 ran 19:47:13.3–17.2. Starts come from `ps`; ends are the curator.log lines. |
+| 2b | Every item either session added is present with its session tag, IDs are unique, and every ID comes from a logged add | PASS | A added I1, F1 and I3; B added I2 and F2. That's 5 IDs, with no duplicate. |
+| 3a | A's offload wrote `reports/todo-perf-scan.md`, and the Write wasn't denied | PASS | |
+| 3b | B read A's report with Read, and the read wasn't denied | PASS | B's agent read `offloads.md`, then `todo-perf-scan.md`. |
+| 3c | No call on a slate path was denied in either session, Bash included | **FAIL** | B's agent ran `grep -rl "TODO(perf)" <slate>/reports/`, which got "grep in … was blocked. For security, Claude Code may only search … the allowed working directories". A had no denial. |
+| 4 | Nothing was written under either cwd, nor under `~/slate` | PASS | A's 217 entries and B's folder are unchanged. `~/slate` was absent before and after. |
+| J | Curator `--json-schema` change lists came back and were applied | PASS | All 8 curator runs used `-p … --json-schema`. A logged 5 `ok` lines with 3 adds, and B logged 3 `ok` lines with 2 adds. No retry, no "no change list". |
+
+The earlier checks, adapted to the new paths, all pass:
+
+| Check | Run 3 |
+|---|---|
+| A's turn 3 used `slate:offload` | PASS |
+| No A main-thread `tool_result` over 2,000 chars | PASS (1,754) |
+| No harness message over 2,000 chars | PASS (A's task-notification: 1,258) |
+| No Agent brief from turn 4 on has an npm command | PASS (none) |
+| No npm in `instructions.md`, `assumptions.md` or either `now.md` | PASS |
+| `superseded.md` mentions npm | PASS |
+| A's turn-5 answer contains pnpm | PASS (`pnpm add lodash`) |
+| `stg-7.internal` is in live memory | PASS (`facts.md`) |
+| `curator.log` has no `partial` or `error` line, in either session (was `restored\|error`) | PASS |
+| Every user turn got the change line | PASS (A: 2–5; B: 2–4) |
+| Only user prompts counted as turns | PASS (A 4, B 3; A's task-notification not counted) |
+| An `ok` line for every slate turn | PASS |
+| SubagentStop shape | PASS (4 stops: A 2, B 2) |
+| Returns over 800 chars sent back once | PASS (A 1,322 → 502; B 842 → 405) |
+| One `offloads.md` entry per agent, tagged `t<turn>@<session8>` | PASS |
+| `queue/` holds at most the newest turn | PASS |
+| Hand-back cap | PASS (no hand-backs) |
+
+### Product fixes made during the run
+
+1. **Agents used Bash on slate paths.** Fixed in `agents/offload.md` and `rules.md`. Tests: `test/packaging.test.mjs` and `test/inject.test.mjs`.
+   - Cause: 2.1.308 has no Grep or Glob tool, so models search with Bash, and the default mode denies Bash outside the working folders.
+   - In runs 1 and 2, A's agent sent `grep <project>; ls <slate>/reports` as one call to check the report path was free. The whole call was denied, so the agent decided Bash was off and wrote a "scan blocked" report.
+   - offload.md now says to use only Read and Write on slate files, because a Bash call naming a slate path is denied whole. It drops the pre-check: Write won't replace an unread file, so it guards on its own. It also says past reports are found through `offloads.md`.
+   - rules.md now says "Bash there is denied" and that `offloads.md` lists report paths. It's 1,692 chars with 120-char paths; to fit, three phrases were shortened with no change in meaning.
+2. **The link reply restated the rules.** Fixed in `skills/link/SKILL.md` (test: `test/packaging.test.mjs`). In run 2 both sessions replied with the rules as bullets. The skill now says to reply with one line and nothing else.
+
+### Open: Bash on slate paths
+
+The probes ran in haiku, in the default mode, as `-p` runs, at about $0.01 in all.
+
+| Probe | Result |
+|---|---|
+| Tool list | Bash, Read, Write and Edit; no Grep or Glob |
+| `grep -rn 'TODO(perf)' <project>` | allowed |
+| `find <project> -name '*.rs'` | allowed |
+| `ls <slate>/reports` | denied |
+
+- The permission hook matches `Read|Write|Edit|Grep|Glob`, so on 2.1.308 its Grep and Glob branches never run. Listing or searching the slate always goes through Bash.
+- Even after the instruction fixes, agents still try Bash first: that's the one denial in run 3. Recovery through `offloads.md` takes about 2 s. In an interactive session, it would be one permission prompt.
+
+Options:
+
+- **a)** A `PermissionRequest` hook answers with `updatedPermissions: addDirectories` for the slate. Then Claude Code's own read-only Bash check covers it. In 2.1.308, only PermissionRequest accepts `updatedPermissions`, and an `allow` also approves the call that asked, so the hook must still judge that Bash command. Separately, in `acceptEdits` mode the whole slate becomes editable without a prompt.
+- **b)** A PreToolUse allow-list: read-only Bash (`ls`, `grep`, `cat`, `head`) whose every path is inside the slate. That needs our own shell parsing and a security review.
+- **c)** Keep it as is: the instructions plus `offloads.md`, accepting an occasional prompt.
+
+### Run 3: memory and logs
+
+```
+# Instructions
+- [I2 t1@b2d166d7] Release branches are always named release/<version>.
+- [I3 t3@055db07f] For this project, always give package-manager commands using pnpm.
+
+# Facts
+- [F1 t1@055db07f] The staging host is stg-7.internal. (user)
+- [F2 t1@b2d166d7] The current release branch is release/2.4. (user)
+
+# Superseded
+- [I1 t1@055db07f retired t3@055db07f] For this project, always give package-manager commands using npm. (reason: user switched project to pnpm)
+```
+
+`assumptions.md` stayed empty. A's `now.md` holds a Goal / Focus / Open / Next for the TODO(perf) summary. B's `now.md` stayed empty, because its curator applied nothing for t2 and t3 (not asserted).
+
+```
+A  19:46:18.419Z t1 ok: attempt 1: applied 0:add I1, 1:add F1
+B  19:46:21.623Z t1 ok: attempt 1: applied 0:add I2, 1:add F2
+A  19:46:35.789Z t2 ok: attempt 1: applied 0:now
+A  19:47:04.489Z t2 ok: attempt 1: applied 0:now            (continuation: the agent's result)
+B  19:47:17.490Z t2 ok: attempt 1: applied nothing
+A  19:47:20.871Z t3 ok: attempt 1: applied 0:replace I1 I3, 1:now
+B  19:47:28.395Z t3 ok: attempt 1: applied nothing
+A  19:47:32.535Z t4 ok: attempt 1: applied nothing
+```
+
+`offloads.md` has two entries: `## t2@055db07f … a0c43b30731e31b27` (A's scan, whose return names `reports/todo-perf-scan.md`) and `## t2@b2d166d7 … aa8844c0efe81b862` (B's lookup).
+
+### Run 3: timings
+
+| Turn | A `-p` | A curator wait | B turn |
+|---|---|---|---|
+| 1 | 5.9 s | 0.8 s | 5.7 s |
+| 2 | 3.4 s | 5.3 s | 4.5 s |
+| 3 | 33.2 s | 12.8 s | 23.5 s |
+| 4 | 6.0 s | 10.5 s | 4.5 s |
+| 5 | 3.8 s | 8.3 s | |
+
+All curator children ran `~/.local/bin/claude` (executable `~/.local/share/claude/versions/2.1.308`) with `-p … --model sonnet --json-schema`.
+
 ## Earlier rounds
 
 **Round 0:** 5 turns and 8 checks, all passed. The review then found two gaps:
@@ -368,6 +515,14 @@ Removed after recording these results:
 - `<tmp>/slate-acc-s48f4J`, `<tmp>/slate-acc-oFCWny`, `<tmp>/slate-probe-Aai8Ot`, `<tmp>/slate-probe-YTY6Qx`
 - `~/.claude/projects/-private-var-folders-…-T-slate-acc-s48f4J` and `…-slate-acc-oFCWny`
 - `/private/tmp/claude-<uid>/-private-var-folders-…-T-slate-acc-s48f4J` and `…-slate-acc-oFCWny`
+
+**Shared slates runs (2026-10-22): left in place** for the same reason. Remove by hand:
+
+- **Run 1:** `<tmp>/slate-home-Cu1lTy`, `<tmp>/slate-acc-UQjnE4`, `<tmp>/slate-acc-b-RyqUdK` and `<tmp>/slate-probe-yzQuOP`
+- **Run 2:** `<tmp>/slate-home-g3f0mU`, `<tmp>/slate-acc-223Gzw`, `<tmp>/slate-acc-b-xQ0beI` and `<tmp>/slate-probe-09CzMb`
+- **Run 3:** `<tmp>/slate-home-F0LVBs`, `<tmp>/slate-acc-FWaFq2`, `<tmp>/slate-acc-b-f05W0q` and `<tmp>/slate-probe-SQMjxs`
+- `~/.claude/projects/-private-var-folders-…-T-slate-acc-{UQjnE4,223Gzw,FWaFq2}` and `…-slate-acc-b-{RyqUdK,xQ0beI,f05W0q}`
+- `~/.claude/projects/-private-tmp-claude-<uid>-…-scratchpad-live-streamprobe-cwd`, from the stream-json probe. The Bash probes kept no transcript.
 
 Not removed, because they fall outside the cleanup ruling. All are harmless.
 

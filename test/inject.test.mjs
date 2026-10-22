@@ -42,6 +42,10 @@ test('rules.md carries the main-thread rules', async () => {
     'memory still updating', 'slate warning', 'Task line', 'replaces', 'offloads.md', 'transcript path']) {
     assert.ok(raw.includes(s), `rules.md lacks ${JSON.stringify(s)}`);
   }
+  // Recent Claude Code has no Grep or Glob tool, and Bash on slate paths is denied in the default
+  // permission mode (live acceptance, 2.1.308): reports are found through offloads.md and read with Read.
+  assert.match(raw, /offloads\.md[^\n]*report and transcript paths/, 'offloads.md is how a session finds a report');
+  assert.match(raw, /read-only for you[^\n]*Bash there is denied/, 'slate files are read with Read, never Bash');
   assert.ok(!raw.includes('{{dir}}'));
   assert.ok(!raw.includes('conversation/'), 'turn files are a curator queue, not for the main thread');
   assert.ok(raw.indexOf('{{slate}}') < 50 && raw.indexOf('{{session}}') < 100, 'both folders named at the top');
