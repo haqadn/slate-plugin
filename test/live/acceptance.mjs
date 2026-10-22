@@ -582,18 +582,25 @@ export function curatorOutputs(dir) {
   }).sort((a, b) => a.at.localeCompare(b.at));
 }
 
-// Items (live or retired) whose text holds `needle`: ID → text.
-export function itemsHolding(texts, needle) {
+// What B's "!!" turn depends on: an item about the TODO(perf) report it asks about, or about the
+// file the report marks "!!".
+const ANCHORS = ['TODO(perf)', 'pool.rs'];
+
+// Items (live or retired) whose text holds any of `needles`, ignoring case: ID → text.
+export function itemsHolding(texts, needles) {
   const out = new Map();
+  const lower = needles.map((n) => n.toLowerCase());
   for (const t of texts) {
     const p = parseMemoryFile(t ?? '');
-    for (const x of [...p.items, ...p.retired]) if (x.text.includes(needle)) out.set(x.id, x.text);
+    for (const x of [...p.items, ...p.retired]) {
+      if (lower.some((n) => x.text.toLowerCase().includes(n))) out.set(x.id, x.text);
+    }
   }
   return out;
 }
 
-// For one turn's change lists: the items holding the needle that were added (per curator.log)
-// before each list's curator run started, and which of them the lists named in `relevant`.
+// For one turn's change lists: the anchor items that were added (per curator.log) before each
+// list's curator run started, and which of them the lists named in `relevant`.
 export function relevanceFor(lists, holding, addedAt) {
   const norm = (id) => String(id).trim().replace(/^([IAF])0*(\d+)$/, '$1$2');
   const known = new Set();
@@ -605,6 +612,41 @@ export function relevanceFor(lists, holding, addedAt) {
     before.filter((id) => rel.has(id)).forEach((id) => named.add(id));
   }
   return { known: [...known], named: [...named], missing: [...known].filter((id) => !named.has(id)) };
+}
+
+// T1a and T1b, from a run's saved data, so --recheck can redo them. B's change lists for the "!!" turn
+// must name in `relevant` every anchor item added before that curator run started, and usage.json
+// must count each one. With no anchor item there is nothing to check, and both fail. B's slate turn
+// is its index in B's turns, since the link turn isn't one.
+export function relevanceChecks({ memory, topics = {}, usage, outputs, bId, bTurns, logs }) {
+  const lists = outputs.filter((o) => Array.isArray(o.list?.ops));
+  const relevantIds = [...new Set(lists.flatMap((o) => o.list.relevant ?? []))];
+  const bangTurn = bTurns.findIndex((t) => t.prompt === B_PROMPTS[2]);
+  const bangLists = lists.filter((o) => o.session === bId && o.turn === bangTurn);
+  const addedAt = new Map(logs.flatMap((text) => curatorLog(text).flatMap((l) => l.adds.map((id) => [id, l.at]))));
+  const holding = itemsHolding([...SHARED_FILES.map((f) => memory[f]), ...Object.values(topics)], ANCHORS);
+  const bang = relevanceFor(bangLists, holding, addedAt);
+  const live = new Set(memoryIds(memory, topics).filter((x) => !x.retired).map((x) => x.id));
+  const uncounted = bang.known.filter((id) => !live.has(id) || !(usage?.[id]?.count >= 1));
+  const none = 'none: nothing to check, so this fails';
+  const at = (id) => (addedAt.has(id) ? iso(addedAt.get(id)) : 'no logged add');
+  return [
+    {
+      name: `T1a. B's change list for the "!!" turn names in \`relevant\` every item mentioning ${ANCHORS.join(' or ')} added before its curator ran (at least one)`,
+      pass: bangLists.length > 0 && bang.known.length > 0 && bang.missing.length === 0,
+      detail: `B slate turn ${bangTurn}: ${bangLists.length} change list(s) ${bangLists.map((o) => `started ${o.started} relevant ${JSON.stringify(o.list.relevant)}`).join('; ') || '(none recorded with session and turn)'}; `
+        + `anchor items: ${[...holding].map(([id, t]) => `${id} added ${at(id)} (${t.slice(0, 50)}…)`).join('; ') || 'none'}; `
+        + `added before its curator: ${bang.known.join(', ') || none}; named ${bang.named.join(', ') || 'none'}; missing ${bang.missing.join(', ') || 'none'}; `
+        + `all change lists: ${lists.length}, ${lists.filter((o) => (o.list.relevant ?? []).length).length} with relevant IDs (${relevantIds.join(', ') || 'none'})`,
+      soft: false,
+    },
+    {
+      name: 'T1b. usage.json counts each of those items as relevant (count ≥ 1)',
+      pass: bang.known.length > 0 && uncounted.length === 0,
+      detail: bang.known.length ? bang.known.map((id) => `${id}: ${live.has(id) ? JSON.stringify(usage?.[id] ?? null) : 'not live'}`).join('; ') : none,
+      soft: false,
+    },
+  ];
 }
 
 // Each slate:offload stop the probe saw, whether it was over the limit and whether it was sent back,
@@ -728,20 +770,31 @@ function printChecks(checks) {
 }
 
 // Re-evaluates a saved run (`--recheck <results.json> [--out <file>]`) where the saved data allows:
-// the denial checks (3c and its note). Every other check is carried over as recorded. No model calls.
+// the denial checks (3c and its note) and the relevance checks (T1a, T1b; an older run's T1 too).
+// Every other check is carried over as recorded. No model calls.
 function recheck(file) {
   const r = JSON.parse(fs.readFileSync(file, 'utf8'));
-  const fresh = denialChecks({ A: r.A.denials, B: r.B.denials }, r.slate, r.home);
-  const stale = (c) => c.name.startsWith('3c.') || c.name.startsWith('note: ');
-  const at = r.checks.findIndex(stale);
-  const before = r.checks.slice(0, at < 0 ? r.checks.length : at).filter((c) => !stale(c));
-  const rest = r.checks.slice(before.length).filter((c) => !stale(c));
-  const replaced = r.checks.filter(stale);
-  r.checks = [...before, ...fresh, ...rest];
-  r.rechecked = { from: file, at: new Date().toISOString(), replaced: replaced.map((c) => c.name), with: fresh.map((c) => c.name) };
+  const replaced = [];
+  const added = [];
+  // Puts `fresh` where the first stale check was (or at the end), and drops the other stale ones.
+  const swap = (stale, fresh) => {
+    const at = r.checks.findIndex(stale);
+    replaced.push(...r.checks.filter(stale).map((c) => c.name));
+    added.push(...fresh.map((c) => c.name));
+    const kept = r.checks.filter((c) => !stale(c));
+    const pos = at < 0 ? kept.length : r.checks.slice(0, at).filter((c) => !stale(c)).length;
+    r.checks = [...kept.slice(0, pos), ...fresh, ...kept.slice(pos)];
+  };
+  swap((c) => c.name.startsWith('3c.') || c.name.startsWith('note: other calls'), denialChecks({ A: r.A.denials, B: r.B.denials }, r.slate, r.home)
+    .filter((c) => c.name.startsWith('3c.') || c.name.startsWith('note: other calls')));
+  swap((c) => /^T1[ab]?\. /.test(c.name), relevanceChecks({
+    memory: r.memory, topics: r.topics ?? {}, usage: r.usage ?? null, outputs: r.curatorOutputs ?? [],
+    bId: r.B.id, bTurns: r.B.turns, logs: [r.A.curatorLog, r.B.curatorLog],
+  }));
+  r.rechecked = { from: file, at: new Date().toISOString(), replaced, with: added };
   const out = outArg >= 0 ? path.resolve(argv[outArg + 1]) : file.replace(/\.json$/, '.recheck.json');
   fs.writeFileSync(out, `${JSON.stringify(r, null, 2)}\n`);
-  console.log(`rechecked ${file}: replaced ${replaced.map((c) => JSON.stringify(c.name)).join(', ') || 'nothing'}`);
+  console.log(`rechecked ${file}: replaced ${replaced.map((n) => JSON.stringify(n)).join(', ') || 'nothing'}`);
   const { passed, total } = printChecks(r.checks);
   console.log(`\n${passed}/${total} checks passed (rechecked from saved outputs, no model calls)\nresults: ${out}`);
   process.exitCode = passed === total ? 0 : 1;
@@ -1055,18 +1108,9 @@ async function main() {
     ['A now.md', A.now], ['B now.md', B.now]]
     .filter(([, t]) => NPM.test(t ?? '')).map(([f]) => f);
 
-  // Relevance and usage: every change list the recorder kept, one per curator log line that ran
-  // the model to the end (ok, partial, retry); usage.json against the F and A items added.
+  // Relevance and usage: the change lists the recorder kept (T1a, T1b), and usage.json against the
+  // F and A items added (T2).
   const outputs = curatorOutputs(recorder.dir);
-  const lists = outputs.filter((o) => Array.isArray(o.list?.ops));
-  const relevantIds = [...new Set(lists.flatMap((o) => o.list.relevant ?? []))];
-  // B's "!!" turn: its answer names the file the report marks "!!", src/db/pool.rs. Its slate turn is
-  // its index in B.turns, since the link turn isn't one.
-  const bangTurn = B.turns.findIndex((t) => t.prompt === B_PROMPTS[2]);
-  const bangLists = lists.filter((o) => o.session === B.id && o.turn === bangTurn);
-  const addedAt = new Map([A, B].flatMap((s) => s.logLines.flatMap((l) => l.adds.map((id) => [id, l.at]))));
-  const holding = itemsHolding([...SHARED_FILES.map((f) => mem[f]), ...Object.values(topics)], 'pool.rs');
-  const bang = relevanceFor(bangLists, holding, addedAt);
   const usageText = readText(path.join(slate, 'usage.json'));
   let usage = null;
   try {
@@ -1075,7 +1119,7 @@ async function main() {
   const liveIds = new Set(ids.filter((x) => !x.retired).map((x) => x.id));
   const addedFA = [...new Set(added.map((x) => x.id).filter((id) => /^[FA]/.test(id) && liveIds.has(id)))];
   const notInUsage = addedFA.filter((id) => !usage || !(id in usage));
-  const uncounted = bang.known.filter((id) => liveIds.has(id) && !(usage?.[id]?.count >= 1));
+  const relevance = relevanceChecks({ memory: mem, topics, usage, outputs, bId: B.id, bTurns: B.turns, logs: [A.log, B.log] });
   const SHAPE = ['agent_type', 'last_assistant_message', 'stop_hook_active', 'session_id', 'agent_id'];
   const offloadStops = [...A.offloadStops, ...B.offloadStops];
   const noChange = (s) => s.userTurns.filter((n) => !s.a.hookContext.some((h) => h.turn === n && h.event === 'UserPromptSubmit' && h.text.includes(REMINDER)));
@@ -1155,12 +1199,7 @@ async function main() {
       both((s) => `${s.queue.join(', ') || 'empty'} (newest turn ${s.slateTurns})`)],
     ['every slate:offload hand-back over 800 chars was denied exactly once', [A, B].every((s) => s.hb.every((h) => h.ok)),
       `${[A, B].flatMap((s) => s.hb.map((h) => `${s.name} ${h.id.slice(0, 6)}: ${h.calls.map((c) => `${c.chars ?? '?'} chars ${c.denied ? 'denied' : c.error ? 'error' : 'ok'}`).join(' → ')}`)).join('; ') || 'no hand-backs'}; probe saw ${preToolUses.filter((x) => HANDBACK_TOOLS.includes(x.tool_name)).length} hand-back PreToolUse(s)`],
-    ['T1a. B\'s change list for the "!!" turn names, in `relevant`, every item holding pool.rs added before its curator ran',
-      bangLists.length > 0 && bang.missing.length === 0,
-      `B slate turn ${bangTurn}: ${bangLists.length} change list(s), relevant ${bangLists.map((o) => JSON.stringify(o.list.relevant)).join(' ') || 'none'}; items holding pool.rs: ${[...holding].map(([id, t]) => `${id} (${t.slice(0, 60)}…)`).join('; ') || 'none'}; added before: ${bang.known.join(', ') || 'none (nothing to name)'}; missing ${bang.missing.join(', ') || 'none'}; all change lists: ${lists.length}, ${lists.filter((o) => (o.list.relevant ?? []).length).length} with relevant IDs (${relevantIds.join(', ') || 'none'})`],
-    ['T1b. usage.json counts that item as relevant (count ≥ 1)',
-      bang.known.length === 0 || uncounted.length === 0,
-      `${bang.known.map((id) => `${id}: ${JSON.stringify(usage?.[id] ?? null)}`).join('; ') || 'no item to count'}`],
+    ...relevance.map((c) => [c.name, c.pass, c.detail, c.soft]),
     ['T2. usage.json exists and holds every F and A item added that is still live',
       usage !== null && addedFA.length > 0 && notInUsage.length === 0,
       `usage.json ${usage === null ? 'missing or unreadable' : `holds ${Object.keys(usage).join(', ') || 'nothing'}`}; live F/A added: ${addedFA.join(', ') || 'none'}; missing: ${notInUsage.join(', ') || 'none'}`],

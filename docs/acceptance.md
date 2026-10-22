@@ -482,13 +482,14 @@ All curator children ran `~/.local/bin/claude` (executable `~/.local/share/claud
 
 Same command and setup as the shared-slates runs, on Claude Code **2.1.308**, after topic files and selective curation landed.
 
-**Result: 31 / 32 on run 3, after review fix round 1.** Run 2 passed 31 / 31 before that round. In run 3, check 3b failed: B answered from the offload summary in `offloads.md` and never opened the report (see "Fix round 1"). The reorganize tool's smoke runs against a real model passed accounting.
+**Result: 31 / 32 on run 3 (rechecked), after review fix rounds 1 and 2.** Run 2 passed 31 / 31 before those rounds. In run 3, check 3b failed: B answered from the offload summary in `offloads.md` and never opened the report (see "Fix round 1"). The reorganize tool's smoke runs against a real model passed accounting.
 
 | Run | Checks | Cost A / B / resumed A | Changed after the run |
 |---|---|---|---|
 | 1 | 30 / 31 | $0.65 / $0.22 / $0.19 | **Script only:** T3 read the memory block from the transcript, where the harness didn't add it (see below). It now reads the block the hook returned, from stream-json. |
 | 2 | **31 / 31** | $0.72 / $0.20 / $0.22 | The T3 note's wording (informational) now reports whether the block matched the last one already in the transcript. |
-| 3 (fix round 1) | 31 / 32 | $0.69 / $0.20 / $0.20 | none: one rerun was allowed |
+| 3 (fix round 1) | 31 / 32 | $0.69 / $0.20 / $0.20 | **Script only:** T1a and T1b passed with nothing to check, since no item held `pool.rs`. They now anchor on `TODO(perf)` too, and fail when no anchor item exists. |
+| 3, rechecked (fix round 2) | **31 / 32** | none | `--recheck` redid T1a and T1b from run 3's saved outputs, with no model calls. Both now assert F3 and pass. 3b still fails. |
 
 Costs are the main sessions only. The reorganize smoke run cost $0.05 (dry run) and $0.02 (real run).
 
@@ -556,7 +557,11 @@ A  21:05:49.425Z t4 ok: attempt 1: applied nothing
 - **`keep` op, reorganize mode only.** It leaves a key item in place, records its `home` and stamps it. The prompt asks for one per item left in a key file. The tool reports any key item still without a home.
 - **Stricter reorganize retires.** They take only F and A items. The reason must name an item of the same type, numbered higher, that is still live after the apply, whatever the op order.
 - **`curator-rules.md`:** before deciding, the curator reads every topic file whose title or summary matches the turn's subject, plus `topics/general.md`. `relevant` lists every item the message or answer used or depends on.
-- **Live script:** T1 (`relevant` present) is replaced. T1a checks that B's change list for the "!!" turn names every item holding `pool.rs` that was added before its curator ran. T1b checks that `usage.json` counts it. The recorder now saves each run's session, turn and start time.
+- **Live script:** T1 (`relevant` present) is replaced. The recorder now saves each run's session, turn and start time.
+  - T1a checks that B's change list for the "!!" turn names, in `relevant`, every anchor item added before its curator ran. An anchor item is one mentioning `TODO(perf)` or `pool.rs`.
+  - T1b checks that `usage.json` counts each anchor item (count ≥ 1).
+  - Both fail when no anchor item exists. Fix round 2 added `TODO(perf)` and that rule; at first only `pool.rs` counted, and no anchor meant a pass.
+  - `--recheck` now redoes T1a and T1b from saved outputs.
 
 **Run 3 (`fix1/run3.json`):**
 - 31 / 32 checks passed. 3b failed with "reads: none".
@@ -564,8 +569,14 @@ A  21:05:49.425Z t4 ok: attempt 1: applied nothing
   - It then read `offloads.md`, whose entry for A's offload holds the return text naming `src/db/pool.rs`.
   - B answered correctly from that, and said so: "per the offload summary in `offloads.md` … that answer is secondhand". It never Read the report.
   - The product files B's session relies on (`rules.md` and `offload.md`) didn't change in this round. B did read the report in shared-slates run 3 and in this section's runs 1 and 2.
-- **T1a and T1b passed, but trivially.** No item held `pool.rs`: A's curator summarized the scan as F3, which lists categories, not files.
-- **The tightened rules did change behavior.** B's "!!" change list returned `relevant: ["F3"]`, the TODO(perf) topic fact, and `usage.json` shows F3 at count 1. In runs 1 and 2, all 16 change lists had an empty `relevant`. In run 3, 1 of 7 named an ID.
+- **T1a and T1b, rechecked, PASS on F3.**
+  - The anchor item is F3 in `topics/todo-perf.md`: "12 files mention "TODO(perf)", one per file, …". A's curator added it at 21:28:14.699.
+  - B's curator for the "!!" turn started at 21:28:20.772 and returned `relevant: ["F3"]`. `usage.json` shows F3 with `count: 1`.
+  - As first recorded, run 3 passed both with nothing to check, since no item held `pool.rs`.
+- **The tightened rules changed behavior.** In runs 1 and 2, all 16 change lists had an empty `relevant`. In run 3, 1 of 7 named an ID, and it's the item the "!!" answer depends on.
+- **The rechecked T1a fails when there's no anchor item**, on two saved outputs:
+  - Run 3 with every `TODO(perf)` replaced by `perf markers`: T1a and T1b both FAIL, "nothing to check, so this fails".
+  - Run 1's saved results, which have no anchor item and no session or turn on their change lists: both FAIL.
 - T2, T3 and every other check passed. `stg-7.internal` is in `facts.md`, and the topics were `general` and `todo-perf`.
 
 **Smoke run with the new prompt (`fix1/smoke/`):**
