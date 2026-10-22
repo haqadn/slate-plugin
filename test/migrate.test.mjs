@@ -78,6 +78,31 @@ test('migrates files byte-identically and leaves the source alone', async () => 
   assert.match(block, /The sky is blue/);
 });
 
+test('offloads.md report paths in the old folder, either spelling, point at the slate; transcript paths stay', async () => {
+  const { root, old, home } = await fixture();
+  // The old folder is reached through a symlink whose path is the tail of its real path, as with
+  // macOS's /var → /private/var, so it has two spellings on any OS, one inside the other.
+  const deep = path.join(root, 'deep', path.dirname(old));
+  await fs.mkdir(path.dirname(deep), { recursive: true });
+  await fs.rename(path.dirname(old), deep);
+  await fs.symlink(deep, path.dirname(old));
+  const given = old;
+  const real = await fs.realpath(old);
+  assert.ok(real.endsWith(given) && real !== given, real);
+  const transcript = path.join(root, '.claude', 'projects', '-old-project', ID, 'subagents', 'agent-a1.jsonl');
+  const entry = (n, report) => `## t${n}@82b3114c 2026-10-0${n}T10:00:00Z agent${n}\ntranscript: ${transcript}\n\n> Report: ${report}\n\n`;
+  const text = `# Offloads\n\n${entry(1, `${given}/reports/r1.md`)}${entry(2, `${real}/reports/r1.md (code, test, verify steps)`)}`
+    + `${entry(3, 'https://example.com/reports/42 and reports/r1.md')}`;
+  await fs.writeFile(path.join(old, 'offloads.md'), text);
+  const r = run(home, given, 'jetpack-seo');
+  assert.equal(r.status, 0, r.stderr);
+  const slate = path.join(home, 'jetpack-seo');
+  assert.equal(await fs.readFile(path.join(slate, 'offloads.md'), 'utf8'), `# Offloads\n\n${entry(1, `${slate}/reports/r1.md`)}`
+    + `${entry(2, `${slate}/reports/r1.md (code, test, verify steps)`)}${entry(3, 'https://example.com/reports/42 and reports/r1.md')}`);
+  assert.equal(await fs.readFile(path.join(old, 'offloads.md'), 'utf8'), text, 'source unchanged');
+  assert.match(r.stdout, /offloads\.md\s+3\s+3/);
+});
+
 test('refuses when the slate exists', async () => {
   const { old, home } = await fixture();
   assert.equal(run(home, old, 'jetpack-seo').status, 0);

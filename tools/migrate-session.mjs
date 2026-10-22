@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// One-off: copy an old per-project .slate/<session>/ folder into a shared slate.
+// One-off: copy an old per-project .slate/<session>/ folder into a shared slate. offloads.md's
+// report paths are pointed at the slate; everything else is copied byte for byte.
 // Usage: node tools/migrate-session.mjs <oldSessionDir> <name>   (honors SLATE_HOME)
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -53,6 +54,18 @@ const slate = slateDir(home, name);
 if (await fs.stat(slate).catch(() => null)) fail(`slate already exists: ${slate}`);
 const session = path.join(slate, '.sessions', path.basename(src));
 
+// offloads.md names each report by its absolute path in the old folder, which the user deletes once
+// migrated: point those at the slate's reports/, where they are copied. Both spellings of the old
+// folder count, as given and with symlinks resolved; one can be the tail of the other (macOS /var
+// and /private/var), so a match must start a path. Transcript paths, under ~/.claude, stay.
+const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const spellings = [...new Set([src, await fs.realpath(src)])].sort((a, b) => b.length - a.length);
+const OLD_REPORTS = new RegExp(`(?<![\\w./~-])(?:${spellings.map(escape).join('|')})/reports/`, 'g');
+async function copyOffloads(from, to) {
+  const text = await fs.readFile(from, 'utf8');
+  await fs.writeFile(to, text.replace(OLD_REPORTS, () => `${slate}/reports/`));
+}
+
 await createSlate(home, name);
 await fs.mkdir(session, { recursive: true });
 for (const [names, dest] of [[SHARED, slate], [SESSION, session]]) {
@@ -60,7 +73,8 @@ for (const [names, dest] of [[SHARED, slate], [SESSION, session]]) {
     const from = path.join(src, f);
     if (!(await fs.stat(from).catch(() => null))) continue;
     await fs.rm(path.join(dest, f), { recursive: true, force: true });
-    await fs.cp(from, path.join(dest, f), { recursive: true });
+    if (f === 'offloads.md') await copyOffloads(from, path.join(dest, f));
+    else await fs.cp(from, path.join(dest, f), { recursive: true });
     console.log(`${f.padEnd(16)} ${String(await count(from)).padStart(4)} ${String(await count(path.join(dest, f))).padStart(4)}`);
   }
 }
