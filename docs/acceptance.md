@@ -482,14 +482,15 @@ All curator children ran `~/.local/bin/claude` (executable `~/.local/share/claud
 
 Same command and setup as the shared-slates runs, on Claude Code **2.1.308**, after topic files and selective curation landed.
 
-**Result: 31 / 32 on run 3 (rechecked), after review fix rounds 1 and 2.** Run 2 passed 31 / 31 before those rounds. In run 3, check 3b failed: B answered from the offload summary in `offloads.md` and never opened the report (see "Fix round 1"). The reorganize tool's smoke runs against a real model passed accounting.
+**Result: 31 / 31 on run 3 (rechecked after the final review), with 3b as a note.** Run 2 passed 31 / 31 before the fix rounds. In run 3, B answered from the offload summary in `offloads.md` and never opened the report. By the controller's ruling that is a note, not a failure, because no slate Read, Write or Edit was denied (see "Fix round 1"). The reorganize tool's smoke runs against a real model passed accounting.
 
 | Run | Checks | Cost A / B / resumed A | Changed after the run |
 |---|---|---|---|
 | 1 | 30 / 31 | $0.65 / $0.22 / $0.19 | **Script only:** T3 read the memory block from the transcript, where the harness didn't add it (see below). It now reads the block the hook returned, from stream-json. |
 | 2 | **31 / 31** | $0.72 / $0.20 / $0.22 | The T3 note's wording (informational) now reports whether the block matched the last one already in the transcript. |
 | 3 (fix round 1) | 31 / 32 | $0.69 / $0.20 / $0.20 | **Script only:** T1a and T1b passed with nothing to check, since no item held `pool.rs`. They now anchor on `TODO(perf)` too, and fail when no anchor item exists. |
-| 3, rechecked (fix round 2) | **31 / 32** | none | `--recheck` redid T1a and T1b from run 3's saved outputs, with no model calls. Both now assert F3 and pass. 3b still fails. |
+| 3, rechecked (fix round 2) | 31 / 32 | none | `--recheck` redid T1a and T1b from run 3's saved outputs, with no model calls. Both now assert F3 and pass. 3b still fails. |
+| 3, rechecked (final review) | **31 / 31** | none | **Script only:** the 3b ruling is encoded and `--recheck` redoes 3b. B answered without a Read and nothing on the slate was denied, so 3b is a note. |
 
 Costs are the main sessions only. The reorganize smoke run cost $0.05 (dry run) and $0.02 (real run).
 
@@ -578,6 +579,15 @@ A  21:05:49.425Z t4 ok: attempt 1: applied nothing
   - Run 3 with every `TODO(perf)` replaced by `perf markers`: T1a and T1b both FAIL, "nothing to check, so this fails".
   - Run 1's saved results, which have no anchor item and no session or turn on their change lists: both FAIL.
 - T2, T3 and every other check passed. `stg-7.internal` is in `facts.md`, and the topics were `general` and `todo-perf`.
+
+**Run 3, rechecked after the final review (`final/run3.recheck.json`): 31 / 31.**
+- 3b is now a note, per the controller's ruling:
+  - B's "!!" answer names `pool.rs`, with no Read of the report.
+  - No Read, Write or Edit on a slate path was denied in either session (3c passes). B's denied `grep` stays in the Bash note.
+- 3b still fails in these cases, each shown on an edited copy of run 3's saved results:
+  - **A Read of the report denied:** 30 / 32. 3b and 3c both fail.
+  - **An answer that doesn't name the marked file:** 31 / 32. 3b fails.
+- Run 2's saved results, where B's agent did Read the report, pass 3b as a check, not a note.
 
 **Smoke run with the new prompt (`fix1/smoke/`):**
 - A fresh copy of the `smoke` slate was planned with `--dry-run --save plan.json` (17 s, $0.051), then applied with `--ops plan.json`, with no model run.

@@ -762,6 +762,31 @@ export function denialChecks(bySession, slate, home) {
   ];
 }
 
+// Check 3b, from a run's saved data, so --recheck can redo it. B's Read of A's report passes. When B
+// has none, B answering the "!!" question right (naming the marked file, say from offloads.md) is a
+// note, not a failure, as long as no Read, Write or Edit on a slate path was denied (3c): the slate
+// Read permission is unit-tested and B's report Read was shown live in earlier runs. A denial, or
+// neither a Read nor an answer, fails.
+const BANG_FILE = PERF.find(([, line]) => line.includes('!!'))[0];
+export function reportReadCheck({ bReads, reportWrites, bTurns, denials, slate, home }) {
+  const aReports = new Set(reportWrites.filter((w) => w.error === false).map((w) => path.basename(w.file)));
+  const readOk = bReads.filter((c) => c.error === false && aReports.has(path.basename(c.file)));
+  const answer = bTurns.find((t) => t.prompt === B_PROMPTS[2])?.result ?? null;
+  const answered = typeof answer === 'string' && answer.includes(path.basename(BANG_FILE));
+  const fileDenials = Object.entries(denials).map(([name, ds]) => [name, classifyDenials(ds, slate, home).file.length]);
+  const denied = fileDenials.some(([, n]) => n > 0);
+  const detail = `reads: ${bReads.map((c) => `${c.agent === 'main' ? 'main' : 'subagent'} Read ${path.basename(c.file)} ${c.error ? `ERROR ${c.result}` : 'ok'}`).join('; ') || 'none'}; `
+    + `B's "!!" answer ${answered ? `names ${path.basename(BANG_FILE)}` : 'does not name the marked file'}: ${JSON.stringify(answer)}; `
+    + `slate Read/Write/Edit denials: ${fileDenials.map(([name, n]) => `${name} ${n}`).join(', ')}`;
+  if (readOk.length || !answered || denied) {
+    return { name: '3b. B read A\'s report with Read, no denial', pass: readOk.length > 0, detail, soft: false };
+  }
+  return {
+    name: 'note: 3b. B answered the "!!" question without a Read of A\'s report, and no slate Read, Write or Edit was denied (not a failure)',
+    pass: true, detail, soft: true,
+  };
+}
+
 function printChecks(checks) {
   console.log('\nchecks:');
   for (const c of checks) console.log(`  ${c.pass ? (c.soft ? 'INFO' : 'PASS') : 'FAIL'}  ${c.name}${c.detail ? `  (${c.detail})` : ''}`);
@@ -770,7 +795,7 @@ function printChecks(checks) {
 }
 
 // Re-evaluates a saved run (`--recheck <results.json> [--out <file>]`) where the saved data allows:
-// the denial checks (3c and its note) and the relevance checks (T1a, T1b; an older run's T1 too).
+// check 3b, the denial checks (3c and its note) and the relevance checks (T1a, T1b; an older run's T1 too).
 // Every other check is carried over as recorded. No model calls.
 function recheck(file) {
   const r = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -785,6 +810,9 @@ function recheck(file) {
     const pos = at < 0 ? kept.length : r.checks.slice(0, at).filter((c) => !stale(c)).length;
     r.checks = [...kept.slice(0, pos), ...fresh, ...kept.slice(pos)];
   };
+  swap((c) => /^(note: )?3b\. /.test(c.name), [reportReadCheck({
+    bReads: r.bReads, reportWrites: r.reportWrites, bTurns: r.B.turns, denials: { A: r.A.denials, B: r.B.denials }, slate: r.slate, home: r.home,
+  })]);
   swap((c) => c.name.startsWith('3c.') || c.name.startsWith('note: other calls'), denialChecks({ A: r.A.denials, B: r.B.denials }, r.slate, r.home)
     .filter((c) => c.name.startsWith('3c.') || c.name.startsWith('note: other calls')));
   swap((c) => /^T1[ab]?\. /.test(c.name), relevanceChecks({
@@ -1081,7 +1109,6 @@ async function main() {
   const failedWrites = [...A.sub.writes, ...B.sub.writes].filter((w) => w.error);
   const aReports = new Set(reportWrites.filter((w) => w.error === false).map((w) => path.basename(w.file)));
   const bReads = [...B.mainCalls, ...B.sub.calls].filter((c) => c.tool === 'Read' && inReports(c.file));
-  const bReadOk = bReads.filter((c) => c.error === false && aReports.has(path.basename(c.file)));
 
   // Check 4: the working folders and ~/slate, before and after.
   const after = { A: snapshot(projectA), B: snapshot(projectB), userSlate: snapshot(userSlate), userSlateExists: exists(userSlate) };
@@ -1152,9 +1179,8 @@ async function main() {
     ['3a. A\'s offload wrote reports/<slug>.md in the default mode: the Write went through, no Write/Edit failed',
       aReports.size > 0 && failedWrites.length === 0,
       `reports: ${reports.join(', ') || 'none'}; A's writes: ${reportWrites.map((w) => `${w.tool} ${path.basename(w.file)} ${w.error ? `ERROR ${w.result}` : 'ok'}`).join('; ') || 'none'}`],
-    ['3b. B read A\'s report with Read, no denial',
-      bReadOk.length > 0,
-      `reads: ${bReads.map((c) => `${c.agent === 'main' ? 'main' : 'subagent'} Read ${path.basename(c.file)} ${c.error ? `ERROR ${c.result}` : 'ok'}`).join('; ') || 'none'}`],
+    ...[reportReadCheck({ bReads, reportWrites, bTurns: B.turns, denials: { A: A.denials, B: B.denials }, slate, home })]
+      .map((c) => [c.name, c.pass, c.detail, c.soft]),
     ...denialChecks({ A: A.denials, B: B.denials }, slate, home).map((c) => [c.name, c.pass, c.detail, c.soft]),
     ['4. nothing was written under either session\'s cwd (nor ~/slate)',
       cwdChanges.A.length === 0 && cwdChanges.B.length === 0 && userSlateChanges.length === 0,
