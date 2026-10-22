@@ -331,13 +331,16 @@ A Python `pty` script ran at 120×40 in a fresh temp dir with `--plugin-dir <rep
 
 `node test/live/acceptance.mjs --live --out <results.json>` on branch `feat/shared-slates`, with Claude Code **2.1.308**.
 
-**Result: 27 / 28 (run 3).** Every check passes except 3c. B's offload agent ran Bash `grep` on the slate's `reports/` once, and the default mode denied it. The agent then found the report through `offloads.md` and read it. Closing 3c needs a ruling: see "Open: Bash on slate paths" below.
+**Result: PASS, 28 / 28 (run 3, rechecked).** One Bash call on the slate was denied; per the ruling it is reported as a note, not a failure.
+
+**Known limitation:** Claude Code 2.1.308 has no Grep or Glob tool, so an agent that greps the slate with Bash may get a permission prompt. Adding `~/slate` to `permissions.additionalDirectories` avoids it (Task 6 puts this in the README).
 
 | Run | Checks | Cost A / B | Changed after the run |
 |---|---|---|---|
 | 1 | 23 / 27 | $0.60 / $0.42 | **Product:** offload.md and rules.md now keep Bash off slate paths and send readers to `offloads.md` for reports. **Script:** check 1 is now timed from the transcript, and the substitution check reads only the skill message. |
 | 2 | 23 / 27 | $0.70 / $0.51 | **Product:** offload.md drops the "check the report path first" step, and the link reply is one line that doesn't restate the rules. **Script:** B became one long-lived session, and check 3 was split into 3a–3c. |
-| 3 | **27 / 28** | $0.71 / $0.22 | Recorded below. |
+| 3 | 27 / 28 | $0.71 / $0.22 | 3c failed on B's one Bash `grep` of `reports/`. Ruling: 3c fails only on a Read, Write or Edit denial on a slate path; Bash denials there are reported as a note. |
+| 3, rechecked | **28 / 28** | none | `--recheck` re-evaluated 3c and the note from run 3's saved outputs, with no model calls. Every other check carries over as recorded. |
 
 Costs are the main sessions only; curator runs aren't captured.
 
@@ -365,7 +368,7 @@ Costs are the main sessions only; curator runs aren't captured.
 
 A's old turn 6, which wrote `CONTRIBUTING.md`, is gone because it wrote into the project and check 4 forbids that. Old checks 5 and 9 went with it.
 
-### Checks (run 3)
+### Checks (run 3, rechecked)
 
 | # | Check | Result | Evidence |
 |---|---|---|---|
@@ -377,7 +380,8 @@ A's old turn 6, which wrote `CONTRIBUTING.md`, is gone because it wrote into the
 | 2b | Every item either session added is present with its session tag, IDs are unique, and every ID comes from a logged add | PASS | A added I1, F1 and I3; B added I2 and F2. That's 5 IDs, with no duplicate. |
 | 3a | A's offload wrote `reports/todo-perf-scan.md`, and the Write wasn't denied | PASS | |
 | 3b | B read A's report with Read, and the read wasn't denied | PASS | B's agent read `offloads.md`, then `todo-perf-scan.md`. |
-| 3c | No call on a slate path was denied in either session, Bash included | **FAIL** | B's agent ran `grep -rl "TODO(perf)" <slate>/reports/`, which got "grep in … was blocked. For security, Claude Code may only search … the allowed working directories". A had no denial. |
+| 3c | No Read, Write or Edit call on a slate path was denied, in either session | PASS | No denials in A or B, and none outside the slate either. |
+| note | Other calls on slate paths denied (known limitation, not a failure) | 1 | B's agent ran `grep -rl "TODO(perf)" <slate>/reports/`, which got "grep in … was blocked. For security, Claude Code may only search … the allowed working directories". It then read `offloads.md` and the report. |
 | 4 | Nothing was written under either cwd, nor under `~/slate` | PASS | A's 217 entries and B's folder are unchanged. `~/slate` was absent before and after. |
 | J | Curator `--json-schema` change lists came back and were applied | PASS | All 8 curator runs used `-p … --json-schema`. A logged 5 `ok` lines with 3 adds, and B logged 3 `ok` lines with 2 adds. No retry, no "no change list". |
 
@@ -412,7 +416,9 @@ The earlier checks, adapted to the new paths, all pass:
    - rules.md now says "Bash there is denied" and that `offloads.md` lists report paths. It's 1,692 chars with 120-char paths; to fit, three phrases were shortened with no change in meaning.
 2. **The link reply restated the rules.** Fixed in `skills/link/SKILL.md` (test: `test/packaging.test.mjs`). In run 2 both sessions replied with the rules as bullets. The skill now says to reply with one line and nothing else.
 
-### Open: Bash on slate paths
+### Bash on slate paths
+
+**Ruling: keep it as is.** Slate doesn't add a Bash allow-list or a working-folder hook, because either one widens what gets approved automatically, and that's the user's call. The instruction fixes stay. Check 3c fails only when the hook should have allowed a call (Read, Write or Edit). Denied Bash calls on the slate are counted as a note.
 
 The probes ran in haiku, in the default mode, as `-p` runs, at about $0.01 in all.
 
@@ -424,13 +430,11 @@ The probes ran in haiku, in the default mode, as `-p` runs, at about $0.01 in al
 | `ls <slate>/reports` | denied |
 
 - The permission hook matches `Read|Write|Edit|Grep|Glob`, so on 2.1.308 its Grep and Glob branches never run. Listing or searching the slate always goes through Bash.
-- Even after the instruction fixes, agents still try Bash first: that's the one denial in run 3. Recovery through `offloads.md` takes about 2 s. In an interactive session, it would be one permission prompt.
-
-Options:
-
-- **a)** A `PermissionRequest` hook answers with `updatedPermissions: addDirectories` for the slate. Then Claude Code's own read-only Bash check covers it. In 2.1.308, only PermissionRequest accepts `updatedPermissions`, and an `allow` also approves the call that asked, so the hook must still judge that Bash command. Separately, in `acceptEdits` mode the whole slate becomes editable without a prompt.
-- **b)** A PreToolUse allow-list: read-only Bash (`ls`, `grep`, `cat`, `head`) whose every path is inside the slate. That needs our own shell parsing and a security review.
-- **c)** Keep it as is: the instructions plus `offloads.md`, accepting an occasional prompt.
+- Even after the instruction fixes, agents still sometimes try Bash first: that's the one denial in run 3. Recovery through `offloads.md` takes about 2 s. In an interactive session, it would be one permission prompt.
+- A user can avoid the prompt by adding `~/slate` to `permissions.additionalDirectories`.
+- Options considered and declined:
+  - A `PermissionRequest` hook that adds the slate as a working folder. In 2.1.308 its `allow` also approves the call that asked, and in `acceptEdits` mode it makes the whole slate editable without a prompt.
+  - A PreToolUse allow-list for read-only Bash inside the slate, which needs our own shell parsing.
 
 ### Run 3: memory and logs
 
