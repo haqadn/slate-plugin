@@ -1,6 +1,6 @@
 {
   "name": "slate-plugin",
-  "description": "Keeps the main Claude Code thread small with offloading and curated session memory.",
+  "description": "Keeps the main Claude Code thread small: offloads heavy work to subagents and keeps curated memory in shared topic slates.",
   "owner": {
     "name": "Adnan"
   },
