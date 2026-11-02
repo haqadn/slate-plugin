@@ -197,6 +197,7 @@ test('prompt: a message over 100,000 chars is capped, pointing at the turn file'
 test('env: deny-listed session vars are stripped, everything else is inherited', async () => {
   const { dir, record } = await setup('good');
   assert.deepEqual([...CURATOR_ENV_DENY].sort(), [
+    'CODEX_THREAD_ID', 'CODEX_INTERNAL_ORIGINATOR_OVERRIDE',
     'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_PARENT_SESSION_ID',
     'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_CODE_SESSION_KIND', 'CLAUDE_CODE_SESSION_NAME',
     'CLAUDE_CODE_SESSION_LOG', 'CLAUDE_CODE_SESSION_ATTENDED',

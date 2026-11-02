@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { settle, spawnCurator, curatorWaitMs, currentPid } from './hook.mjs';
 import { slateHome, validName, slateDir, slateOf, createSlate, createSession, listSlates, sessionDirs, findSession } from './lib/slate.mjs';
-import { readSession, setPid, pendingTurns } from './lib/session.mjs';
+import { readSession, writeSession, setPid, pendingTurns } from './lib/session.mjs';
 import { memoryBlock } from './lib/inject.mjs';
 
 const SWITCH_WAIT_MS = 5000; // for the old session's curator before it is aborted
@@ -73,6 +73,8 @@ async function detach(old, env) {
   const detached = `${old}.detached-${Date.now()}`;
   await fs.rename(old, detached);
   await setPid(detached, null);
+  const state = await readSession(detached);
+  if (state.runtime === 'codex') await writeSession(detached, { ...state, active: false });
   const pending = await pendingTurns(detached);
   return pending ? spawnCurator(detached, pending.to, env) : null;
 }
@@ -99,6 +101,10 @@ async function link(home, sid, name, create, env) {
     }
     dir = (await createSession(slate, sid, currentPid(env))).dir;
   }
+  if (env.SLATE_RUNTIME === 'codex') {
+    const s = await readSession(dir);
+    await writeSession(dir, { ...s, runtime: 'codex', active: true, pid: null });
+  }
   return { out: `${status}\n${await memoryBlock(dir)}\n`, spawned };
 }
 
@@ -124,8 +130,8 @@ async function done(home, sid, name, yes, env) {
   for (const dir of await sessionDirs(home)) {
     const id = path.basename(dir);
     if (slateOf(dir) !== slate || id === sid) continue;
-    const { pid } = await readSession(dir).catch(() => ({ pid: null }));
-    if (pid && pid !== ownPid && alive(pid)) live.push(id.slice(0, 8));
+    const s = await readSession(dir).catch(() => ({ pid: null }));
+    if (s.runtime === 'codex' ? s.active : s.pid && s.pid !== ownPid && alive(s.pid)) live.push(id.slice(0, 8));
   }
   if (live.length) return { out: `refused ${name} live ${live.join(',')}\n` };
   await abortCurators(slate);

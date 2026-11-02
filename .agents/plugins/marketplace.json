@@ -1,0 +1,12 @@
+{
+  "name": "slate-plugin",
+  "interface": { "displayName": "Slate" },
+  "plugins": [
+    {
+      "name": "slate",
+      "source": { "source": "local", "path": "./plugins/slate" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

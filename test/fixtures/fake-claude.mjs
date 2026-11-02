@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Fake `claude` for curator tests. Records each call to $FAKE_RECORD (one JSON line, with `seen`,
+// Fake Claude/Codex for curator tests. Records each call to $FAKE_RECORD (one JSON line, with `seen`,
 // instructions.md as it read it) and prints a `--output-format json` result whose
 // `structured_output` is a change list (`relevant` empty unless said), per $FAKE_MODE:
 //   good             add "fake item <turn>"
@@ -15,10 +15,11 @@
 import fs from 'node:fs';
 
 const args = process.argv.slice(2);
+const codex = args[0] === 'exec';
 // `node --test` also runs files under test/ as test files; without a prompt there is nothing to do.
-if (!args.includes('-p')) process.exit(0);
+if (!codex && !args.includes('-p')) process.exit(0);
 
-const prompt = args[args.indexOf('-p') + 1];
+const prompt = codex ? args.at(-1) : args[args.indexOf('-p') + 1];
 const mode = process.env.FAKE_MODE || 'good';
 const record = process.env.FAKE_RECORD;
 
@@ -39,6 +40,7 @@ if (record) {
   } catch {}
   const stdinRdev = fs.fstatSync(0).rdev;
   const line = { args, prompt, env: process.env, cwd: process.cwd(), pid: process.pid, stdinRdev, seen };
+  if (codex) line.schema = JSON.parse(fs.readFileSync(args[args.indexOf('--output-schema') + 1], 'utf8'));
   fs.appendFileSync(record, `${JSON.stringify(line)}\n`);
 }
 
@@ -48,7 +50,7 @@ const INVALID = [...GOOD, { op: 'add', type: 'F', text: 'an unsourced fact' }];
 function reply(ops, relevant = []) {
   const out = { ops, relevant };
   const result = { type: 'result', subtype: 'success', is_error: false, result: JSON.stringify(out), structured_output: out };
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  process.stdout.write(`${JSON.stringify(codex ? out : result)}\n`);
 }
 
 function stale() {

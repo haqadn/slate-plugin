@@ -19,7 +19,7 @@ import { slateHome, validName, slateDir, readTopics } from '../plugins/slate/scr
 import { applyChanges, REORGANIZE_SCHEMA, FACTS_CAP, ASSUMPTIONS_CAP } from '../plugins/slate/scripts/lib/apply.mjs';
 import { ITEM_FILES, parseItemLine, parseMemoryFile } from '../plugins/slate/scripts/lib/items.mjs';
 import {
-  resolveClaudeBin, curatorEnv, runClaude, parseChanges, topicLine,
+  resolveClaudeBin, curatorEnv, runClaude, parseChanges, topicLine, runCodex, parseCodexChanges,
 } from '../plugins/slate/scripts/curate.mjs';
 
 const RULES_FILE = new URL('../plugins/slate/reorganize-rules.md', import.meta.url);
@@ -27,7 +27,8 @@ const ITEM_NAMES = Object.values(ITEM_FILES);
 const SHARED = [...ITEM_NAMES, 'superseded.md'];
 const CAPS = { 'facts.md': FACTS_CAP, 'assumptions.md': ASSUMPTIONS_CAP };
 const USAGE = 'usage.json';
-const MODEL = 'sonnet';
+const CODEX = process.env.SLATE_RUNTIME === 'codex';
+const MODEL = CODEX ? process.env.SLATE_CODEX_MODEL || undefined : 'sonnet';
 const TIMEOUT_MS = 15 * 60_000;
 // Retired lines read `retired t0@reorg`: no session ran this.
 const APPLY = { turn: 0, sessionId: 'reorg', lenient: true, reorganize: true };
@@ -233,17 +234,20 @@ async function loadOps(file, real) {
 // One model run; the op list, or the tool exits with nothing changed.
 async function plan(real, before) {
   const prompt = buildPrompt(await fs.readFile(RULES_FILE, 'utf8'), real, before);
-  const bin = resolveClaudeBin();
-  console.log(`model ${MODEL}, via ${bin}`);
+  const bin = CODEX ? process.env.SLATE_CODEX_BIN || 'codex' : resolveClaudeBin();
+  console.log(`model ${MODEL || 'CLI default'}, via ${bin}`);
   // Ctrl-C or SIGTERM kills the model run, which is in its own process group.
   const ac = new AbortController();
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => ac.abort());
   const started = Date.now();
-  const run = await runClaude(bin, modelArgs(prompt, real), {
+  const opts = {
     cwd: real, env: curatorEnv(process.env), timeoutMs: TIMEOUT_MS, signal: ac.signal,
-  });
+  };
+  const run = CODEX
+    ? await runCodex(prompt, { ...opts, bin, model: MODEL, schema: REORGANIZE_SCHEMA })
+    : await runClaude(bin, modelArgs(prompt, real), opts);
   if (run.error) fail(`model run failed (${run.error}); nothing changed`);
-  const changes = parseChanges(run.stdout);
+  const changes = CODEX ? parseCodexChanges(run.stdout) : parseChanges(run.stdout);
   if (!changes) fail('no op list in the model output; nothing changed');
   let cost = null;
   try {

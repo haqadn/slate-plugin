@@ -1,4 +1,4 @@
-// Hook dispatcher for SessionStart, UserPromptSubmit, Stop, PreCompact, SubagentStop and PreToolUse.
+// Shared lifecycle hook dispatcher; Codex also uses SessionEnd to release its active marker.
 // CLI: node hook.mjs <Event>, hook JSON on stdin, hook JSON (or nothing) on stdout. Always exits 0.
 import fs from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
@@ -69,6 +69,8 @@ export async function settle(dir, waitMs) {
 
 // CLAUDE_PID from the given env, else claudePid()'s own lookup (process env, then the ancestors).
 export function currentPid(env) {
+  // Codex can host several threads in one daemon; its PID does not identify a session.
+  if (env.SLATE_RUNTIME === 'codex') return null;
   const n = Number(env.CLAUDE_PID);
   return Number.isInteger(n) && n > 0 ? n : claudePid();
 }
@@ -85,6 +87,11 @@ async function setKind(dir, kind) {
 // the old session's slate, as a sibling folder.
 async function sessionStart(input, home, dir, env) {
   const source = input.source;
+  if (env.SLATE_RUNTIME === 'codex') {
+    if (dir === null) return { output: null };
+    const s = await readSession(dir);
+    await writeSession(dir, { ...s, runtime: 'codex', active: true, pid: null });
+  }
   if (dir === null) {
     const pid = currentPid(env);
     if (!pid) return { output: null };
@@ -140,7 +147,9 @@ async function userPromptSubmit(input, dir, env) {
 }
 
 export function spawnCurator(dir, turn, env) {
-  const model = env.CLAUDE_PLUGIN_OPTION_CURATORMODEL || 'sonnet';
+  const model = env.SLATE_RUNTIME === 'codex'
+    ? env.SLATE_CODEX_MODEL || ''
+    : env.CLAUDE_PLUGIN_OPTION_CURATORMODEL || 'sonnet';
   const args = [CURATE, dir, String(turn), model];
   const child = spawn(process.execPath, args, { detached: true, stdio: 'ignore', env });
   child.on('error', (e) => process.stderr.write(`slate: curator spawn failed: ${e.message}\n`));
@@ -163,9 +172,9 @@ const returnFile = (dir, agent) => path.join(dir, 'handbacks', `${agent}.return`
 // An offload agent's return goes into the main thread. Over the limit, send it back once for a
 // shorter rewrite; the second stop carries stop_hook_active and always passes. A stop that passes
 // is recorded in offloads.md, with the hand-back message PreToolUse saved when there's no final text.
-async function subagentStop(input, dir) {
+async function subagentStop(input, dir, env) {
   const text = input.last_assistant_message;
-  if (input.agent_type !== OFFLOAD_AGENT) return { output: null };
+  if (env.SLATE_RUNTIME !== 'codex' && input.agent_type !== OFFLOAD_AGENT) return { output: null };
   if (input.stop_hook_active !== true && typeof text === 'string') {
     const chars = [...text].length;
     if (chars > RETURN_LIMIT) {
@@ -249,9 +258,15 @@ export async function handle(event, input, env = process.env) {
     return sessionStart(input, home, dir, env);
   }
   if (dir === null) return { output: null };
-  if (event === 'SubagentStop') return subagentStop(input, dir);
+  if (event === 'SubagentStop') return subagentStop(input, dir, env);
   if (event === 'PreToolUse') return preToolUse(input, dir);
   switch (event) {
+    case 'SessionEnd': {
+      if (env.SLATE_RUNTIME !== 'codex') return { output: null };
+      const s = await readSession(dir);
+      await writeSession(dir, { ...s, active: false, pid: null });
+      return { output: null };
+    }
     case 'UserPromptSubmit':
       return userPromptSubmit(input, dir, env);
     case 'Stop':
@@ -264,12 +279,12 @@ export async function handle(event, input, env = process.env) {
   }
 }
 
-async function main(event) {
+export async function main(event, env = process.env) {
   try {
     let text = '';
     process.stdin.setEncoding('utf8');
     for await (const chunk of process.stdin) text += chunk;
-    const { output } = await handle(event, JSON.parse(text), process.env);
+    const { output } = await handle(event, JSON.parse(text), env);
     if (output) process.stdout.write(JSON.stringify(output));
   } catch (e) {
     process.stderr.write(`slate ${event} hook: ${String(e?.message ?? e).replace(/\s+/g, ' ').trim()}\n`);

@@ -198,7 +198,9 @@ export async function sweepSessions(home, { now = Date.now(), maxIdleMs = MAX_ID
       if (t === null || t >= now - maxIdleMs) continue;
       let pid = null;
       try {
-        pid = JSON.parse(await fs.readFile(file, 'utf8')).pid ?? null;
+        const s = JSON.parse(await fs.readFile(file, 'utf8'));
+        if (s.runtime === 'codex' && s.active) continue;
+        pid = s.pid ?? null;
       } catch {}
       if (Number.isInteger(pid) && pid > 0 && alive(pid)) continue;
       try {

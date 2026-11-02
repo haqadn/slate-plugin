@@ -1,0 +1,14 @@
+{
+  "name": "slate",
+  "version": "0.2.0",
+  "description": "Keep the main thread small with shared curated memory, focused subagents and detailed reports.",
+  "author": { "name": "Adnan" },
+  "skills": "./codex/skills/",
+  "hooks": "./hooks/codex.json",
+  "interface": {
+    "displayName": "Slate",
+    "shortDescription": "Shared memory that survives compaction",
+    "developerName": "Adnan",
+    "category": "Productivity"
+  }
+}

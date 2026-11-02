@@ -1,4 +1,4 @@
-// Curator runner: a fresh, read-only `claude -p` reads memory and returns a change list, which
+// Curator runner: a fresh, read-only Claude or Codex process returns a change list, which
 // applyChanges (lib/apply.mjs) applies. Errors go back to the model once; the retry's valid ops
 // apply and the rest are dropped with a `partial` warning.
 // CLI: node curate.mjs <dir> <turn> [model]. It drains every pending turn of the session; <turn> is
@@ -6,6 +6,7 @@
 import fs from 'node:fs/promises';
 import { realpathSync, statSync, accessSync, constants } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
@@ -27,8 +28,9 @@ const MAX_ATTEMPTS = 2;
 const NO_ANSWER = '[no answer: turn was interrupted]';
 const ABORTED = 'aborted';
 
-// Parent-session identity and plumbing that must not leak into the curator's `claude -p`.
+// Parent-session identity and plumbing that must not leak into the curator process.
 export const CURATOR_ENV_DENY = [
+  'CODEX_THREAD_ID', 'CODEX_INTERNAL_ORIGINATOR_OVERRIDE',
   // session identity
   'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_PARENT_SESSION_ID',
   'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_CODE_SESSION_KIND', 'CLAUDE_CODE_SESSION_NAME',
@@ -223,6 +225,47 @@ export function parseChanges(stdout) {
   }
 }
 
+// Structured outputs accept anyOf rather than oneOf, and typed enums rather than bare consts.
+export function codexSchema(value) {
+  if (Array.isArray(value)) return value.map(codexSchema);
+  if (!value || typeof value !== 'object') return value;
+  if ('const' in value) return { type: 'string', enum: [value.const] };
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k === 'oneOf' ? 'anyOf' : k, codexSchema(v)]));
+}
+
+export function parseCodexChanges(stdout) {
+  try {
+    const out = JSON.parse(stdout);
+    if (!Array.isArray(out?.ops)) return null;
+    return { ops: out.ops, relevant: Array.isArray(out.relevant) ? out.relevant : [] };
+  } catch {
+    return null;
+  }
+}
+
+export async function runCodex(prompt, { model, bin = process.env.SLATE_CODEX_BIN || 'codex', schema = CHANGE_SCHEMA, ...opts }) {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'slate-codex-schema-'));
+  try {
+    const schemaFile = path.join(temp, 'changes.json');
+    await fs.writeFile(schemaFile, JSON.stringify(codexSchema(schema)));
+    const args = [
+      'exec', '--ignore-user-config', '--ephemeral', '--skip-git-repo-check',
+      '--sandbox', 'read-only', '-c', 'approval_policy="never"',
+      '-c', 'features.hooks=false', '-c', 'features.multi_agent=false',
+      '-c', 'features.memories=false', '-c', 'web_search="disabled"',
+      '--output-schema', schemaFile,
+      ...(model ? ['--model', model] : []), prompt,
+    ];
+    return await runClaude(bin, args, opts);
+  } finally {
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+}
+
+const curatorRuntime = () => process.env.SLATE_RUNTIME === 'codex' ? 'codex' : 'claude';
+const defaultModel = (runtime) => runtime === 'codex' ? process.env.SLATE_CODEX_MODEL || undefined : 'sonnet';
+const defaultBin = (runtime) => runtime === 'codex' ? process.env.SLATE_CODEX_BIN || 'codex' : resolveClaudeBin();
+
 const retryNote = (errors) =>
   'Your previous change list was rejected, so nothing was applied. ' +
   `Problems, as <op index>:<problem>: ${errors.join('; ')}. ` +
@@ -244,7 +287,7 @@ async function log(dir, turn, status, detail) {
 
 // One turn; the caller holds the session's curator.lock. Attempt 1 applies strictly; on errors the
 // model sees them and attempt 2 applies leniently. A run that fails or is aborted applies nothing.
-async function curateTurn({ dir, turn, model, bin, timeoutMs, signal }) {
+async function curateTurn({ dir, turn, runtime, model, bin, timeoutMs, signal }) {
   let attempts = 0;
   const end = async (status, detail, result) => {
     await log(dir, turn, status, detail);
@@ -274,12 +317,14 @@ async function curateTurn({ dir, turn, model, bin, timeoutMs, signal }) {
     let prompt = base;
     for (;;) {
       attempts++;
-      const run = await runClaude(bin, curatorArgs(prompt, model, real), opts);
+      const run = runtime === 'codex'
+        ? await runCodex(prompt, { ...opts, model, bin })
+        : await runClaude(bin, curatorArgs(prompt, model, real), opts);
       if (run.error === ABORTED || signal?.aborted) {
         return end('aborted', 'requeued', { errors: ['aborted: requeued'], aborted: true });
       }
       if (run.error) return failed(run.error);
-      const changes = parseChanges(run.stdout);
+      const changes = runtime === 'codex' ? parseCodexChanges(run.stdout) : parseChanges(run.stdout);
       if (!changes) return failed('no change list in output');
       const lenient = attempts === MAX_ATTEMPTS;
       const r = await applyChanges(dir, changes.ops, {
@@ -296,7 +341,7 @@ async function curateTurn({ dir, turn, model, bin, timeoutMs, signal }) {
 }
 
 export async function runCurator({
-  dir, turn, model = 'sonnet', bin = resolveClaudeBin(), timeoutMs = TIMEOUT_MS, signal,
+  dir, turn, runtime = curatorRuntime(), model = defaultModel(runtime), bin = defaultBin(runtime), timeoutMs = TIMEOUT_MS, signal,
 }) {
   let release;
   try {
@@ -306,7 +351,7 @@ export async function runCurator({
   }
   if (!release) return { ok: false, attempts: 0, errors: ['locked'] };
   try {
-    return await curateTurn({ dir, turn, model, bin, timeoutMs, signal });
+    return await curateTurn({ dir, turn, runtime, model, bin, timeoutMs, signal });
   } finally {
     await release();
   }
@@ -352,7 +397,7 @@ async function nextWork(dir) {
 // error (not a partial apply) stays queued once, for the next drain: a later Stop, or one that
 // came in during this run; a second error marks it done. `beforeRelease` is a test seam.
 export async function drain({
-  dir, model = 'sonnet', bin = resolveClaudeBin(), timeoutMs = TIMEOUT_MS, signal, beforeRelease,
+  dir, runtime = curatorRuntime(), model = defaultModel(runtime), bin = defaultBin(runtime), timeoutMs = TIMEOUT_MS, signal, beforeRelease,
 } = {}) {
   const runs = [];
   const result = (locked) => ({ runs, locked, aborted: Boolean(signal?.aborted) });
@@ -365,7 +410,7 @@ export async function drain({
       for (let work; !signal?.aborted && (work = await nextWork(dir));) {
         if (!work.missing) {
           const mark = await queueMark(dir);
-          const r = await curateTurn({ dir, turn: work.turn, model, bin, timeoutMs, signal });
+          const r = await curateTurn({ dir, turn: work.turn, runtime, model, bin, timeoutMs, signal });
           runs.push({ turn: work.turn, ...r });
           if (r.aborted) break; // not marked done: the next drain curates it again
           const done = await readCurated(dir);

@@ -9,6 +9,7 @@ import { ERROR_KINDS } from './apply.mjs';
 
 const MAX = 10000; // SessionStart / UserPromptSubmit additionalContext cap
 const RULES_FILE = new URL('../../rules.md', import.meta.url);
+const CODEX_RULES_FILE = new URL('../../codex/rules.md', import.meta.url);
 const COMPACT_LINE = 'Memory below wins where it differs from the summary.';
 const REMINDER = 'slate: offload heavy reads to slate:offload; reply briefly.';
 const MAX_ADDS = 5;
@@ -29,8 +30,8 @@ const QUOTES = new Map([['"', '"'], ["'", "'"], ['`', '`'], ['\u201c', '\u201d']
 
 const clip = (s, n) => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
 
-export async function rulesText(dir) {
-  const text = await fs.readFile(RULES_FILE, 'utf8');
+export async function rulesText(dir, { runtime } = {}) {
+  const text = await fs.readFile(runtime === 'codex' ? CODEX_RULES_FILE : RULES_FILE, 'utf8');
   if (dir === undefined) return text;
   return text.replaceAll('{{slate}}', () => slateOf(dir)).replaceAll('{{session}}', () => dir);
 }
@@ -117,11 +118,12 @@ async function lagLine(dir, waiting) {
 }
 
 export async function memoryBlock(dir, { afterCompact = false, waiting = false } = {}) {
+  const session = await readSession(dir);
   const memory = await readMemory(dir);
   const topics = await readTopics(slateOf(dir));
   const lag = await lagLine(dir, waiting);
   const head = ['# slate memory', afterCompact && COMPACT_LINE, lag].filter(Boolean).join('\n');
-  const rules = (await rulesText(dir)).trim();
+  const rules = (await rulesText(dir, session)).trim();
   const retired = retiredTexts(memory);
   const sections = [
     ['Instructions', 'instructions.md'],
@@ -174,7 +176,6 @@ export async function memoryBlock(dir, { afterCompact = false, waiting = false }
   }
   const out = clip(render(), MAX);
 
-  const session = await readSession(dir);
   session.seen = seenOf(liveItems(memory), topics);
   await writeSession(dir, session);
   return out;
@@ -279,7 +280,9 @@ export async function changeLine(dir, { waiting = false } = {}) {
   }
 
   const warnings = await newWarnings(dir, session);
-  const lines = [REMINDER];
+  const lines = [session.runtime === 'codex'
+    ? 'slate: delegate heavy work when subagents are available; keep details in reports and reply briefly.'
+    : REMINDER];
   if (entries.length) lines.push(`slate: ${entries.join(' · ')}`);
   lines.push(...warnings.slice(0, MAX_WARNINGS));
   if (warnings.length > MAX_WARNINGS) {

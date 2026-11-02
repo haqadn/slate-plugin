@@ -35,6 +35,30 @@ test('hooks.json wraps six events (seven commands) and every plugin-root path ex
   }
 });
 
+test('Codex discovers only its own skills and hook entry point from the shared package', async () => {
+  const plugin = await json(`${PLUGIN}.codex-plugin/plugin.json`);
+  const claude = await json(`${PLUGIN}.claude-plugin/plugin.json`);
+  const market = await json(`${ROOT}.agents/plugins/marketplace.json`);
+  assert.equal(plugin.name, claude.name);
+  assert.equal(plugin.version, claude.version);
+  assert.equal(market.plugins[0].source.path, './plugins/slate');
+  const cfg = await json(PLUGIN + plugin.hooks);
+  assert.deepEqual(Object.keys(cfg.hooks).sort(), ['PreCompact', 'SessionEnd', 'SessionStart', 'Stop', 'SubagentStop', 'UserPromptSubmit']);
+  for (const [event, groups] of Object.entries(cfg.hooks)) {
+    for (const hook of groups.flatMap((g) => g.hooks)) {
+      assert.equal(hook.command, `node "\${PLUGIN_ROOT}/scripts/codex-hook.mjs" ${event}`);
+    }
+  }
+  for (const name of ['link', 'done', 'offload']) {
+    const skill = await fs.readFile(`${PLUGIN}${plugin.skills}/${name}/SKILL.md`, 'utf8');
+    assert.doesNotMatch(skill, /CLAUDE_PLUGIN_ROOT|CLAUDE_SESSION_ID|AskUserQuestion|!`/);
+    if (name === 'offload') continue;
+    assert.ok(await exists(`${PLUGIN}${plugin.skills}/${name}/../../../scripts/codex-slate.mjs`));
+    const policy = await fs.readFile(`${PLUGIN}${plugin.skills}/${name}/agents/openai.yaml`, 'utf8');
+    assert.match(policy, /allow_implicit_invocation: false/);
+  }
+});
+
 test('agent frontmatter', async () => {
   const agent = await fs.readFile(`${PLUGIN}agents/offload.md`, 'utf8');
   assert.match(agent, /^---\nname: offload\n/);

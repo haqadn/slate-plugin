@@ -158,6 +158,23 @@ test('a run moves items into topics, retires the replaced status, leaves key fil
   assert.equal(await exists(path.join(fx.slate, 'memory.lock')), false);
 });
 
+test('Codex reorganizes a slate without Claude and keeps the same accounting guarantees', async () => {
+  const fx = await fixture();
+  const r = run(fx, [NAME], { env: {
+    SLATE_RUNTIME: 'codex', SLATE_CODEX_BIN: FAKE, SLATE_CLAUDE_BIN: '/no-claude-allowed',
+    SLATE_CODEX_MODEL: '',
+  } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^accounting: ok\b/m);
+  const [call] = await calls(fx.record);
+  assert.equal(call.args[0], 'exec');
+  assert.equal(call.args.includes('--model'), false, 'an unset model uses the CLI default');
+  assert.deepEqual(call.schema.properties.ops.items.anyOf.map((s) => s.properties.op.enum[0]),
+    ['topic', 'move', 'retire', 'keep']);
+  assert.match(await read(fx.slate, 'superseded.md'), /F8/);
+  assert.match(await read(fx.slate, 'topics/canonical.md'), /F9/);
+});
+
 test('command: one read-only run of the curator binary, Read on the key files, superseded.md and topics/**, only topic, move and retire in the schema', async () => {
   const fx = await fixture();
   await fs.mkdir(path.join(fx.slate, 'topics'));
