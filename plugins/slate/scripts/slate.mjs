@@ -6,13 +6,15 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { settle, spawnCurator, curatorWaitMs, currentPid } from './hook.mjs';
-import { slateHome, validName, slateDir, slateOf, createSlate, createSession, listSlates, sessionDirs, findSession } from './lib/slate.mjs';
+import {
+  slateHome, validName, slateDir, slateOf, createSlate, createSession, listSlates, sessionDirs, findSession, closest,
+  NAME_HELP,
+} from './lib/slate.mjs';
 import { readSession, writeSession, setPid, pendingTurns } from './lib/session.mjs';
 import { memoryBlock } from './lib/inject.mjs';
 
 const SWITCH_WAIT_MS = 5000; // for the old session's curator before it is aborted
 const SAFE_ID = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
-const NAME_HELP = 'a slate name is lowercase letters, digits and hyphens, up to 64 characters, e.g. jetpack-seo';
 const exists = (p) => fs.access(p).then(() => true, () => false);
 
 function alive(pid) {
@@ -32,29 +34,6 @@ function branchOf(cwd) {
   } catch {
     return '';
   }
-}
-
-function distance(a, b) {
-  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
-  for (let i = 1; i <= a.length; i++) {
-    const row = [i];
-    for (let j = 1; j <= b.length; j++) {
-      row[j] = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-    }
-    prev = row;
-  }
-  return prev[b.length];
-}
-
-// The existing slate a new name may be a slip for: within edit distance 2, or a prefix either way.
-function closest(name, slates) {
-  let best = null;
-  for (const { name: other } of slates) {
-    const d = distance(name, other);
-    if (d > 2 && !name.startsWith(other) && !other.startsWith(name)) continue;
-    if (!best || d < best.d) best = { other, d };
-  }
-  return best?.other ?? null;
 }
 
 async function list(home, sid, cwd) {

@@ -13,6 +13,13 @@ claude plugin marketplace add ~/Projects/slate-plugin
 claude plugin install slate@slate-plugin
 ```
 
+To start sessions already linked, put `claude-slate` on your PATH. For zsh tab completion of slate names, source its completion file after `compinit` (oh-my-zsh runs `compinit` for you):
+
+```
+ln -s ~/Projects/slate-plugin/bin/claude-slate ~/bin/claude-slate
+echo 'source ~/Projects/slate-plugin/bin/claude-slate.zsh' >> ~/.zshrc
+```
+
 ### Codex
 
 Requires a Codex release with plugin lifecycle hooks and `codex exec --ignore-user-config` (tested with CLI 0.166.0), installed and signed in with `codex login`.
@@ -34,6 +41,7 @@ Codex's curator uses `codex exec` with a read-only sandbox, hooks disabled, no u
 
 In Claude Code:
 
+- `claude-slate [name] [claude args]` starts Claude Code linked to a slate. Memory loads at startup, with no model turn. Other args go to `claude` (`-c`, `--resume`, a prompt). With no name you pick from recent slates. A new name asks before creating the slate. A resumed session already on another slate stays there.
 - `/slate:link [name]` links this session to a slate (new names ask first; no name shows a picker). Several sessions can share one slate.
 - `/slate:done [name]` deletes a finished slate.
 - Run `/autocompact 100000` so compaction becomes the automatic reset. Memory reloads after it.
@@ -80,6 +88,7 @@ In Claude Code, reads in the linked slate and writes under `reports/` are allowe
 
 - When `facts.md` or `assumptions.md` goes over its cap, the curator's apply step moves the least recently relevant items to their home topics (`general` if none) until it fits, and logs them as `demoted` in `curator.log`.
 - `SLATE_HOME` (default `~/slate`) must be on a filesystem with hard links: locks are linked into place.
+- `claude-slate` writes the slate name to `~/slate/.launch/<pid>` and then runs `claude` in place, keeping the same process ID. The startup hook reads that file once and deletes it. It ignores files older than 10 minutes. A `claude` started inside the session has a different process ID, so it isn't linked.
 - Turn files escape exact marker lines with a leading backslash.
 - The Claude curator finds `claude` through `CLAUDE_CODE_EXECPATH` and runs with `--setting-sources ""`: OAuth login works; `apiKeyHelper` auth can't reach it.
 - Codex indexes subagent returns from linked threads in `offloads.md` and asks once for a shorter return above 800 characters. Its hooks do not grant tool permissions; shell reads and report writes follow the thread's sandbox and approval settings.
