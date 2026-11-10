@@ -5,6 +5,7 @@
   "author": {
     "name": "Adnan"
   },
+  "types": "./types/index.d.ts",
   "userConfig": {
     "curatorModel": {
       "type": "string",

@@ -10,7 +10,9 @@ import {
   nextTurn, writeMessage, appendAnswer, appendContinuation, pendingTurns, appendOffload, atomicWrite,
 } from './lib/session.mjs';
 import { waitFree, lockHolder } from './lib/lock.mjs';
-import { slateHome, findSession, slateAccess, sweepSessions } from './lib/slate.mjs';
+import {
+  slateHome, findSession, slateAccess, sweepSessions, slateDir, slateOf, createSlate, createSession, takeLaunch,
+} from './lib/slate.mjs';
 import { memoryBlock, changeLine } from './lib/inject.mjs';
 
 const CURATE = fileURLToPath(new URL('./curate.mjs', import.meta.url));
@@ -76,6 +78,7 @@ export function currentPid(env) {
 }
 
 const context = (hookEventName, additionalContext) => ({ hookSpecificOutput: { hookEventName, additionalContext } });
+const exists = (p) => fs.access(p).then(() => true, () => false);
 
 async function setKind(dir, kind) {
   const s = await readSession(dir);
@@ -92,34 +95,49 @@ async function sessionStart(input, home, dir, env) {
     const s = await readSession(dir);
     await writeSession(dir, { ...s, runtime: 'codex', active: true, pid: null });
   }
+  const pid = currentPid(env);
+  // A new process (startup, or resume from the command line) that claude-slate started for a slate.
+  // Its file is used up here, so a later in-process /resume is not linked by it.
+  const fresh = source === 'startup' || source === 'resume';
+  const launch = fresh && pid ? await takeLaunch(home, pid) : null;
   if (dir === null) {
-    const pid = currentPid(env);
     if (!pid) return { output: null };
     // This process now runs a session without a folder: no folder may keep its pid.
-    if (source === 'startup' || source === 'resume') await releasePid(home, pid);
-    if (source !== 'clear' && source !== 'fork') return { output: null };
-    const found = await findByPid(home, pid);
-    if (!found) return { output: null };
-    dir = path.join(path.dirname(found), input.session_id);
-    if (found === dir) return { output: null };
-    if (source === 'clear') {
-      await settle(found, curatorWaitMs(env, START_WAIT_MS));
-      await moveSession(found, dir);
+    if (fresh) await releasePid(home, pid);
+    if (launch) {
+      if (!(await exists(slateDir(home, launch)))) {
+        return { output: { systemMessage: `No slate named ${launch}. Run /slate:link ${launch} to create it.` } };
+      }
+      await createSlate(home, launch); // repairs a slate missing some files, as /slate:link does
+      dir = (await createSession(slateDir(home, launch), input.session_id, pid)).dir;
     } else {
-      await settle(found, curatorWaitMs(env, FORK_WAIT_MS));
-      await copySession(found, dir, pid);
+      if (source !== 'clear' && source !== 'fork') return { output: null };
+      const found = await findByPid(home, pid);
+      if (!found) return { output: null };
+      dir = path.join(path.dirname(found), input.session_id);
+      if (found === dir) return { output: null };
+      if (source === 'clear') {
+        await settle(found, curatorWaitMs(env, START_WAIT_MS));
+        await moveSession(found, dir);
+      } else {
+        await settle(found, curatorWaitMs(env, FORK_WAIT_MS));
+        await copySession(found, dir, pid);
+      }
     }
-  } else if (source === 'resume') {
+  } else if (source === 'resume' && pid) {
     // A --resume runs in a new process; a later /clear finds the folder by this pid. An in-process
     // /resume keeps the pid, which another folder may still hold: only this one keeps it.
-    const pid = currentPid(env);
-    if (pid) {
-      await setPid(dir, pid);
-      await releasePid(home, pid, dir);
-    }
+    await setPid(dir, pid);
+    await releasePid(home, pid, dir);
   }
   const free = await waitFree(dir, curatorWaitMs(env, START_WAIT_MS));
   const output = context('SessionStart', await memoryBlock(dir, { afterCompact: source === 'compact', waiting: !free }));
+  if (launch) {
+    const linked = path.basename(slateOf(dir));
+    output.systemMessage = linked === launch
+      ? `Linked to slate ${launch}.`
+      : `This session stays on slate ${linked}. Run /slate:link ${launch} to switch.`;
+  }
   // Turns left uncurated, e.g. by a curator aborted above before the move or copy: drain them now
   // rather than at the next Stop. Only after the block, so the block is read before that curator
   // changes memory; and only when the lock is free, since a holder rechecks the queue after its release.

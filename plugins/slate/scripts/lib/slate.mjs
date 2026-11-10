@@ -20,6 +20,8 @@ export function slateHome(env = process.env) {
   return env.SLATE_HOME || path.join(os.homedir(), 'slate');
 }
 
+export const NAME_HELP = 'a slate name is lowercase letters, digits and hyphens, up to 64 characters, e.g. jetpack-seo';
+
 export function validName(name) {
   return typeof name === 'string' && name.length <= NAME_MAX && NAME.test(name);
 }
@@ -151,6 +153,66 @@ export async function listSlates(home) {
     out.push({ name, dir, lastUsed: lastUsed ?? (await mtime(dir)) ?? 0 });
   }
   return out.sort((a, b) => b.lastUsed - a.lastUsed || a.name.localeCompare(b.name));
+}
+
+function distance(a, b) {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const row = [i];
+    for (let j = 1; j <= b.length; j++) {
+      row[j] = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = row;
+  }
+  return prev[b.length];
+}
+
+// The existing slate a new name may be a slip for: within edit distance 2, or a prefix either way.
+export function closest(name, slates) {
+  let best = null;
+  for (const { name: other } of slates) {
+    const d = distance(name, other);
+    if (d > 2 && !name.startsWith(other) && !other.startsWith(name)) continue;
+    if (!best || d < best.d) best = { other, d };
+  }
+  return best?.other ?? null;
+}
+
+// claude-slate names the slate for the claude process it is about to become in .launch/<pid>.
+// Older files are ignored: their process is gone, and its ID may since have been reused.
+const LAUNCH = '.launch';
+const LAUNCH_MAX_AGE_MS = 10 * 60 * 1000;
+const launchPath = (home, pid) => path.join(home, LAUNCH, String(pid));
+const validPid = (pid) => Number.isInteger(pid) && pid > 0;
+
+export async function writeLaunch(home, pid, name, now = Date.now()) {
+  if (!validPid(pid)) throw new Error(`invalid process ID: ${pid}`);
+  if (!validName(name)) throw new Error(`invalid slate name: ${JSON.stringify(name)}`);
+  const dir = path.join(home, LAUNCH);
+  await fs.mkdir(dir, { recursive: true });
+  for (const f of await fs.readdir(dir).catch(() => [])) {
+    const t = await mtime(path.join(dir, f));
+    if (t !== null && now - t > LAUNCH_MAX_AGE_MS) await fs.rm(path.join(dir, f), { force: true });
+  }
+  await fs.writeFile(launchPath(home, pid), `${name}\n`);
+}
+
+// The slate name claude-slate left for process `pid`, used once: the file goes either way. null when
+// there is none, it is stale, or the name is not a slate name.
+export async function takeLaunch(home, pid, now = Date.now()) {
+  if (!validPid(pid)) return null;
+  const file = launchPath(home, pid);
+  let text;
+  let t;
+  try {
+    t = (await fs.stat(file)).mtimeMs;
+    text = await fs.readFile(file, 'utf8');
+  } catch {
+    return null;
+  }
+  await fs.rm(file, { force: true });
+  const name = text.trim();
+  return now - t <= LAUNCH_MAX_AGE_MS && validName(name) ? name : null;
 }
 
 // Every linked session folder in every slate; detached ones (set aside by /slate:done) are not.

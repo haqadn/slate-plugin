@@ -1,0 +1,12 @@
+#!/bin/sh
+# claude-slate [name] [claude args...]: start Claude Code linked to a slate before the first prompt.
+# No name (or a flag first) picks from the slates. The picker leaves the name for this process ID;
+# exec keeps that ID, and slate's SessionStart hook links the session it starts.
+here=$(dirname "$(realpath "$0")") || exit
+name=
+if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
+  name=$1
+  shift
+fi
+node "$here/pick-slate.mjs" "$$" ${name:+"$name"} || exit
+exec claude "$@"

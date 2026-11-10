@@ -1,4 +1,4 @@
-// CLI behind /slate:link and /slate:done: node slate.mjs <list|link|done> <sessionId> [name] [--create] [--yes]
+// CLI behind /slate:link, /slate:done and the slate row: node slate.mjs <list|link|done|digest> <sessionId> [name] [--create] [--yes]
 // The first stdout line is a status token, then free text. Always exits 0.
 import fs from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
@@ -6,13 +6,18 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { settle, spawnCurator, curatorWaitMs, currentPid } from './hook.mjs';
-import { slateHome, validName, slateDir, slateOf, createSlate, createSession, listSlates, sessionDirs, findSession } from './lib/slate.mjs';
+import {
+  slateHome, validName, slateDir, slateOf, createSlate, createSession, listSlates, sessionDirs, findSession, closest, readTopics,
+  NAME_HELP,
+} from './lib/slate.mjs';
 import { readSession, writeSession, setPid, pendingTurns } from './lib/session.mjs';
 import { memoryBlock } from './lib/inject.mjs';
 
 const SWITCH_WAIT_MS = 5000; // for the old session's curator before it is aborted
+const DIGEST_SLATES = 30;
+const DIGEST_FACTS_CHARS = 1200;
+const DIGEST_TOPICS = 20;
 const SAFE_ID = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
-const NAME_HELP = 'a slate name is lowercase letters, digits and hyphens, up to 64 characters, e.g. jetpack-seo';
 const exists = (p) => fs.access(p).then(() => true, () => false);
 
 function alive(pid) {
@@ -34,29 +39,6 @@ function branchOf(cwd) {
   }
 }
 
-function distance(a, b) {
-  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
-  for (let i = 1; i <= a.length; i++) {
-    const row = [i];
-    for (let j = 1; j <= b.length; j++) {
-      row[j] = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-    }
-    prev = row;
-  }
-  return prev[b.length];
-}
-
-// The existing slate a new name may be a slip for: within edit distance 2, or a prefix either way.
-function closest(name, slates) {
-  let best = null;
-  for (const { name: other } of slates) {
-    const d = distance(name, other);
-    if (d > 2 && !name.startsWith(other) && !other.startsWith(name)) continue;
-    if (!best || d < best.d) best = { other, d };
-  }
-  return best?.other ?? null;
-}
-
 async function list(home, sid, cwd) {
   const own = await findSession(home, sid);
   const lines = [own ? `linked ${path.basename(slateOf(own))}` : 'unlinked'];
@@ -64,6 +46,22 @@ async function list(home, sid, cwd) {
   lines.push(`project: ${path.basename(cwd)}`);
   const branch = branchOf(cwd);
   if (branch) lines.push(`branch: ${branch}`);
+  return { out: lines.join('\n') + '\n' };
+}
+
+// What the row's suggestion compares a session with: this project, then each slate's facts and topics.
+async function digest(home, cwd) {
+  const lines = ['digest', `project: ${path.basename(cwd)}`];
+  const branch = branchOf(cwd);
+  if (branch) lines.push(`branch: ${branch}`);
+  for (const s of (await listSlates(home)).slice(0, DIGEST_SLATES)) {
+    lines.push('', `## ${s.name}`);
+    const facts = (await fs.readFile(path.join(s.dir, 'facts.md'), 'utf8').catch(() => '')).trim();
+    if (facts) lines.push(facts.slice(0, DIGEST_FACTS_CHARS));
+    for (const t of (await readTopics(s.dir)).slice(0, DIGEST_TOPICS)) {
+      lines.push(`- ${t.title}${t.summary ? `: ${t.summary}` : ''}`);
+    }
+  }
   return { out: lines.join('\n') + '\n' };
 }
 
@@ -144,11 +142,12 @@ export async function run(argv, env = process.env, cwd = process.cwd()) {
     const flags = argv.filter((a) => a.startsWith('--'));
     const [command, sid, ...rest] = argv.filter((a) => !a.startsWith('--'));
     const home = slateHome(env);
-    if (!['list', 'link', 'done'].includes(command)) return { out: 'error usage: slate.mjs <list|link|done> <session id> [name]\n' };
+    if (!['list', 'link', 'done', 'digest'].includes(command)) return { out: 'error usage: slate.mjs <list|link|done|digest> <session id> [name]\n' };
     if (typeof sid !== 'string' || !SAFE_ID.test(sid)) return { out: 'error missing or invalid session id\n' };
     // Words after the session id are one name: "Jetpack SEO" is rejected, not half-used.
     const name = rest.length ? rest.join(' ') : undefined;
     if (command === 'list') return await list(home, sid, cwd);
+    if (command === 'digest') return await digest(home, cwd);
     if (command === 'link') return await link(home, sid, name ?? '', flags.includes('--create'), env);
     return await done(home, sid, name, flags.includes('--yes'), env);
   } catch (e) {
