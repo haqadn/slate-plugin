@@ -28,6 +28,8 @@ test('hooks.json wraps six events (seven commands) and every plugin-root path ex
   assert.deepEqual(Object.keys(cfg.hooks).sort(), ['PreCompact', 'PreToolUse', 'SessionStart', 'Stop', 'SubagentStop', 'UserPromptSubmit']);
   const cmds = Object.values(cfg.hooks).flat().flatMap((g) => g.hooks.map((h) => h.command));
   assert.equal(cmds.length, 7);
+  assert.deepEqual(cfg.modules, ['./status.tsx']);
+  assert.ok(await exists(`${PLUGIN}hooks/status.tsx`));
   for (const c of cmds) {
     for (const [, rel] of c.matchAll(/\$\{CLAUDE_PLUGIN_ROOT\}\/([^"\s]+)/g)) {
       assert.ok(await exists(PLUGIN + rel), rel);

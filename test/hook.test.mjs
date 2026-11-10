@@ -914,7 +914,7 @@ test('CLI: bad input exits 0 with one stderr line and no stdout', async () => {
 
 test('hooks.json: five events, matcher, timeouts, quoted plugin-root commands', async () => {
   const cfg = JSON.parse(await fs.readFile(HOOKS_JSON, 'utf8'));
-  assert.deepEqual(Object.keys(cfg), ['hooks']);
+  assert.deepEqual(Object.keys(cfg), ['hooks', 'modules']);
   const events = [...EVENTS, 'SubagentStop', 'PreToolUse'];
   assert.deepEqual(Object.keys(cfg.hooks).sort(), [...events].sort());
   const want = { SessionStart: 60, UserPromptSubmit: 30, Stop: 10, PreCompact: 90, SubagentStop: 10, PreToolUse: 10 };

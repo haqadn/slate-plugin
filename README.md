@@ -44,6 +44,8 @@ In Claude Code:
 - `claude-slate [name] [claude args]` starts Claude Code linked to a slate. Memory loads at startup, with no model turn. Other args go to `claude` (`-c`, `--resume`, a prompt). With no name you pick from recent slates. A new name asks before creating the slate. A resumed session already on another slate stays there.
 - `/slate:link [name]` links this session to a slate (new names ask first; no name shows a picker). Several sessions can share one slate.
 - `/slate:done [name]` deletes a finished slate.
+- A row above the prompt shows the linked slate. When none is linked, click it or press `ctrl+x tab` and type a name to link one, with matching slates suggested. A custom `statusLine` is left as it is.
+- After two prompts with no slate linked, the row may suggest one. A single Haiku call compares those prompts, the project and branch with your slates' facts and topic summaries. It never links by itself: click `Link`, or `Not now` to hide it for the session.
 - Run `/autocompact 100000` so compaction becomes the automatic reset. Memory reloads after it.
 - Set the curator model with `/plugin configure slate` (`curatorModel`, default `sonnet`), or in user settings: `"pluginConfigs": {"slate@slate-plugin": {"options": {"curatorModel": "haiku"}}}`.
 

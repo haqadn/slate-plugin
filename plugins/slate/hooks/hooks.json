@@ -51,5 +51,6 @@
         ]
       }
     ]
-  }
+  },
+  "modules": ["./status.tsx"]
 }
